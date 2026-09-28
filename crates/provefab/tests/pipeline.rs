@@ -1078,3 +1078,52 @@ async fn review_rounds_accumulate_findings_require_tests_and_escalate() {
     );
     assert!(last.contains("regression test"), "{last}");
 }
+
+/// Merges the PR of issue 7 by itself; leaves every other PR to a person.
+struct MergeIssueSeven;
+
+impl ReviewPolicy for MergeIssueSeven {
+    fn approvals_needed(&self, _repo: &provefab::config::RepoConfig) -> u8 {
+        1
+    }
+    fn after_pr_opened<'a>(
+        &'a self,
+        cx: PrOpened<'a>,
+    ) -> BoxFuture<'a, Result<String, provefab::pipeline::PipelineError>> {
+        Box::pin(async move {
+            if cx.task.issue_number == 7 {
+                let head = cx.tools.head().await?;
+                cx.tools.merge(&head).await?;
+            }
+            Ok("opened".to_string())
+        })
+    }
+}
+
+/// Pilot measurement: `provefab stats` tells automatic merges from merges by a person.
+#[tokio::test]
+async fn stats_count_prs_and_tell_auto_merges_from_human_ones() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.policy = Arc::new(MergeIssueSeven);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let auto = queue_n(&p, 7, "Add a feature file").await;
+    assert_eq!(p.drive(auto).await.unwrap(), PrOpen);
+    let human = queue_n(&p, 8, "Add another feature file").await;
+    assert_eq!(p.drive(human).await.unwrap(), PrOpen);
+    *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
+        state: provefab::forge::PrState::Merged,
+        comments: vec![],
+    };
+    p.watch_pr(human).await.unwrap();
+    let out = provefab::commands::stats(&p.store).await.unwrap();
+    assert!(out.contains("o/r: 2 tasks"), "{out}");
+    assert!(out.contains("2 PRs"), "{out}");
+    assert!(out.contains("merged 2 (auto 1, by hand 1)"), "{out}");
+    assert!(out.contains("reviewers:"), "{out}");
+}

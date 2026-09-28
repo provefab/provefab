@@ -52,6 +52,8 @@ enum Cmd {
     Add { url: String },
     /// Every task and why it is in its state.
     Status,
+    /// Per repository: issues turned into PRs, merges (automatic or by hand), reviewers.
+    Stats,
     /// Everything recorded about one task.
     Log { task: i64 },
     /// Check tools, logins, the Jev key and the repos.
@@ -301,6 +303,11 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
         Cmd::Status => {
             let store = Store::open(&paths.db()).await?;
             print!("{}", commands::status(&store).await?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Stats => {
+            let store = Store::open(&paths.db()).await?;
+            print!("{}", commands::stats(&store).await?);
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Log { task } => {

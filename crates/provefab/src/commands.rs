@@ -136,6 +136,107 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
     Ok(out)
 }
 
+/// `provefab stats`: per repository, how many issues became pull requests,
+/// how they ended, and which reviewers approved the merged ones. What a pilot
+/// team measures (landing L14).
+pub async fn stats(store: &Store) -> Result<String, CommandError> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Repo {
+        tasks: u32,
+        prs: u32,
+        merged: u32,
+        auto: u32,
+        closed: u32,
+        reopened_after_merge: u32,
+        stopped: u32,
+        minutes_to_pr: Vec<i64>,
+        reviewers: BTreeMap<String, u32>,
+    }
+    let mut repos: BTreeMap<String, Repo> = BTreeMap::new();
+    for t in store.tasks_in(&TaskState::ALL).await? {
+        let r = repos.entry(t.repo.clone()).or_default();
+        r.tasks += 1;
+        if matches!(t.state, TaskState::Failed | TaskState::NeedsYou) {
+            r.stopped += 1;
+        }
+        let transitions = store.transitions(t.id).await?;
+        if t.pr_url.is_none() {
+            continue;
+        }
+        r.prs += 1;
+        if let (Some(first), Some(opened)) = (
+            transitions.first(),
+            transitions.iter().find(|x| x.to == TaskState::PrOpen),
+        ) {
+            r.minutes_to_pr.push((opened.at - first.at) / 60);
+        }
+        match t.pr_state.as_deref() {
+            Some("merged" | "done") => {
+                r.merged += 1;
+                if store.last_output(t.id, "auto_merged").await?.is_some() {
+                    r.auto += 1;
+                }
+                let models: Vec<String> = store
+                    .recent_outputs(t.id, "approval", u32::MAX)
+                    .await?
+                    .iter()
+                    .filter_map(|a| a["model"].as_str().map(str::to_string))
+                    .collect();
+                if !models.is_empty() {
+                    *r.reviewers.entry(models.join(" + ")).or_default() += 1;
+                }
+                if t.reopen_count > 0 && t.state != TaskState::PrOpen {
+                    r.reopened_after_merge += 1;
+                }
+            }
+            Some("closed") => r.closed += 1,
+            _ => {}
+        }
+    }
+    if repos.is_empty() {
+        return Ok("no tasks\n".into());
+    }
+    let mut out = String::new();
+    for (slug, r) in repos {
+        let mut mins = r.minutes_to_pr.clone();
+        mins.sort_unstable();
+        let median = mins
+            .get(mins.len() / 2)
+            .map_or("-".to_string(), |m| format!("{m} min"));
+        let pct = (r.prs * 100).checked_div(r.tasks).unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "{slug}: {} tasks · {} PRs ({pct}%) · merged {} (auto {}, by hand {}) · closed {} · stopped {} · reopened after merge {}",
+            r.tasks,
+            r.prs,
+            r.merged,
+            r.auto,
+            r.merged - r.auto,
+            r.closed,
+            r.stopped,
+            r.reopened_after_merge
+        );
+        let _ = writeln!(out, "  median issue to PR: {median}");
+        let pairs: Vec<String> = r
+            .reviewers
+            .iter()
+            .map(|(k, n)| format!("{k} ({n})"))
+            .collect();
+        let _ = writeln!(
+            out,
+            "  reviewers: {}",
+            if pairs.is_empty() {
+                "-".to_string()
+            } else {
+                pairs.join(", ")
+            }
+        );
+    }
+    Ok(out)
+}
+
 /// `provefab log <task>`: transitions, routing, stage runs and stage answers.
 pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
     let t = store.task(id).await?.ok_or(CommandError::UnknownTask(id))?;

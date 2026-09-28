@@ -2589,6 +2589,11 @@ where
             // Only the reviewed head: a later push to the branch is not merged (review I6).
             match self.p.hub.pr_merge(&self.repo.slug, self.url, head).await {
                 Ok(()) => {
+                    // Tells automatic merges from merges by a person (`provefab stats`).
+                    self.p
+                        .store
+                        .record_output(self.task.id, "auto_merged", &json!({"head": head}))
+                        .await?;
                     self.p.record_merge(self.task, self.repo).await?;
                     Ok(MergeOutcome::Merged)
                 }
