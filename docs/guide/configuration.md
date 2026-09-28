@@ -15,6 +15,8 @@ No secret goes in `provefab.toml`.
 | Codex (ChatGPT) login | `provefab login codex` (directory `~/.provefab/codex`) |
 | GitHub | `gh auth login` (Provefab uses `gh` and `git` with your permissions) |
 
+**Plans for work.** Provefab runs the official CLIs with whatever login you give them. For professional use, prefer a business plan (Claude Team or Enterprise, ChatGPT Business) or API keys: consumer plans can restrict commercial use (for example, Anthropic's consumer terms for EEA and Swiss residents say "Non-commercial use only"). Check your plan's terms; this is not legal advice.
+
 ## `[jev]`
 
 | Field | Default | Role |
