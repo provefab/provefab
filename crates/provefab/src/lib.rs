@@ -1,0 +1,28 @@
+//! Provefab: everything specific to turning issues into PRs.
+
+pub mod agents;
+pub mod app;
+pub mod cli;
+pub mod codex_setup;
+pub mod commands;
+pub mod config;
+pub mod cooldown;
+pub mod forge;
+pub mod gates;
+pub mod guard;
+pub mod intake;
+pub mod jevq;
+pub mod paths;
+pub mod pipeline;
+pub mod plugins;
+pub mod policy;
+pub mod ports;
+pub mod prompts;
+pub mod router;
+pub mod scheduler;
+pub mod service;
+pub mod stage;
+pub mod store;
+pub mod task;
+#[cfg(feature = "testkit")]
+pub mod testkit;

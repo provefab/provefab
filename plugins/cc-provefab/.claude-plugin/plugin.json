@@ -1,0 +1,5 @@
+{
+  "name": "cc-provefab",
+  "version": "0.1.0",
+  "description": "Provefab worker support for Claude Code: every tool call is checked by provefab guard."
+}

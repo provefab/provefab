@@ -1,0 +1,81 @@
+# Operations
+
+## The service
+
+Provefab runs as a launchd agent: it starts at login and restarts if it stops.
+
+```bash
+provefab service install --workers 1   # install or update, then (re)start
+provefab service status                # running (pid N), loaded, not installed
+provefab service uninstall             # stop and remove the service
+```
+
+`install` does three things:
+- it copies the current binary to `~/.provefab/bin/provefab`, so rebuilding the repository never breaks the service;
+- it writes `~/Library/LaunchAgents/dev.provefab.run.plist`;
+- it freezes the `PATH` of the terminal you run it from.
+
+**Run `install` again** after:
+- installing a new Provefab version (`cargo install --path crates/provefab`);
+- installing or moving a tool (`claude`, `codex`, `gh`, `cargo`...);
+- editing `provefab.toml`.
+
+Only one `provefab run` works at a time, thanks to the `~/.provefab/run.lock` lock. To run a pass by hand while the service runs, stop the service first.
+
+`--workers N` sets how many tasks run in parallel. Each model stays limited by its `max_concurrency`, often 1 for a subscription.
+
+## Without the service
+
+```bash
+provefab run                 # continuously in the terminal (Ctrl-C stops cleanly)
+provefab run --once          # one pass: everything that can move, then exit
+provefab run --dry-run       # classification and routing only, nothing changes
+```
+
+Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume at the next start, in the state they were in.
+
+## Where things are
+
+| Path | Contents |
+|---|---|
+| `~/.provefab/provefab.toml` | the configuration |
+| `~/.provefab/provefab.db` | the state (SQLite): tasks, transitions, routing, stages, outputs |
+| `~/.provefab/logs/run.log` | the service log; `provefab service install` rotates it to `run.log.1` once it passes 10 MB |
+| `~/.provefab/repos/` | the clones Provefab manages |
+| `~/.provefab/worktrees/<id>/` | a task's worktree, removed after the merge |
+| `~/.provefab/sessions/<id>/` | agent transcripts and check outputs, per stage |
+| `~/.provefab/claude/`, `~/.provefab/codex/` | worker logins, kept apart from your own sessions |
+| `~/.provefab/bin/provefab` | the binary the service runs |
+
+`PROVEFAB_HOME` moves all of this elsewhere.
+
+## Budgets and safeguards
+
+Provefab stops itself rather than spend quota in a loop:
+
+- **Automatic passes:** at most `max_auto_passes` per issue (3 by default). Beyond that, the task goes to `needs_you`.
+- **Daily work:** at most `max_stage_runs_per_day` worker runs over a rolling 24 hours (60 by default). Beyond that, tasks wait in `waiting`, with one comment per issue, and resume by themselves.
+- **Rate limits:** a rate-limited provider is paused (15 minutes, doubled on each repeat, 4 hours at most). Stages move to another model of the same tier, or wait.
+- **Transient failures** (network, GitHub, busy repository): waits of 5, 15 then 45 minutes, then `needs_you`.
+- **Steps per task:** at most `max_drive_steps` in one go (200 by default).
+
+## Troubleshooting
+
+Always start with `provefab doctor`. Each `FAIL` line says what to do.
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `jev ... Unknown model` | `jev.model` without its patch number | use the full version, for example `jev-1.13.0` |
+| `jev key missing` | no key | `security add-generic-password -s provefab-typesafe -a provefab -w <key>` |
+| `claude login FAIL` | Claude session missing or expired | `provefab login claude` |
+| `codex guard hook FAIL` | the Codex guard hook is not trusted | `provefab login codex` |
+| `model ... removed: its worker is not ready` in the log | its worker is not installed or not signed in; Provefab dropped it from the catalog at startup | fix the matching `doctor` line, then `provefab service install` |
+| every task in `waiting` | every model of the tier is paused, or the daily budget is reached | `provefab status` gives the reason; wait, or widen the catalog or the budget |
+| the service cannot find `claude` or `cargo` | `PATH` frozen at install time | run `provefab service install` again from a terminal where the tool is found |
+| `another provefab run is already working` | the service already runs | `provefab service uninstall` before a manual pass |
+| `[repos.merge] is read by Provefab Pro` warning | the config asks for auto-merge | expected with this binary: PRs open and wait for you |
+
+To dig into a task:
+- read `provefab log <id>`;
+- read the transcripts in `~/.provefab/sessions/<id>/`;
+- read the check outputs (`gates-N` directories).

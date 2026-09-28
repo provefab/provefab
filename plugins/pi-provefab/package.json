@@ -1,0 +1,10 @@
+{
+  "name": "pi-provefab",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Provefab worker support for Pi: tool-call guard and structured stage results.",
+  "pi": {
+    "extensions": ["./extensions/provefab.ts"],
+    "skills": ["./skills"]
+  }
+}

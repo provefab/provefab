@@ -1,0 +1,991 @@
+//! Durable task state in SQLite (spec §3.5). Every state change is written,
+//! with its reason, before the side effect it leads to (spec §3.2).
+
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
+use sqlx::Row;
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
+};
+
+use crate::task::{TaskKind, TaskState};
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("store: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("store: migration failed: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("store: no task {0}")]
+    UnknownTask(i64),
+    #[error("store: unreadable value `{0}` in the database")]
+    Corrupt(String),
+}
+
+/// An issue as intake found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewIssue {
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub author: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskRow {
+    pub id: i64,
+    pub repo: String,
+    pub issue_number: u64,
+    pub issue_url: String,
+    pub title: String,
+    pub author: String,
+    pub state: TaskState,
+    pub kind: Option<TaskKind>,
+    pub attempts: u32,
+    pub review_rounds: u32,
+    pub branch: Option<String>,
+    pub worktree: Option<PathBuf>,
+    pub pr_url: Option<String>,
+    pub pr_state: Option<String>,
+    pub reopen_count: u32,
+    /// The retry ladder moved the implement stage up one tier (spec §3.2).
+    pub escalated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionRow {
+    pub from: Option<TaskState>,
+    pub to: TaskState,
+    pub reason: String,
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageRunRecord {
+    pub task_id: i64,
+    pub stage: String,
+    pub model_id: String,
+    pub exit: String,
+    pub turns: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub session_dir: PathBuf,
+    pub gate_score: Option<String>,
+    pub started_at: i64,
+    pub finished_at: i64,
+}
+
+pub struct Store {
+    pool: SqlitePool,
+}
+
+/// Writes that ride along with a transition, in its transaction.
+#[derive(Debug, Clone, Copy)]
+pub enum Also<'a> {
+    Nothing,
+    /// A stage starts: fresh attempt counter and tier.
+    NewStage,
+    /// A review asked for changes: one more round, fresh attempts and tier.
+    NewRound,
+    /// Provefab asks for information: keep the question, and count only
+    /// comments after `seen_at` (RFC 3339 UTC) as replies.
+    Question {
+        question: &'a Value,
+        seen_at: &'a str,
+    },
+}
+
+/// `secs` since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ`, GitHub's timestamp format.
+pub fn rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Howard Hinnant's days-to-civil.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl Store {
+    /// Opens (creating if needed) the database and applies the migrations.
+    pub async fn open(path: &Path) -> Result<Self, StoreError> {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(opts)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// Queues an issue. `None` when the issue URL is already known (intake is idempotent).
+    pub async fn add_issue(&self, issue: &NewIssue) -> Result<Option<i64>, StoreError> {
+        // IMMEDIATE takes the write lock up front: a deferred transaction that reads
+        // first gets SQLITE_BUSY when another writer commits in between (review C1).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let t = now();
+        let inserted = sqlx::query(
+            "INSERT INTO tasks (repo, issue_number, issue_url, title, author, state, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (repo, issue_number) DO NOTHING",
+        )
+        // GitHub slugs are case-insensitive; (repo, number) is the issue's identity.
+        .bind(issue.repo.to_lowercase())
+        .bind(issue.number as i64)
+        .bind(&issue.url)
+        .bind(&issue.title)
+        .bind(&issue.author)
+        .bind(TaskState::Queued.as_str())
+        .bind(t)
+        .bind(t)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let id = inserted.last_insert_rowid();
+        sqlx::query("INSERT INTO transitions (task_id, from_state, to_state, reason, at) VALUES (?, NULL, ?, 'intake', ?)")
+            .bind(id)
+            .bind(TaskState::Queued.as_str())
+            .bind(t)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(id))
+    }
+
+    pub async fn task(&self, id: i64) -> Result<Option<TaskRow>, StoreError> {
+        let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| task_row(&r)).transpose()
+    }
+
+    pub async fn task_by_url(&self, url: &str) -> Result<Option<TaskRow>, StoreError> {
+        let row = sqlx::query("SELECT * FROM tasks WHERE issue_url = ?")
+            .bind(url)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| task_row(&r)).transpose()
+    }
+
+    /// Tasks in any of `states`, oldest first.
+    pub async fn tasks_in(&self, states: &[TaskState]) -> Result<Vec<TaskRow>, StoreError> {
+        let mut out = Vec::new();
+        for state in states {
+            let rows = sqlx::query("SELECT * FROM tasks WHERE state = ?")
+                .bind(state.as_str())
+                .fetch_all(&self.pool)
+                .await?;
+            for r in rows {
+                out.push(task_row(&r)?);
+            }
+        }
+        out.sort_by_key(|t| t.id);
+        Ok(out)
+    }
+
+    /// Moves a task to `to` and logs the change in the same transaction.
+    pub async fn transition(&self, id: i64, to: TaskState, reason: &str) -> Result<(), StoreError> {
+        self.transition_and(id, to, reason, Also::Nothing).await
+    }
+
+    /// A transition plus the writes that must land with it, all or nothing
+    /// (Plan 3b review I1, I2): a crash between them used to leave half a step.
+    pub async fn transition_and(
+        &self,
+        id: i64,
+        to: TaskState,
+        reason: &str,
+        also: Also<'_>,
+    ) -> Result<(), StoreError> {
+        // IMMEDIATE takes the write lock up front: a deferred transaction that reads
+        // first gets SQLITE_BUSY when another writer commits in between (review C1).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let from: Option<String> = sqlx::query("SELECT state FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| r.get("state"));
+        let Some(from) = from else {
+            return Err(StoreError::UnknownTask(id));
+        };
+        let t = now();
+        sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
+            .bind(to.as_str())
+            .bind(t)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO transitions (task_id, from_state, to_state, reason, at) VALUES (?, ?, ?, ?, ?)")
+            .bind(id)
+            .bind(from)
+            .bind(to.as_str())
+            .bind(reason)
+            .bind(t)
+            .execute(&mut *tx)
+            .await?;
+        match also {
+            Also::Nothing => {}
+            Also::NewStage => {
+                sqlx::query("UPDATE tasks SET attempts = 0, escalated = 0 WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Also::NewRound => {
+                sqlx::query(
+                    "UPDATE tasks SET attempts = 0, escalated = 0, review_rounds = review_rounds + 1 WHERE id = ?",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            Also::Question { question, seen_at } => {
+                sqlx::query(
+                    "INSERT INTO stage_outputs (task_id, kind, json, at) VALUES (?, 'question', ?, ?)",
+                )
+                .bind(id)
+                .bind(question.to_string())
+                .bind(t)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO replies_seen (task_id, last_comment_at) VALUES (?, ?)
+                     ON CONFLICT (task_id) DO UPDATE SET last_comment_at = excluded.last_comment_at",
+                )
+                .bind(id)
+                .bind(seen_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn transitions(&self, id: i64) -> Result<Vec<TransitionRow>, StoreError> {
+        let rows = sqlx::query("SELECT from_state, to_state, reason, at FROM transitions WHERE task_id = ? ORDER BY id")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let from: Option<String> = r.get("from_state");
+                Ok(TransitionRow {
+                    from: from.map(|f| parse_state(&f)).transpose()?,
+                    to: parse_state(&r.get::<String, _>("to_state"))?,
+                    reason: r.get("reason"),
+                    at: r.get("at"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn set_kind(&self, id: i64, kind: TaskKind) -> Result<(), StoreError> {
+        self.update(
+            id,
+            "UPDATE tasks SET kind = ?, updated_at = ? WHERE id = ?",
+            |q| q.bind(kind.as_str()),
+        )
+        .await
+    }
+
+    pub async fn set_worktree(
+        &self,
+        id: i64,
+        branch: &str,
+        worktree: &Path,
+    ) -> Result<(), StoreError> {
+        let path = worktree.display().to_string();
+        self.update(
+            id,
+            "UPDATE tasks SET branch = ?, worktree = ?, updated_at = ? WHERE id = ?",
+            |q| q.bind(branch.to_string()).bind(path),
+        )
+        .await
+    }
+
+    /// Adds one to the attempt counter and returns the new value.
+    pub async fn bump_attempts(&self, id: i64) -> Result<u32, StoreError> {
+        self.bump(id, Counter::Attempts).await
+    }
+
+    pub async fn reset_attempts(&self, id: i64) -> Result<(), StoreError> {
+        self.update(
+            id,
+            "UPDATE tasks SET attempts = 0, updated_at = ? WHERE id = ?",
+            |q| q,
+        )
+        .await
+    }
+
+    /// Adds one to the review-round counter and returns the new value.
+    pub async fn bump_review_rounds(&self, id: i64) -> Result<u32, StoreError> {
+        self.bump(id, Counter::ReviewRounds).await
+    }
+
+    /// Links the task to its pull request (spec §3.4 item 7).
+    pub async fn set_pr(&self, id: i64, url: &str, state: &str) -> Result<(), StoreError> {
+        self.update(
+            id,
+            "UPDATE tasks SET pr_url = ?, pr_state = ?, updated_at = ? WHERE id = ?",
+            |q| q.bind(url.to_string()).bind(state.to_string()),
+        )
+        .await
+    }
+
+    pub async fn set_pr_state(&self, id: i64, state: &str) -> Result<(), StoreError> {
+        self.update(
+            id,
+            "UPDATE tasks SET pr_state = ?, updated_at = ? WHERE id = ?",
+            |q| q.bind(state.to_string()),
+        )
+        .await
+    }
+
+    /// The issue came back after its PR was merged.
+    pub async fn record_reopen(&self, id: i64) -> Result<u32, StoreError> {
+        self.bump(id, Counter::Reopens).await
+    }
+
+    pub async fn record_routing(
+        &self,
+        id: i64,
+        jev_model: Option<&str>,
+        verdict: Option<&Value>,
+        tiers: &Value,
+        reasons: &[String],
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO routing_decisions (task_id, jev_model, verdict_json, tiers_json, reasons, at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(jev_model)
+        .bind(verdict.map(Value::to_string))
+        .bind(tiers.to_string())
+        .bind(reasons.join("\n"))
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// `(jev_model, verdict, tiers, reasons)` of every routing decision, oldest first.
+    pub async fn routing_decisions(
+        &self,
+        id: i64,
+    ) -> Result<Vec<(Option<String>, Option<Value>, Value, Vec<String>)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT jev_model, verdict_json, tiers_json, reasons FROM routing_decisions WHERE task_id = ? ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let verdict: Option<String> = r.get("verdict_json");
+                let tiers: String = r.get("tiers_json");
+                let reasons: String = r.get("reasons");
+                Ok((
+                    r.get("jev_model"),
+                    verdict
+                        .map(|v| {
+                            serde_json::from_str(&v).map_err(|_| StoreError::Corrupt(v.clone()))
+                        })
+                        .transpose()?,
+                    serde_json::from_str(&tiers).map_err(|_| StoreError::Corrupt(tiers.clone()))?,
+                    reasons.lines().map(str::to_string).collect(),
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn record_stage_run(&self, run: &StageRunRecord) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO stage_runs (task_id, stage, model_id, exit, turns, input_tokens, output_tokens, session_dir, gate_score, started_at, finished_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(run.task_id)
+        .bind(&run.stage)
+        .bind(&run.model_id)
+        .bind(&run.exit)
+        .bind(run.turns as i64)
+        .bind(run.input_tokens as i64)
+        .bind(run.output_tokens as i64)
+        .bind(run.session_dir.display().to_string())
+        .bind(&run.gate_score)
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn stage_runs(&self, id: i64) -> Result<Vec<StageRunRecord>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM stage_runs WHERE task_id = ? ORDER BY id")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| StageRunRecord {
+                task_id: r.get("task_id"),
+                stage: r.get("stage"),
+                model_id: r.get("model_id"),
+                exit: r.get("exit"),
+                turns: r.get::<i64, _>("turns") as u32,
+                input_tokens: r.get::<i64, _>("input_tokens") as u64,
+                output_tokens: r.get::<i64, _>("output_tokens") as u64,
+                session_dir: PathBuf::from(r.get::<String, _>("session_dir")),
+                gate_score: r.get("gate_score"),
+                started_at: r.get("started_at"),
+                finished_at: r.get("finished_at"),
+            })
+            .collect())
+    }
+
+    /// Timestamp (as GitHub reports it) of the last comment given to the reply check.
+    pub async fn last_reply_seen(&self, id: i64) -> Result<Option<String>, StoreError> {
+        Ok(
+            sqlx::query("SELECT last_comment_at FROM replies_seen WHERE task_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|r| r.get("last_comment_at")),
+        )
+    }
+
+    pub async fn set_last_reply_seen(&self, id: i64, at: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO replies_seen (task_id, last_comment_at) VALUES (?, ?)
+             ON CONFLICT (task_id) DO UPDATE SET last_comment_at = excluded.last_comment_at",
+        )
+        .bind(id)
+        .bind(at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_escalated(&self, id: i64, escalated: bool) -> Result<(), StoreError> {
+        self.update(
+            id,
+            "UPDATE tasks SET escalated = ?, updated_at = ? WHERE id = ?",
+            |q| q.bind(escalated as i64),
+        )
+        .await
+    }
+
+    /// Clears the attempt, review-round and escalation counters: the task starts over
+    /// (a reply answered Provefab's question, or `provefab add` requeued it).
+    pub async fn reset_counters(&self, id: i64) -> Result<(), StoreError> {
+        self.update(
+            id,
+            "UPDATE tasks SET attempts = 0, review_rounds = 0, escalated = 0, updated_at = ? WHERE id = ?",
+            |q| q,
+        )
+        .await
+    }
+
+    /// Keeps a structured stage answer or a text Provefab wrote (`plan`, `review`, `question`).
+    pub async fn record_output(
+        &self,
+        id: i64,
+        kind: &str,
+        value: &Value,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO stage_outputs (task_id, kind, json, at) VALUES (?, ?, ?, ?)")
+            .bind(id)
+            .bind(kind)
+            .bind(value.to_string())
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Worker runs (stage runs with a model, not gates) started at or after `since`,
+    /// across all tasks (the daily budget, D53).
+    pub async fn worker_runs_since(&self, since: i64) -> Result<u32, StoreError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM stage_runs WHERE model_id != '' AND started_at >= ?",
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("n") as u32)
+    }
+
+    /// How many outputs of `kind` the task has.
+    pub async fn count_outputs(&self, id: i64, kind: &str) -> Result<u32, StoreError> {
+        let row =
+            sqlx::query("SELECT COUNT(*) AS n FROM stage_outputs WHERE task_id = ? AND kind = ?")
+                .bind(id)
+                .bind(kind)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.get::<i64, _>("n") as u32)
+    }
+
+    /// The newest `n` outputs of `kind`, oldest first.
+    pub async fn recent_outputs(
+        &self,
+        id: i64,
+        kind: &str,
+        n: u32,
+    ) -> Result<Vec<Value>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT json FROM stage_outputs WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT ?",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(i64::from(n))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = rows
+            .iter()
+            .map(|r| {
+                let s: String = r.get("json");
+                serde_json::from_str(&s).map_err(|_| StoreError::Corrupt(s))
+            })
+            .collect::<Result<Vec<Value>, _>>()?;
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Every stored `pending_github` effect across all tasks, oldest first:
+    /// `(row id, task id, effect json)`.
+    pub async fn pending_github(&self) -> Result<Vec<(i64, i64, Value)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, json FROM stage_outputs WHERE kind = 'pending_github' ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let s: String = r.get("json");
+                let json = serde_json::from_str(&s).map_err(|_| StoreError::Corrupt(s))?;
+                Ok((r.get("id"), r.get("task_id"), json))
+            })
+            .collect()
+    }
+
+    /// Deletes one stage-output row (a retried `pending_github` effect that succeeded).
+    pub async fn delete_output(&self, row_id: i64) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM stage_outputs WHERE id = ?")
+            .bind(row_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The newest output of `kind`, if any.
+    pub async fn last_output(&self, id: i64, kind: &str) -> Result<Option<Value>, StoreError> {
+        let row = sqlx::query(
+            "SELECT json FROM stage_outputs WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(id)
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            let s: String = r.get("json");
+            serde_json::from_str(&s).map_err(|_| StoreError::Corrupt(s))
+        })
+        .transpose()
+    }
+
+    /// Runs an `UPDATE ... updated_at = ? WHERE id = ?` whose leading parameters `bind` supplies.
+    async fn update(
+        &self,
+        id: i64,
+        sql: &'static str,
+        bind: impl FnOnce(
+            sqlx::query::Query<'static, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+        )
+            -> sqlx::query::Query<'static, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+    ) -> Result<(), StoreError> {
+        let done = bind(sqlx::query(sql))
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(StoreError::UnknownTask(id));
+        }
+        Ok(())
+    }
+
+    async fn bump(&self, id: i64, counter: Counter) -> Result<u32, StoreError> {
+        let sql = match counter {
+            Counter::Attempts => {
+                "UPDATE tasks SET attempts = attempts + 1, updated_at = ? WHERE id = ? RETURNING attempts"
+            }
+            Counter::ReviewRounds => {
+                "UPDATE tasks SET review_rounds = review_rounds + 1, updated_at = ? WHERE id = ? RETURNING review_rounds"
+            }
+            Counter::Reopens => {
+                "UPDATE tasks SET reopen_count = reopen_count + 1, updated_at = ? WHERE id = ? RETURNING reopen_count"
+            }
+        };
+        let row = sqlx::query(sql)
+            .bind(now())
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::UnknownTask(id))?;
+        Ok(row.get::<i64, _>(0) as u32)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Counter {
+    Attempts,
+    ReviewRounds,
+    Reopens,
+}
+
+fn parse_state(s: &str) -> Result<TaskState, StoreError> {
+    TaskState::parse(s).ok_or_else(|| StoreError::Corrupt(s.to_string()))
+}
+
+fn task_row(r: &SqliteRow) -> Result<TaskRow, StoreError> {
+    let kind: Option<String> = r.get("kind");
+    let worktree: Option<String> = r.get("worktree");
+    Ok(TaskRow {
+        id: r.get("id"),
+        repo: r.get("repo"),
+        issue_number: r.get::<i64, _>("issue_number") as u64,
+        issue_url: r.get("issue_url"),
+        title: r.get("title"),
+        author: r.get("author"),
+        state: parse_state(&r.get::<String, _>("state"))?,
+        kind: kind
+            .map(|k| TaskKind::parse(&k).ok_or(StoreError::Corrupt(k)))
+            .transpose()?,
+        attempts: r.get::<i64, _>("attempts") as u32,
+        review_rounds: r.get::<i64, _>("review_rounds") as u32,
+        branch: r.get("branch"),
+        worktree: worktree.map(PathBuf::from),
+        pr_url: r.get("pr_url"),
+        pr_state: r.get("pr_state"),
+        reopen_count: r.get::<i64, _>("reopen_count") as u32,
+        escalated: r.get::<i64, _>("escalated") != 0,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn issue(n: u64) -> NewIssue {
+        NewIssue {
+            repo: "o/r".into(),
+            number: n,
+            url: format!("https://github.com/o/r/issues/{n}"),
+            title: format!("Issue {n}"),
+            author: "alice".into(),
+        }
+    }
+
+    async fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("provefab.db")).await.unwrap();
+        (dir, s)
+    }
+
+    #[tokio::test]
+    async fn intake_is_idempotent_and_logs_the_first_transition() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(1)).await.unwrap().unwrap();
+        assert_eq!(s.add_issue(&issue(1)).await.unwrap(), None);
+        let t = s.task(id).await.unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        assert_eq!(t.issue_number, 1);
+        let log = s.transitions(id).await.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].from, log[0].to), (None, TaskState::Queued));
+    }
+
+    #[tokio::test]
+    async fn transitions_are_logged_in_order_with_their_reasons() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(2)).await.unwrap().unwrap();
+        s.transition(id, TaskState::Classified, "jev: bugfix, difficulty 1.2")
+            .await
+            .unwrap();
+        s.transition(id, TaskState::Planning, "plan on sonnet")
+            .await
+            .unwrap();
+        let log = s.transitions(id).await.unwrap();
+        let steps: Vec<_> = log
+            .iter()
+            .map(|t| (t.from, t.to, t.reason.as_str()))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (None, TaskState::Queued, "intake"),
+                (
+                    Some(TaskState::Queued),
+                    TaskState::Classified,
+                    "jev: bugfix, difficulty 1.2"
+                ),
+                (
+                    Some(TaskState::Classified),
+                    TaskState::Planning,
+                    "plan on sonnet"
+                ),
+            ]
+        );
+        assert!(matches!(
+            s.transition(999, TaskState::Failed, "x").await,
+            Err(StoreError::UnknownTask(999))
+        ));
+    }
+
+    #[tokio::test]
+    async fn state_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provefab.db");
+        let id = {
+            let s = Store::open(&path).await.unwrap();
+            let id = s.add_issue(&issue(3)).await.unwrap().unwrap();
+            s.transition(id, TaskState::Implementing, "resume me")
+                .await
+                .unwrap();
+            s.set_worktree(id, "provefab/3-fix", Path::new("/w/3"))
+                .await
+                .unwrap();
+            id
+        };
+        let s = Store::open(&path).await.unwrap();
+        let t = s.task(id).await.unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Implementing);
+        assert_eq!(t.branch.as_deref(), Some("provefab/3-fix"));
+        assert_eq!(t.worktree, Some(PathBuf::from("/w/3")));
+    }
+
+    #[tokio::test]
+    async fn counters_kind_pr_links_and_filters() {
+        let (_d, s) = store().await;
+        let a = s.add_issue(&issue(4)).await.unwrap().unwrap();
+        let b = s.add_issue(&issue(5)).await.unwrap().unwrap();
+        s.set_kind(a, TaskKind::Bugfix).await.unwrap();
+        assert_eq!(s.bump_attempts(a).await.unwrap(), 1);
+        assert_eq!(s.bump_attempts(a).await.unwrap(), 2);
+        s.reset_attempts(a).await.unwrap();
+        assert_eq!(s.bump_review_rounds(a).await.unwrap(), 1);
+        s.set_pr(a, "https://github.com/o/r/pull/9", "open")
+            .await
+            .unwrap();
+        s.set_pr_state(a, "merged").await.unwrap();
+        assert_eq!(s.record_reopen(a).await.unwrap(), 1);
+        s.transition(b, TaskState::NeedsInfo, "underspecified 0.91")
+            .await
+            .unwrap();
+        let t = s.task(a).await.unwrap().unwrap();
+        assert_eq!(t.kind, Some(TaskKind::Bugfix));
+        assert_eq!((t.attempts, t.review_rounds, t.reopen_count), (0, 1, 1));
+        assert_eq!(t.pr_url.as_deref(), Some("https://github.com/o/r/pull/9"));
+        assert_eq!(t.pr_state.as_deref(), Some("merged"));
+        let waiting = s.tasks_in(&[TaskState::NeedsInfo]).await.unwrap();
+        assert_eq!(waiting.iter().map(|t| t.id).collect::<Vec<_>>(), vec![b]);
+        assert_eq!(s.task_by_url(&issue(5).url).await.unwrap().unwrap().id, b);
+        assert!(matches!(
+            s.set_kind(42, TaskKind::Docs).await,
+            Err(StoreError::UnknownTask(42))
+        ));
+    }
+
+    #[tokio::test]
+    async fn routing_stage_runs_and_replies_round_trip() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(6)).await.unwrap().unwrap();
+        s.record_routing(
+            id,
+            Some("jev-1.13.0"),
+            Some(&json!({"difficulty": 2.1})),
+            &json!({"plan": "frontier", "implement": "standard", "review": "frontier"}),
+            &["difficulty 2.10 -> implement Standard".to_string()],
+        )
+        .await
+        .unwrap();
+        let r = s.routing_decisions(id).await.unwrap();
+        assert_eq!(r[0].0.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(r[0].1, Some(json!({"difficulty": 2.1})));
+        assert_eq!(r[0].3, vec!["difficulty 2.10 -> implement Standard"]);
+        let run = StageRunRecord {
+            task_id: id,
+            stage: "implement".into(),
+            model_id: "codex-hi".into(),
+            exit: "completed".into(),
+            turns: 7,
+            input_tokens: 1000,
+            output_tokens: 200,
+            session_dir: "/s/6/implement".into(),
+            gate_score: Some("0,0,0".into()),
+            started_at: 10,
+            finished_at: 20,
+        };
+        s.record_stage_run(&run).await.unwrap();
+        assert_eq!(s.stage_runs(id).await.unwrap(), vec![run]);
+        assert_eq!(s.last_reply_seen(id).await.unwrap(), None);
+        s.set_last_reply_seen(id, "2026-09-24T10:00:00Z")
+            .await
+            .unwrap();
+        s.set_last_reply_seen(id, "2026-09-24T11:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.last_reply_seen(id).await.unwrap().as_deref(),
+            Some("2026-09-24T11:00:00Z")
+        );
+    }
+
+    /// Final review C1: `--workers N` moves tasks concurrently through one store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn review_c1_concurrent_transitions_all_succeed() {
+        let (_d, s) = store().await;
+        let s = std::sync::Arc::new(s);
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            ids.push(s.add_issue(&issue(100 + n)).await.unwrap().unwrap());
+        }
+        let mut handles = Vec::new();
+        for i in 0..200 {
+            let s = s.clone();
+            let id = ids[i % ids.len()];
+            let to = if i % 2 == 0 {
+                TaskState::Planning
+            } else {
+                TaskState::Implementing
+            };
+            handles.push(tokio::spawn(async move {
+                s.transition(id, to, "concurrent").await
+            }));
+        }
+        let mut failures = 0;
+        for h in handles {
+            if h.await.unwrap().is_err() {
+                failures += 1;
+            }
+        }
+        assert_eq!(failures, 0, "transitions failed under concurrency");
+        let logged: usize = {
+            let mut n = 0;
+            for id in &ids {
+                n += s.transitions(*id).await.unwrap().len() - 1;
+            }
+            n
+        };
+        assert_eq!(logged, 200);
+    }
+
+    /// Final review (minor, promoted): the same issue under another spelling of its URL
+    /// (case, trailing slash) or repo slug is the same task.
+    #[tokio::test]
+    async fn review_same_issue_different_url_is_not_a_second_task() {
+        let (_d, s) = store().await;
+        s.add_issue(&issue(7)).await.unwrap().unwrap();
+        let mut variant = issue(7);
+        variant.url = "https://github.com/O/R/issues/7/".into();
+        variant.repo = "O/R".into();
+        assert_eq!(s.add_issue(&variant).await.unwrap(), None);
+    }
+
+    #[test]
+    fn rfc3339_matches_github_timestamps() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339(1_790_316_980), "2026-09-25T06:16:20Z");
+    }
+
+    #[tokio::test]
+    async fn review_i1_i2_transition_and_writes_everything_together() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(4)).await.unwrap().unwrap();
+        s.bump_attempts(id).await.unwrap();
+        s.set_escalated(id, true).await.unwrap();
+        s.transition_and(id, TaskState::Implementing, "changes", Also::NewRound)
+            .await
+            .unwrap();
+        let t = s.task(id).await.unwrap().unwrap();
+        assert_eq!(
+            (t.state, t.attempts, t.escalated, t.review_rounds),
+            (TaskState::Implementing, 0, false, 1)
+        );
+        let q = json!({"text": "why?"});
+        s.transition_and(
+            id,
+            TaskState::NeedsInfo,
+            "ask",
+            Also::Question {
+                question: &q,
+                seen_at: "2026-09-25T10:00:00Z",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.last_output(id, "question").await.unwrap(), Some(q));
+        assert_eq!(
+            s.last_reply_seen(id).await.unwrap().as_deref(),
+            Some("2026-09-25T10:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn outputs_and_ladder_state_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provefab.db");
+        let id = {
+            let s = Store::open(&path).await.unwrap();
+            let id = s.add_issue(&issue(3)).await.unwrap().unwrap();
+            s.record_output(id, "plan", &json!({"v": 1})).await.unwrap();
+            s.record_output(id, "plan", &json!({"v": 2})).await.unwrap();
+            s.set_escalated(id, true).await.unwrap();
+            s.bump_attempts(id).await.unwrap();
+            s.bump_review_rounds(id).await.unwrap();
+            id
+        };
+        let s = Store::open(&path).await.unwrap();
+        assert_eq!(
+            s.last_output(id, "plan").await.unwrap(),
+            Some(json!({"v": 2}))
+        );
+        assert_eq!(s.last_output(id, "review").await.unwrap(), None);
+        let t = s.task(id).await.unwrap().unwrap();
+        assert!(t.escalated && t.attempts == 1 && t.review_rounds == 1);
+        s.reset_counters(id).await.unwrap();
+        let t = s.task(id).await.unwrap().unwrap();
+        assert!(!t.escalated && t.attempts == 0 && t.review_rounds == 0);
+    }
+}

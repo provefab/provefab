@@ -1,0 +1,225 @@
+//! `provefab guard`: reads one tool call as JSON on stdin and answers in the
+//! calling worker's format. Every failure path denies (fail closed).
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use crate::guard::{self, Decision, adapters};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GuardFormat {
+    /// `{"tool", "args", "cwd"}` in, `{"decision", "reason"?}` out. Used by the pi-provefab extension.
+    Pi,
+    /// Claude Code PreToolUse hook input and output.
+    ClaudeCode,
+    /// Codex PreToolUse hook: same contract as Claude Code, Codex tool names.
+    Codex,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct GuardOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+pub fn run_guard(format: GuardFormat, root: Option<&Path>, stdin: &str) -> GuardOutput {
+    let Ok(input) = serde_json::from_str::<Value>(stdin) else {
+        return unreadable(format);
+    };
+    let (tool_key, args_key) = match format {
+        GuardFormat::Pi => ("tool", "args"),
+        GuardFormat::ClaudeCode | GuardFormat::Codex => ("tool_name", "tool_input"),
+    };
+    let (Some(tool), Some(args)) = (
+        input.get(tool_key).and_then(Value::as_str),
+        input.get(args_key),
+    ) else {
+        return unreadable(format);
+    };
+    let decision = match root {
+        None => {
+            Decision::Deny("PROVEFAB_WORKTREE is not set, so every tool call is refused".into())
+        }
+        Some(root) if !root.is_dir() => Decision::Deny(format!(
+            "worktree root {} does not exist, so every tool call is refused",
+            root.display()
+        )),
+        Some(root) => {
+            let cwd = input
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.to_path_buf());
+            let call = match format {
+                GuardFormat::Pi => adapters::from_pi(tool, args),
+                GuardFormat::ClaudeCode => adapters::from_claude_code(tool, args),
+                GuardFormat::Codex => adapters::from_codex(tool, args),
+            };
+            guard::check(&call, &cwd, root)
+        }
+    };
+    render(format, &decision)
+}
+
+fn render(format: GuardFormat, decision: &Decision) -> GuardOutput {
+    let stdout = match (format, decision) {
+        (GuardFormat::Pi, Decision::Allow) => json!({"decision": "allow"}).to_string(),
+        (GuardFormat::Pi, Decision::Deny(reason)) => {
+            json!({"decision": "deny", "reason": reason}).to_string()
+        }
+        // Empty output leaves Claude Code's normal permission rules in charge.
+        // Returning "allow" would skip them, which the guard must never do.
+        (GuardFormat::ClaudeCode | GuardFormat::Codex, Decision::Allow) => String::new(),
+        (GuardFormat::ClaudeCode | GuardFormat::Codex, Decision::Deny(reason)) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+        .to_string(),
+    };
+    GuardOutput {
+        stdout,
+        stderr: String::new(),
+        exit_code: 0,
+    }
+}
+
+fn unreadable(format: GuardFormat) -> GuardOutput {
+    let reason = "provefab guard could not read the tool call";
+    match format {
+        GuardFormat::Pi => render(format, &Decision::Deny(reason.into())),
+        // Exit code 2 blocks the tool call in Claude Code; stderr becomes the reason.
+        GuardFormat::ClaudeCode | GuardFormat::Codex => GuardOutput {
+            stdout: String::new(),
+            stderr: reason.into(),
+            exit_code: 2,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn pi_allow_and_deny() {
+        let r = root();
+        let out = run_guard(
+            GuardFormat::Pi,
+            Some(r.path()),
+            r#"{"tool":"bash","args":{"command":"cargo test"}}"#,
+        );
+        assert_eq!(out.stdout, r#"{"decision":"allow"}"#);
+        let out = run_guard(
+            GuardFormat::Pi,
+            Some(r.path()),
+            r#"{"tool":"bash","args":{"command":"git push"}}"#,
+        );
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(out.exit_code, 0);
+    }
+
+    #[test]
+    fn claude_code_allow_is_silent_and_deny_uses_hook_output() {
+        let r = root();
+        let allow = run_guard(
+            GuardFormat::ClaudeCode,
+            Some(r.path()),
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+        );
+        assert_eq!(
+            allow,
+            GuardOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0
+            }
+        );
+
+        let deny = run_guard(
+            GuardFormat::ClaudeCode,
+            Some(r.path()),
+            r#"{"tool_name":"Write","tool_input":{"file_path":"/etc/hosts","content":""}}"#,
+        );
+        let v: Value = serde_json::from_str(&deny.stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    }
+
+    #[test]
+    fn missing_root_denies_even_harmless_calls() {
+        let out = run_guard(
+            GuardFormat::Pi,
+            None,
+            r#"{"tool":"read","args":{"path":"a"}}"#,
+        );
+        assert!(out.stdout.contains("PROVEFAB_WORKTREE"), "{}", out.stdout);
+    }
+
+    /// Final review M1 (re-graded): a root that does not exist denies shell calls too.
+    #[test]
+    fn review_m1_nonexistent_root_denies_everything() {
+        let out = run_guard(
+            GuardFormat::Pi,
+            Some(Path::new("/nope/not/a/worktree")),
+            r#"{"tool":"bash","args":{"command":"ls"}}"#,
+        );
+        assert!(
+            out.stdout.contains(r#""decision":"deny""#),
+            "{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn garbage_input_fails_closed() {
+        let r = root();
+        for bad in ["", "not json", "{}", r#"{"tool":"bash"}"#] {
+            let pi = run_guard(GuardFormat::Pi, Some(r.path()), bad);
+            assert!(pi.stdout.contains("deny"), "pi {bad:?}: {pi:?}");
+        }
+        let cc = run_guard(GuardFormat::ClaudeCode, Some(r.path()), "not json");
+        assert_eq!(cc.exit_code, 2);
+        assert!(!cc.stderr.is_empty());
+    }
+
+    #[test]
+    fn relative_pi_paths_resolve_against_cwd() {
+        let r = root();
+        std::fs::create_dir(r.path().join("sub")).unwrap();
+        let input = json!({"tool": "write", "args": {"path": "x.rs"}, "cwd": r.path().join("sub")})
+            .to_string();
+        assert_eq!(
+            run_guard(GuardFormat::Pi, Some(r.path()), &input).stdout,
+            r#"{"decision":"allow"}"#
+        );
+    }
+
+    #[test]
+    fn codex_patch_outside_the_worktree_is_denied() {
+        let r = root();
+        let patch = "*** Begin Patch\n*** Add File: /etc/evil\n+x\n*** End Patch";
+        let input = json!({"hook_event_name": "PreToolUse", "tool_name": "apply_patch", "tool_input": {"command": patch}}).to_string();
+        let out = run_guard(GuardFormat::Codex, Some(r.path()), &input);
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        let ok = json!({"tool_name": "apply_patch", "tool_input": {"command": "*** Begin Patch\n*** Add File: notes.txt\n+x\n*** End Patch"}}).to_string();
+        assert_eq!(
+            run_guard(GuardFormat::Codex, Some(r.path()), &ok).stdout,
+            ""
+        );
+        assert_eq!(
+            run_guard(GuardFormat::Codex, Some(r.path()), "nope").exit_code,
+            2
+        );
+    }
+}

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PROVEFAB_BIN:-provefab-bin-not-set}\" guard --format claude-code || exit 2",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

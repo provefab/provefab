@@ -1,0 +1,52 @@
+# Provefab configuration: copy this file to ~/.provefab/provefab.toml
+# (or to $PROVEFAB_HOME/provefab.toml), then adapt it.
+# Full reference: docs/guide/configuration.md
+# No secret here: the TypeSafe key goes in the macOS Keychain.
+
+[jev]
+model = "jev-1.13.0"            # full, pinned version; never "jev-latest"
+underspecified_threshold = 0.7  # above this, Provefab asks a question instead of coding
+loop_threshold = 0.8            # above this, an agent going in circles is stopped
+
+# The catalog: the models Provefab may use, by tier.
+# Each stage takes the first free model of the tier it needs, in this order.
+[[models]]
+id = "claude-sonnet"
+worker = "claude-code"           # "claude-code", "codex" or "pi"
+model = "sonnet"
+tier = "standard"                # "fast", "standard" or "frontier"
+max_concurrency = 1
+
+[[models]]
+id = "codex-gpt"
+worker = "codex"
+model = "gpt-5.5"
+tier = "standard"
+
+[[models]]
+id = "claude-opus"
+worker = "claude-code"
+model = "opus"
+tier = "frontier"
+
+# One block per watched repository.
+[[repos]]
+slug = "your-account/your-repo"
+# local_path = "~/code/your-repo"   # optional: without it, Provefab clones into ~/.provefab/repos
+label = "provefab"
+base = "main"
+poll_interval = "3m"
+gates = ["cargo fmt -- --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
+# [repos.merge]                  # read by Provefab Pro only: guarded auto-merge
+# auto = true
+# max_lines = 400
+
+[limits]
+stage_timeout = "30m"
+gate_timeout = "20m"
+max_turns = { plan = 40, implement = 150, review = 40 }
+review_rounds = 2
+max_auto_passes = 3
+max_stage_runs_per_day = 60
+max_drive_steps = 200
+retry_delays = ["5m", "15m", "45m"]

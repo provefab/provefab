@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["crates/agent-workers","crates/provefab","crates/jev"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license-file = "LICENSE.md"
+repository = "https://github.com/provefab/provefab"
+publish = false

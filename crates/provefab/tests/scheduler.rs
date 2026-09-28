@@ -1,0 +1,367 @@
+//! `provefab run`: the loop and `--dry-run`, with the fakes in `common`.
+
+use provefab::testkit::*;
+
+pub struct FakeSource(Issue);
+
+impl provefab::intake::IssueSource for FakeSource {
+    async fn open_issues(
+        &self,
+        _: &provefab::config::RepoConfig,
+    ) -> Result<Vec<Issue>, ForgeError> {
+        Ok(vec![self.0.clone()])
+    }
+    async fn comments(
+        &self,
+        _: &provefab::config::RepoConfig,
+        _: u64,
+    ) -> Result<Vec<Comment>, ForgeError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let source = FakeSource(p.hub.issue.clone());
+    let opts = provefab::scheduler::RunOptions {
+        workers: 2,
+        once: true,
+    };
+    provefab::scheduler::run(p.clone(), &source, opts, std::future::pending::<()>())
+        .await
+        .unwrap();
+    let t = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.state, PrOpen);
+    assert_eq!(
+        *p.hub.ensured.lock().unwrap(),
+        vec![
+            "provefab:in-pr",
+            "provefab:needs-info",
+            "provefab:failed",
+            "provefab:merged"
+        ]
+    );
+    // A second run finds nothing new to do.
+    provefab::scheduler::run(p.clone(), &source, opts, std::future::pending::<()>())
+        .await
+        .unwrap();
+    assert_eq!(p.hub.prs.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn dry_run_reports_routes_and_touches_nothing() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    let source = FakeSource(hub.issue.clone());
+    let oracle = FakeOracle {
+        verdict: Some(verdict(TaskKind::Feature, 0.1)),
+        ..Default::default()
+    };
+    let lines = provefab::scheduler::dry_run(&f.config, &source, &oracle)
+        .await
+        .unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].ends_with("-> plan top-claude, implement std-claude, review top-claude"),
+        "{}",
+        lines[0]
+    );
+    // Architectural scope: plan frontier, implement fast (none configured, so
+    // standard), review standard on the other provider.
+    let mut wide = verdict(TaskKind::Refactor, 0.1);
+    wide.difficulty = 0.5;
+    wide.scope = 3.0;
+    let routed = FakeOracle {
+        verdict: Some(wide),
+        ..Default::default()
+    };
+    let lines = provefab::scheduler::dry_run(&f.config, &source, &routed)
+        .await
+        .unwrap();
+    assert!(
+        lines[0].ends_with("-> plan top-claude, implement std-claude, review std-codex"),
+        "{}",
+        lines[0]
+    );
+    let asks = FakeOracle {
+        verdict: Some(verdict(TaskKind::Feature, 0.9)),
+        ..Default::default()
+    };
+    let lines = provefab::scheduler::dry_run(&f.config, &source, &asks)
+        .await
+        .unwrap();
+    assert!(
+        lines[0].contains("would ask for more information"),
+        "{}",
+        lines[0]
+    );
+    let none = provefab::scheduler::dry_run(&f.config, &source, &FakeOracle::default())
+        .await
+        .unwrap();
+    assert!(
+        lines.len() == 1 && none[0].contains("Jev unavailable"),
+        "{}",
+        none[0]
+    );
+    assert!(hub.posted.lock().unwrap().is_empty() && hub.labels.lock().unwrap().is_empty());
+}
+
+// ---------- final review fixes ----------
+
+const ONCE: provefab::scheduler::RunOptions = provefab::scheduler::RunOptions {
+    workers: 1,
+    once: true,
+};
+
+/// Bounded: a hang is the failure these tests catch.
+async fn within<F: std::future::Future>(secs: u64, f: F) -> F::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(secs), f)
+        .await
+        .expect("the scheduler did not return")
+}
+
+#[tokio::test]
+async fn review_i4_a_task_that_keeps_erroring_does_not_spin_and_once_ends() {
+    let f = fixture(&["true"]);
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let id = queue(&p).await;
+    p.store.transition(id, Planning, "test").await.unwrap();
+    // A routing row the store cannot read: every step of this task errors.
+    let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", f.home.join("provefab.db").display()))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_decisions (task_id, jev_model, verdict_json, tiers_json, reasons, at) VALUES (?, NULL, NULL, 'not json', '', 0)",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let source = FakeSource(p.hub.issue.clone());
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().state, Planning);
+}
+
+#[tokio::test]
+async fn review_i5_a_panicking_task_is_parked_for_a_person() {
+    let f = fixture(&["true"]);
+    let script = |_: &ModelEntry,
+                  _: &StageRequest,
+                  _: &UnboundedSender<WorkerEvent>|
+     -> Option<StageResult> { panic!("worker adapter bug") };
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(script),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let source = FakeSource(p.hub.issue.clone());
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    let t = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.state, NeedsYou);
+    let posted = p.hub.posted.lock().unwrap().clone();
+    assert!(
+        posted.last().unwrap().contains("internal error"),
+        "{posted:?}"
+    );
+    assert!(
+        posted.iter().all(|c| !c.contains("worker adapter bug")),
+        "{posted:?}"
+    );
+}
+
+#[tokio::test]
+async fn review_i6_stopping_cancels_running_stages_and_returns() {
+    let f = fixture(&["true"]);
+    let script = |_: &ModelEntry, _: &StageRequest, _: &UnboundedSender<WorkerEvent>| None; // hangs
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(script),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let source = FakeSource(p.hub.issue.clone());
+    let forever = provefab::scheduler::RunOptions {
+        workers: 1,
+        once: false,
+    };
+    let stop = tokio::time::sleep(std::time::Duration::from_millis(500));
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, forever, stop),
+    )
+    .await
+    .unwrap();
+    // The stage was cancelled, not finished: the task resumes after a restart.
+    let t = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.state, Planning);
+}
+
+/// A failed comment becomes a `pending_github` effect and is retried on the
+/// scheduler's next poll: the question still reaches the issue, exactly once.
+#[tokio::test]
+async fn pending_github_comment_is_retried_on_next_poll() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    hub.comment_failures
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle {
+                verdict: Some(verdict(TaskKind::Feature, 0.9)),
+                ..Default::default()
+            },
+            hub,
+        )
+        .await,
+    );
+    let source = FakeSource(p.hub.issue.clone());
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    let id = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().state, NeedsInfo);
+    assert!(p.hub.posted.lock().unwrap().is_empty());
+    // The question comment failed; the label edit right after it queues behind
+    // it too, so a later retry cannot post it out of order.
+    assert_eq!(
+        p.store.count_outputs(id, "pending_github").await.unwrap(),
+        2
+    );
+
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    let posted = p.hub.posted.lock().unwrap().clone();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert!(posted[0].contains("needs more detail"), "{posted:?}");
+    assert_eq!(
+        p.store.count_outputs(id, "pending_github").await.unwrap(),
+        0
+    );
+
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.hub.posted.lock().unwrap().len(), 1);
+}
+
+/// D52: each poll looks at open PRs; a merged one is recorded.
+#[tokio::test]
+async fn polling_watches_open_prs() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let source = FakeSource(p.hub.issue.clone());
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
+        state: provefab::forge::PrState::Merged,
+        comments: vec![],
+    };
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    let t = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.pr_state.as_deref(), Some("merged"));
+    // After the merge, the issue is checked at most once an hour (Plan 4 review I2).
+    for _ in 0..3 {
+        within(
+            10,
+            provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        p.hub
+            .issue_open_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
