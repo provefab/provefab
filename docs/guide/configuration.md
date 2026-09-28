@@ -56,7 +56,7 @@ How the tier is chosen:
 | `trust_pi_project` | `false` | Pi only: load the repository's Pi config (avoid for a repository you do not control). |
 | `gates` | required, at least one | Commands run in the worktree after every implementation. All must pass. They decide, not the agents. |
 
-Provefab Pro reads an optional `[repos.merge]` table (`auto`, `max_lines`) for guarded auto-merge. This binary ignores it, says so in `provefab doctor` and in each PR comment, and never merges. The old keys `auto_merge` and `auto_merge_max_lines` are refused with a message naming `[repos.merge]`.
+Provefab Pro reads an optional `[repos.merge]` table for guarded auto-merge: `auto` (off by default), `max_lines` (400), `require_test_change` (on: only a change that adds or changes tests merges by itself), `exclude` (paths kept for a human, `.github/**` by default) and `allow_public` (off: a public repository is never merged automatically, since anyone can write its issues). This binary ignores it, says so in `provefab doctor` and in each PR comment, and never merges. The old keys `auto_merge` and `auto_merge_max_lines` are refused with a message naming `[repos.merge]`.
 
 For gates that work well:
 - Put in what your CI requires: format, lint, tests.
