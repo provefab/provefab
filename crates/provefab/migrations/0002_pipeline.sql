@@ -2,7 +2,7 @@
 -- Set once the retry ladder has moved the implement stage up a tier.
 ALTER TABLE tasks ADD COLUMN escalated INTEGER NOT NULL DEFAULT 0;
 
--- Structured stage answers (plan, review) and Provefab's own texts
+-- Structured stage answers (plan, review) and the factory's own texts
 -- (the NeedsInfo question), newest last (spec §3.2).
 CREATE TABLE stage_outputs (
     id      INTEGER PRIMARY KEY,

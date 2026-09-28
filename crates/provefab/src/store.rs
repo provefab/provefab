@@ -704,6 +704,26 @@ fn task_row(r: &SqliteRow) -> Result<TaskRow, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Applied migrations are checksummed by sqlx: editing one, even a
+    /// comment, makes every existing database refuse to open. These are the
+    /// checksums installed databases carry (seen live when the Provefab rename
+    /// touched a comment, plan 5 task 8).
+    #[test]
+    fn migrations_are_frozen() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let sums: Vec<String> = sqlx::migrate!("./migrations")
+            .iter()
+            .map(|m| hex(&m.checksum))
+            .collect();
+        assert_eq!(
+            sums,
+            [
+                "58482ad7ee578abba1976c7bc8f21ed4c3c2a481c6a24f74d64164e7f37c01e6dc1931ad68e527a67df118bf2983cdbd",
+                "fa9d5e7daa5ddeec2a821c7123b4fcca83a08f59d147187aac8a58405466bc12e383f228b0a8574c97fa57817f6fa432",
+            ]
+        );
+    }
     use serde_json::json;
 
     fn issue(n: u64) -> NewIssue {
