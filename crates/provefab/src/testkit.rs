@@ -229,6 +229,8 @@ pub struct FakeHub {
     pub issue_missing: std::sync::atomic::AtomicBool,
     /// While set, `edit_labels` fails (GitHub unreachable).
     pub labels_down: std::sync::atomic::AtomicBool,
+    /// The repository is public (merge policies refuse by default).
+    pub public: std::sync::atomic::AtomicBool,
 }
 
 impl FakeHub {
@@ -262,6 +264,7 @@ impl FakeHub {
             issue_open_calls: Default::default(),
             issue_missing: Default::default(),
             labels_down: Default::default(),
+            public: Default::default(),
         }
     }
 
@@ -374,6 +377,9 @@ impl Hub for FakeHub {
     async fn pr_merge(&self, _: &str, url: &str, head: &str) -> Result<(), ForgeError> {
         self.merged.lock().unwrap().push(format!("{url}@{head}"));
         Ok(())
+    }
+    async fn repo_is_public(&self, _: &str) -> Result<bool, ForgeError> {
+        Ok(self.public.load(std::sync::atomic::Ordering::SeqCst))
     }
     async fn issue_open(&self, _: &str, _: u64) -> Result<bool, ForgeError> {
         self.issue_open_calls

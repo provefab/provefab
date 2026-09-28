@@ -179,6 +179,8 @@ pub trait Hub {
         url: &str,
         head: &str,
     ) -> impl Future<Output = Result<(), ForgeError>> + Send;
+    /// Whether anyone can write the repository's issues (a public repository).
+    fn repo_is_public(&self, slug: &str) -> impl Future<Output = Result<bool, ForgeError>> + Send;
 }
 
 impl Hub for Gh {
@@ -230,6 +232,9 @@ impl Hub for Gh {
     }
     async fn pr_merge(&self, slug: &str, url: &str, head: &str) -> Result<(), ForgeError> {
         Gh::pr_merge(self, slug, url, head).await
+    }
+    async fn repo_is_public(&self, slug: &str) -> Result<bool, ForgeError> {
+        Gh::repo_is_public(self, slug).await
     }
 }
 

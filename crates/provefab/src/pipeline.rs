@@ -2580,6 +2580,10 @@ where
         Box::pin(self.p.git.is_ancestor(self.wt, ancestor, of))
     }
 
+    fn repo_is_public(&self) -> BoxFuture<'_, Result<bool, ForgeError>> {
+        Box::pin(self.p.hub.repo_is_public(&self.repo.slug))
+    }
+
     fn merge<'a>(&'a self, head: &'a str) -> BoxFuture<'a, Result<MergeOutcome, PipelineError>> {
         Box::pin(async move {
             // Only the reviewed head: a later push to the branch is not merged (review I6).

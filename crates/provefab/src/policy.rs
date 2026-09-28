@@ -46,6 +46,8 @@ pub trait MergeTools: Send + Sync {
         ancestor: &'a str,
         of: &'a str,
     ) -> BoxFuture<'a, Result<bool, ForgeError>>;
+    /// Whether the repository is public: anyone can write the issues agents read.
+    fn repo_is_public(&self) -> BoxFuture<'_, Result<bool, ForgeError>>;
     /// `pr_merge` pinned to `head`; on success records the merge (labels,
     /// `merged_at`, worktree removal); on failure writes the reason to the task log.
     fn merge<'a>(&'a self, head: &'a str) -> BoxFuture<'a, Result<MergeOutcome, PipelineError>>;

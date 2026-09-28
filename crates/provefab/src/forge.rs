@@ -449,6 +449,41 @@ fn is_test_path(path: &str) -> bool {
         || name.ends_with("_spec.rb")
 }
 
+/// Lines that declare a test, across the languages the gates usually run.
+const TEST_MARKERS: &[&str] = &[
+    "#[test]",
+    "#[tokio::test]",
+    "#[rstest]",
+    "def test_",
+    "func Test",
+    "it(",
+    "test(",
+    "describe(",
+    "@Test",
+];
+
+/// Whether the change adds or changes tests: a test file added or modified, or
+/// an added line that declares a test (inline Rust tests live next to the code).
+/// Used by merge policies that require a test change (landing L11).
+pub fn adds_tests(changed: &[Change], diff: &str) -> bool {
+    changed
+        .iter()
+        .any(|c| c.status != 'D' && is_test_path(&c.path))
+        || diff.lines().any(|l| {
+            l.strip_prefix('+')
+                .filter(|_| !l.starts_with("+++"))
+                .is_some_and(|added| {
+                    let t = added.trim_start();
+                    TEST_MARKERS.iter().any(|m| t.starts_with(m))
+                })
+        })
+}
+
+/// `gh repo view --json visibility -q .visibility` says the repo is public.
+pub fn is_public_visibility(out: &str) -> bool {
+    out.trim().eq_ignore_ascii_case("PUBLIC")
+}
+
 /// Markers that switch tests off or focus a single test (which skips the others).
 /// Matched only in test files, and only at a word boundary (`xit(` must not
 /// match `exit(`). `#[ignore` is also matched in any `.rs` file, since Rust
@@ -835,6 +870,26 @@ impl Gh {
         Ok(())
     }
 
+    /// Whether the repository is public: anyone can then write the issue text
+    /// agents read (landing L11: no auto-merge on public repos by default).
+    pub async fn repo_is_public(&self, slug: &str) -> Result<bool, ForgeError> {
+        let out = self
+            .gh(
+                &[
+                    "repo",
+                    "view",
+                    slug,
+                    "--json",
+                    "visibility",
+                    "-q",
+                    ".visibility",
+                ],
+                None,
+            )
+            .await?;
+        Ok(is_public_visibility(&out))
+    }
+
     /// Whether the issue is open (a merged fix whose issue was reopened, D52).
     pub async fn issue_open(&self, slug: &str, number: u64) -> Result<bool, ForgeError> {
         let n = number.to_string();
@@ -1017,6 +1072,34 @@ mod tests {
         )));
         assert!(!is_bot_comment("It is version 2."));
         assert!(BOT_PREFIX.contains("Provefab"));
+    }
+
+    /// Auto-merge policy (landing L11): a change must add or change tests,
+    /// in a test file or inline (Rust `#[test]` next to the code).
+    #[test]
+    fn adds_tests_sees_test_files_and_inline_tests() {
+        let lib = [Change::new('M', "src/lib.rs")];
+        assert!(!adds_tests(&lib, "+pub fn range() {}\n"));
+        assert!(adds_tests(&lib, "+    #[test]\n+    fn empty() {}\n"));
+        assert!(adds_tests(&lib, "+#[tokio::test]\n"));
+        assert!(adds_tests(&[Change::new('A', "tests/range.rs")], ""));
+        assert!(adds_tests(&[Change::new('M', "app/foo.test.ts")], ""));
+        assert!(adds_tests(
+            &[Change::new('M', "app.py")],
+            "+def test_range():\n"
+        ));
+        assert!(adds_tests(&[Change::new('M', "a_test.go")], ""));
+        // Deleting a test file is not adding one.
+        assert!(!adds_tests(&[Change::new('D', "tests/old.rs")], ""));
+        // A removed test line is not an added one.
+        assert!(!adds_tests(&lib, "-    #[test]\n"));
+    }
+
+    #[test]
+    fn visibility_parses_gh_output() {
+        assert!(is_public_visibility("PUBLIC\n"));
+        assert!(!is_public_visibility("PRIVATE"));
+        assert!(!is_public_visibility("INTERNAL"));
     }
 
     #[test]
