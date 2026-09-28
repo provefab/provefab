@@ -151,7 +151,7 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
         closed: u32,
         reopened_after_merge: u32,
         stopped: u32,
-        minutes_to_pr: Vec<i64>,
+        seconds_to_pr: Vec<i64>,
         reviewers: BTreeMap<String, u32>,
     }
     let mut repos: BTreeMap<String, Repo> = BTreeMap::new();
@@ -170,7 +170,7 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
             transitions.first(),
             transitions.iter().find(|x| x.to == TaskState::PrOpen),
         ) {
-            r.minutes_to_pr.push((opened.at - first.at) / 60);
+            r.seconds_to_pr.push(opened.at - first.at);
         }
         match t.pr_state.as_deref() {
             Some("merged" | "done") => {
@@ -200,11 +200,15 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
     }
     let mut out = String::new();
     for (slug, r) in repos {
-        let mut mins = r.minutes_to_pr.clone();
-        mins.sort_unstable();
-        let median = mins
-            .get(mins.len() / 2)
-            .map_or("-".to_string(), |m| format!("{m} min"));
+        let mut secs = r.seconds_to_pr.clone();
+        secs.sort_unstable();
+        let median = secs.get(secs.len() / 2).map_or("-".to_string(), |&t| {
+            if t < 60 {
+                format!("{t} s")
+            } else {
+                format!("{} min", t / 60)
+            }
+        });
         let pct = (r.prs * 100).checked_div(r.tasks).unwrap_or(0);
         let _ = writeln!(
             out,
