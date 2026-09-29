@@ -1146,9 +1146,20 @@ Please reply with what should happen, what happens instead, and how to reproduce
         commit_count: Option<usize>,
     ) -> Result<(), PipelineError> {
         if !repo.post_merge_checks.is_empty() && (merge_sha.is_none() || base.is_none()) {
-            // GitHub may not expose mergeCommit immediately after a squash.
-            // Keep the PR watched so the next poll can recover its exact SHA.
-            return Ok(());
+            // GitHub may report `mergeCommit` a little after the merge: keep the PR
+            // watched, but never longer than an hour (spec section 4).
+            let first = match self.store.last_output(task.id, "merge_seen").await? {
+                Some(v) => v["at"].as_i64().unwrap_or_else(now),
+                None => {
+                    self.store
+                        .record_output(task.id, "merge_seen", &json!({"at": now()}))
+                        .await?;
+                    now()
+                }
+            };
+            if now() - first < crate::post_merge::ATTRIBUTION_WAIT_SECS {
+                return Ok(());
+            }
         }
         let merged = format!("{}:merged", repo.label);
         let in_pr = format!("{}:in-pr", repo.label);
@@ -1160,19 +1171,53 @@ Please reply with what should happen, what happens instead, and how to reproduce
             &[&in_pr],
         )
         .await?;
-        if let (Some(sha), Some(base)) = (merge_sha, base)
-            && base == repo.base
-            && !repo.post_merge_checks.is_empty()
-        {
-            self.store
-                .ensure_post_merge_check(&crate::store::NewPostMergeCheck {
-                    task_id: task.id,
-                    merge_sha: sha,
-                    base,
-                    commit_count,
-                    auto_merged: false,
-                })
-                .await?;
+        if !repo.post_merge_checks.is_empty() {
+            let auto_merged = self
+                .store
+                .last_output(task.id, "auto_merged")
+                .await?
+                .is_some();
+            match (merge_sha, base) {
+                (Some(sha), Some(b)) if b == repo.base => {
+                    self.store
+                        .ensure_post_merge_check(&crate::store::NewPostMergeCheck {
+                            task_id: task.id,
+                            merge_sha: sha,
+                            base: b,
+                            commit_count,
+                            auto_merged,
+                        })
+                        .await?;
+                }
+                // Merged into another branch: not what the checks describe.
+                (Some(_), Some(_)) => {}
+                _ => {
+                    let row = self
+                        .store
+                        .ensure_post_merge_check(&crate::store::NewPostMergeCheck {
+                            task_id: task.id,
+                            merge_sha: merge_sha.unwrap_or("unknown"),
+                            base: base.unwrap_or(&repo.base),
+                            commit_count,
+                            auto_merged,
+                        })
+                        .await?;
+                    self.store
+                        .advance_post_merge(
+                            row.id,
+                            crate::post_merge::CheckState::Queued,
+                            crate::post_merge::CheckState::Blocked,
+                            &crate::store::CheckPatch {
+                                failure_kind: Some(crate::post_merge::FailureKind::AttributionMissing),
+                                failure_summary: Some(format!(
+                                    "GitHub reported merge commit {merge_sha:?} and base {base:?} for over an hour"
+                                )),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                }
+            }
         }
         self.store
             .record_output(
@@ -2741,7 +2786,7 @@ where
                             self.task,
                             self.repo,
                             status.merge_sha.as_deref(),
-                            status.base_ref.as_deref().or(Some(self.repo.base.as_str())),
+                            status.base_ref.as_deref(),
                             status.commit_count,
                         )
                         .await?;

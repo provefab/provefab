@@ -3,7 +3,10 @@
 
 use std::path::Path;
 
-use provefab::testkit::{fixture, git};
+use provefab::post_merge::{CheckState, FailureKind};
+use provefab::task::TaskState;
+use provefab::testkit::{FakeHub, FakeOracle, Fixture, Script, fixture, git, pipeline, queue};
+use serde_json::json;
 
 fn commit_and_push(repo: &Path, file: &str, content: &str, msg: &str) -> String {
     std::fs::write(repo.join(file), content).unwrap();
@@ -99,4 +102,153 @@ async fn a_merge_commit_reverts_with_mainline_one() {
         std::fs::read_to_string(wt.join("README.md")).unwrap(),
         "hello\n"
     );
+}
+
+type P = provefab::pipeline::Pipeline<provefab::testkit::FakeRunner, FakeOracle, FakeHub>;
+
+fn unused_worker(
+    _: &provefab::config::ModelEntry,
+    _: &agent_workers::StageRequest,
+    _: &tokio::sync::mpsc::UnboundedSender<agent_workers::WorkerEvent>,
+) -> Option<agent_workers::StageResult> {
+    None
+}
+
+/// A task whose Provefab PR (pull/8) is open, in a repo with `checks`.
+async fn open_pr_task(checks: &[&str]) -> (Fixture, P, i64) {
+    let mut f = fixture(&["true"]);
+    f.config.repos[0].post_merge_checks = checks.iter().map(|c| c.to_string()).collect();
+    let p = pipeline(
+        &f,
+        Box::new(unused_worker) as Box<Script>,
+        FakeOracle::default(),
+        FakeHub::new("issue"),
+    )
+    .await;
+    *p.hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let id = queue(&p).await;
+    p.store
+        .set_pr(id, "https://github.com/o/r/pull/8", "open")
+        .await
+        .unwrap();
+    p.store
+        .transition(id, TaskState::PrOpen, "pr")
+        .await
+        .unwrap();
+    (f, p, id)
+}
+
+fn merged(
+    sha: Option<&str>,
+    base: Option<&str>,
+    commits: Option<usize>,
+) -> provefab::forge::PrStatus {
+    provefab::forge::PrStatus {
+        state: provefab::forge::PrState::Merged,
+        comments: vec![],
+        head_sha: Some("pr-head".into()),
+        merge_sha: sha.map(Into::into),
+        base_ref: base.map(Into::into),
+        commit_count: commits,
+    }
+}
+
+#[tokio::test]
+async fn a_merge_on_the_configured_base_queues_one_check() {
+    let (_f, p, id) = open_pr_task(&["true"]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(Some("abc"), Some("main"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    let c = p.store.post_merge_checks(id).await.unwrap();
+    assert_eq!(c.len(), 1);
+    assert_eq!(
+        (c[0].merge_sha.as_str(), c[0].state),
+        ("abc", CheckState::Queued)
+    );
+    assert_eq!(
+        p.store.task(id).await.unwrap().unwrap().pr_state.as_deref(),
+        Some("merged")
+    );
+}
+
+#[tokio::test]
+async fn another_base_or_no_opt_in_creates_no_check() {
+    let (_f, p, id) = open_pr_task(&["true"]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(Some("abc"), Some("release"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
+
+    let (_f, p, id) = open_pr_task(&[]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(Some("abc"), Some("main"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn missing_attribution_waits_an_hour_then_blocks() {
+    let (_f, p, id) = open_pr_task(&["true"]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(None, Some("main"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
+    assert_eq!(
+        p.store.task(id).await.unwrap().unwrap().pr_state.as_deref(),
+        Some("open")
+    );
+    // An hour later GitHub still has no merge commit: record the merge, block the check.
+    let long_ago = provefab::store::now() - provefab::post_merge::ATTRIBUTION_WAIT_SECS - 1;
+    p.store
+        .record_output(id, "merge_seen", &json!({"at": long_ago}))
+        .await
+        .unwrap();
+    p.watch_pr(id).await.unwrap();
+    let c = p.store.post_merge_checks(id).await.unwrap();
+    assert_eq!(c[0].merge_sha, "unknown");
+    assert_eq!(
+        (c[0].state, c[0].failure_kind),
+        (CheckState::Blocked, Some(FailureKind::AttributionMissing))
+    );
+    assert_eq!(
+        p.store.task(id).await.unwrap().unwrap().pr_state.as_deref(),
+        Some("merged")
+    );
+}
+
+#[tokio::test]
+async fn a_missing_base_is_never_inferred() {
+    let (_f, p, id) = open_pr_task(&["true"]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(Some("abc"), None, Some(1));
+    let long_ago = provefab::store::now() - provefab::post_merge::ATTRIBUTION_WAIT_SECS - 1;
+    p.store
+        .record_output(id, "merge_seen", &json!({"at": long_ago}))
+        .await
+        .unwrap();
+    p.watch_pr(id).await.unwrap();
+    let c = p.store.post_merge_checks(id).await.unwrap();
+    assert_eq!(c[0].failure_kind, Some(FailureKind::AttributionMissing));
+}
+
+#[tokio::test]
+async fn an_auto_merge_is_recorded_on_the_check() {
+    let (_f, p, id) = open_pr_task(&["true"]).await;
+    p.store
+        .record_output(id, "auto_merged", &json!({"head": "pr-head"}))
+        .await
+        .unwrap();
+    *p.hub.pr_status.lock().unwrap() = merged(Some("abc"), Some("main"), Some(3));
+    p.watch_pr(id).await.unwrap();
+    let c = p.store.post_merge_checks(id).await.unwrap();
+    assert!(c[0].auto_merged);
+    assert_eq!(c[0].commit_count, Some(3));
+}
+
+#[tokio::test]
+async fn opting_in_later_never_checks_an_old_merge() {
+    let (_f, p, id) = open_pr_task(&[]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(Some("abc"), Some("main"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    // The owner opts in after the merge was recorded.
+    let mut p = p;
+    p.config.repos[0].post_merge_checks = vec!["true".into()];
+    p.watch_pr(id).await.unwrap();
+    p.process_post_merge(id).await.unwrap();
+    assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
 }

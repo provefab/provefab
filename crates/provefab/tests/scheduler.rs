@@ -398,3 +398,57 @@ async fn the_loop_refreshes_stale_prices_from_the_cache() {
         .unwrap();
     assert_eq!(p.prices.read().unwrap().source, "seeded");
 }
+
+/// Post-merge rows advance on every tick, not on the hourly reopen watch.
+#[tokio::test]
+async fn post_merge_checks_advance_on_every_tick() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.config.repos[0].post_merge_checks = vec!["true".into()];
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let source = FakeSource(p.hub.issue.clone());
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    // A real one-parent commit on origin/main stands in for the squash merge.
+    let repo = f.config.repos[0].path_in(&f.home);
+    std::fs::write(repo.join("MERGED.md"), "merged\n").unwrap();
+    git(&repo, &["add", "MERGED.md"]);
+    git(&repo, &["commit", "-qm", "squash merge"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let sha = git(&repo, &["rev-parse", "HEAD"]);
+    *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
+        state: provefab::forge::PrState::Merged,
+        comments: vec![],
+        head_sha: None,
+        merge_sha: Some(sha),
+        base_ref: Some("main".into()),
+        commit_count: Some(1),
+    };
+    for _ in 0..4 {
+        within(
+            10,
+            provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        )
+        .await
+        .unwrap();
+    }
+    let t = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap();
+    let c = p.store.post_merge_checks(t.id).await.unwrap();
+    assert_eq!(c[0].state, provefab::post_merge::CheckState::Passed);
+}

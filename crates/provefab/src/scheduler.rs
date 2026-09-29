@@ -162,6 +162,11 @@ where
                     if !in_flight.contains(&t.id)
                         && repo_of(&p.config, &t.repo).is_some_and(|r| r.slug == repo.slug)
                     {
+                        // Post-merge rows advance every tick; the hourly throttle
+                        // below is for the reopen watch only (spec section 5).
+                        if let Err(e) = p.process_post_merge(t.id).await {
+                            eprintln!("provefab: post-merge verification for task {}: {e}", t.id);
+                        }
                         // After the merge only a reopen matters: check hourly (Plan 4 review I2).
                         if matches!(t.pr_state.as_deref(), Some("merged" | "done")) {
                             let recent = p
@@ -184,9 +189,6 @@ where
                         match p.watch_pr(t.id).await {
                             Ok(TaskState::PrOpen) => {}
                             other => report(t.id, other),
-                        }
-                        if let Err(e) = p.process_post_merge(t.id).await {
-                            eprintln!("provefab: post-merge verification for task {}: {e}", t.id);
                         }
                     }
                 }
