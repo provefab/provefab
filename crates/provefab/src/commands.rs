@@ -123,31 +123,24 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
             .map(|r| r.reason.clone())
             .unwrap_or_default();
         let why = why.lines().next().unwrap_or_default();
-        let checks = store.post_merge_checks(t.id).await?;
-        let post_merge = checks
-            .last()
-            .map(|c| {
-                format!(
-                    "  post-merge: {}{}",
-                    c.state.as_str(),
-                    c.revert_pr_url
-                        .as_ref()
-                        .map(|u| format!(" {u}"))
-                        .unwrap_or_default()
-                )
-            })
-            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:>4}  {}#{}  {:<12} {}{}{}",
+            "{:>4}  {}#{}  {:<12} {}{}",
             t.id,
             t.repo,
             t.issue_number,
             t.state.as_str(),
             why,
             t.pr_url.map(|u| format!("  {u}")).unwrap_or_default(),
-            post_merge
         );
+    }
+    let counts = store.post_merge_state_counts().await?;
+    if !counts.is_empty() {
+        let parts: Vec<String> = counts
+            .iter()
+            .map(|(s, n)| format!("{} {n}", s.as_str()))
+            .collect();
+        let _ = writeln!(out, "post-merge checks: {}", parts.join(" · "));
     }
     Ok(out)
 }
@@ -167,8 +160,10 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
         closed: u32,
         reopened_after_merge: u32,
         post_merge_passed: u32,
-        post_merge_failed: u32,
+        post_merge_flaky: u32,
+        post_merge_superseded: u32,
         revert_prs: u32,
+        post_merge_blocked: u32,
         stopped: u32,
         seconds_to_pr: Vec<i64>,
         reviewers: BTreeMap<String, u32>,
@@ -193,12 +188,15 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
         }
         for check in store.post_merge_checks(t.id).await? {
             match check.state {
-                CheckState::Passed => r.post_merge_passed += 1,
-                CheckState::RevertOpen => {
-                    r.post_merge_failed += 1;
-                    r.revert_prs += 1;
+                CheckState::Passed => {
+                    r.post_merge_passed += 1;
+                    if !check.flaky.is_empty() {
+                        r.post_merge_flaky += 1;
+                    }
                 }
-                CheckState::Blocked => r.post_merge_failed += 1,
+                CheckState::Superseded => r.post_merge_superseded += 1,
+                CheckState::RevertOpen => r.revert_prs += 1,
+                CheckState::Blocked => r.post_merge_blocked += 1,
                 _ => {}
             }
         }
@@ -242,7 +240,7 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
         let pct = (r.prs * 100).checked_div(r.tasks).unwrap_or(0);
         let _ = writeln!(
             out,
-            "{slug}: {} tasks · {} PRs ({pct}%) · merged {} (auto {}, by hand {}) · closed {} · stopped {} · reopened after merge {} · post-merge passed {} failed {} revert PRs {}",
+            "{slug}: {} tasks · {} PRs ({pct}%) · merged {} (auto {}, by hand {}) · closed {} · stopped {} · reopened after merge {} · post-merge passed {} · flaky {} · superseded {} · reverts opened {} · blocked {}",
             r.tasks,
             r.prs,
             r.merged,
@@ -252,8 +250,10 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
             r.stopped,
             r.reopened_after_merge,
             r.post_merge_passed,
-            r.post_merge_failed,
-            r.revert_prs
+            r.post_merge_flaky,
+            r.post_merge_superseded,
+            r.revert_prs,
+            r.post_merge_blocked
         );
         let _ = writeln!(out, "  median issue to PR: {median}");
         let pairs: Vec<String> = r
@@ -363,17 +363,38 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
         for c in post_merge {
             let _ = writeln!(
                 out,
-                "  {} {} on {}{}{}",
+                "  #{} {} {} on {}{}",
+                c.id,
                 c.state.as_str(),
                 c.merge_sha,
                 c.base,
-                c.revert_pr_url
-                    .map(|u| format!("  revert {u}"))
-                    .unwrap_or_default(),
-                c.failure_summary
-                    .map(|s| format!("  failure: {s}"))
+                c.failure_kind
+                    .map(|k| format!("  ({})", k.as_str()))
                     .unwrap_or_default()
             );
+            for (label, v) in [
+                ("base tip", &c.base_sha),
+                ("revert commit", &c.revert_sha),
+                ("revert PR", &c.revert_pr_url),
+            ] {
+                if let Some(v) = v {
+                    let _ = writeln!(out, "    {label}: {v}");
+                }
+            }
+            if !c.failed_commands.is_empty() {
+                let failed = crate::post_merge::failure_summary(&c.failed_commands)
+                    .lines()
+                    .map(|l| format!("      {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let _ = writeln!(out, "    failed:\n{failed}");
+            }
+            if !c.flaky.is_empty() {
+                let _ = writeln!(out, "    flaky: {}", c.flaky.join(", "));
+            }
+            if let Some(s) = &c.failure_summary {
+                let _ = writeln!(out, "    detail: {s}");
+            }
         }
     }
     for kind in ["plan", "review", "failure"] {

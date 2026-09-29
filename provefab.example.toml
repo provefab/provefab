@@ -52,6 +52,7 @@ poll_interval = "3m"
 gates = ["cargo fmt -- --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
 # Optional: checks run against the squashed base commit after this repo's
 # Provefab-created PR merges. A failure opens a human-reviewed revert PR.
+# Never put secrets in these commands: failing command lines are posted on GitHub.
 # post_merge_checks = ["cargo test", "cargo clippy --all-targets -- -D warnings"]
 # [repos.merge]                  # read by Provefab Pro only: guarded auto-merge
 # auto = true

@@ -44,11 +44,13 @@ Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume 
 | `~/.provefab/repos/` | the clones Provefab manages |
 | `~/.provefab/worktrees/<id>/` | a task's worktree, removed after the merge |
 | `~/.provefab/sessions/<id>/` | agent transcripts and check outputs, per stage |
-| `~/.provefab/post-merge/` | temporary detached worktrees used to verify merged commits and prepare revert PRs |
+| `~/.provefab/post-merge/` | temporary detached worktrees, one per check step, removed when the step ends |
 | `~/.provefab/claude/`, `~/.provefab/codex/` | worker plan logins, kept apart from your own sessions |
 | `~/.provefab/claude-api/`, `~/.provefab/codex-api/` | worker API-key sign-ins (the Anthropic key itself stays in the Keychain) |
 | `~/.provefab/prices.json` | model prices, refreshed at most once a day from models.dev (LiteLLM as fallback) |
 | `~/.provefab/bin/provefab` | the binary the service runs |
+
+Provefab never deletes remote `provefab/revert-*` branches.
 
 `PROVEFAB_HOME` moves all of this elsewhere.
 

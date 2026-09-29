@@ -901,3 +901,32 @@ async fn issue_failures_do_not_count_against_the_pr_target() {
     assert!(c.issue_notified_at.is_some() && c.pr_notified_at.is_some());
     assert_eq!((issue_markers(&p, c.id), pr_markers(&p, c.id)), (1, 1));
 }
+
+#[tokio::test]
+async fn status_log_and_stats_show_the_check() {
+    let (_f, p, id, sha) = setup(&["grep -q hello README.md"], "broken\n").await;
+    let c = drive(&p, id).await;
+    let status = provefab::commands::status(&p.store).await.unwrap();
+    assert!(
+        status.contains("post-merge checks: revert_open 1"),
+        "{status}"
+    );
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    for needle in [
+        "revert_open".to_string(),
+        sha.clone(),
+        c.base_sha.clone().unwrap(),
+        c.revert_sha.clone().unwrap(),
+        "https://github.com/o/r/pull/100".to_string(),
+        "`grep -q hello README.md` exited with 1".to_string(),
+    ] {
+        assert!(log.contains(&needle), "{needle} missing from:\n{log}");
+    }
+    let stats = provefab::commands::stats(&p.store).await.unwrap();
+    assert!(
+        stats.contains(
+            "post-merge passed 0 · flaky 0 · superseded 0 · reverts opened 1 · blocked 0"
+        ),
+        "{stats}"
+    );
+}

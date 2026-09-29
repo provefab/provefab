@@ -14,7 +14,7 @@ issue labelled `provefab`
   -> Provefab commits and pushes, opens the PR, comments on the issue
 ```
 
-The pull request then waits for your click. Optionally set `post_merge_checks` per repository: after a Provefab PR merges, Provefab runs your commands on the merged commit; on failure it can open a human-reviewed revert PR, but only when the reverted tree passes the same checks. It never merges a revert automatically. This checks repository commands, not deployed production health. Provefab Pro adds a second reviewer on another model, merge policies (auto-merge small, tested changes under fail-closed conditions) and cost reports per repository and model; it is not in this repository.
+The pull request then waits for your click. Optionally set `post_merge_checks` per repository: after a Provefab PR merges, Provefab runs your commands on the merged commit; on failure it can open a human-reviewed revert PR (unless a later commit already fixed it), but only when the reverted tree passes the same checks. It never merges a revert automatically. This checks repository commands, not deployed production health. Provefab Pro adds a second reviewer on another model, merge policies (auto-merge small, tested changes under fail-closed conditions) and cost reports per repository and model; it is not in this repository.
 
 ## Quick start
 
