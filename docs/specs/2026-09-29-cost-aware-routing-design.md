@@ -37,6 +37,17 @@
    `provefab log`, the PR body and `provefab stats` show them.
 6. No test touches the network. One ignored test fetches real prices.
 
+**Free and Pro (D75, user's choice 2026-09-29).**
+- **In the free core:**
+  - choosing the cheapest capable model;
+  - automatic prices;
+  - recording each stage's cost;
+  - showing it in `provefab log` and in the PR body.
+- **In Provefab Pro:**
+  - cost reports: `provefab-pro costs`, with dollars and quota units per repository and per model, and cost per merged PR over a period;
+  - later, routing learned from history (approach C) and dollar budget caps.
+- The existing `provefab stats` counts stay free; cost columns are not added there.
+
 **Out of scope:**
 - learning from history (approach C: this design only records its data);
 - per-token budgets or dollar caps (the daily stage-run budget, D53, still applies);
@@ -128,7 +139,7 @@ Paused models (cooldowns keyed by family and sign-in mode) are skipped before or
 - **Where it shows:**
   - `provefab log <task>` shows each stage's cost and the task total.
   - The PR body's "Routing" section gains `Cost: $X API · Y quota units`.
-  - `provefab stats` adds, per repository and per model, dollars, quota units, and cost per merged PR.
+  - Provefab Pro's `provefab-pro costs` reports, per repository and per model, dollars, quota units, and cost per merged PR, over the last 7 or 30 days, or all time. It reads the core store through public read methods; no cost logic is duplicated.
 
 ## 6. Configuration
 
@@ -167,7 +178,24 @@ All new fields are optional. A config without them keeps working and gets fetche
 - **Live, and ignored by default:** fetch models.dev and resolve `opus` and `sonnet`.
 - **Real run:** one sandbox issue whose `provefab log` shows the chosen tiers, the reasons and the stage costs.
 
-## 8. Decisions
+## 8. Documentation and landing
+
+The same change updates what people read, so docs never describe old behaviour.
+
+- **Core docs** (`README.md`, `docs/guide/`, rendered at `provefab.dev/docs/` by the landing site):
+  - **`configuration.md`:** `[routing] prefer`, the price fields, `quota_weight`, and how prices are fetched, cached and overridden.
+  - **`usage.md`:** reading the cost lines in `provefab log` and in PRs, and what the two new Jev answers change.
+  - **`operations.md`:** where `prices.json` lives, what `doctor` reports about prices, and troubleshooting a model with no price.
+  - **`README.md`:** one line on cost-aware routing.
+- **Example config:** commented `[routing]` and price fields.
+- **Landing:**
+  - The FAQ gains "How does Provefab keep model costs down?", answered from sections 3 and 4.
+  - The spec table gains the row `routing | cheapest model that fits`.
+  - The Pro list gains `Cost reports: cost per merged PR, per model and repository`.
+  - The docs pages refresh through the submodule (landing README, "Docs").
+- **Pro README:** the `costs` command.
+
+## 9. Decisions
 
 | ID | Decision | Why | Re-open trigger |
 |---|---|---|---|
@@ -177,3 +205,4 @@ All new fields are optional. A config without them keeps working and gets fetche
 | D72 | Subscription quota weight defaults to relative price within the vendor | Vendors meter quota by compute; no published per-model quota figures | A vendor publishes per-model quota consumption |
 | D73 | `[routing] prefer = "subscription"` by default | Subscriptions are already paid; API keys take over when a plan is paused (BYOK cooldowns) | Users on API keys only complain about the default |
 | D74 | Record cache tokens, the actual model, and cost per stage in a new migration | Claude's `input_tokens` excludes cache tokens, so costs were understated; approach C needs exact data | none |
+| D75 | Cheapest-capable routing, prices and per-stage cost are free; cost reports (and later history-based routing and dollar caps) are Pro | User's choice: saving money is an adoption argument for the free core; steering spend across a team is what teams pay for; routing stays in the core, so no new extension seam is needed now | Pro needs to change routing itself (approach C): then add a routing extension point |
