@@ -415,14 +415,14 @@ where
     O: Oracle + Sync,
     H: Hub + Sync,
 {
-    fn repo(&self, task: &TaskRow) -> Option<&RepoConfig> {
+    pub(crate) fn repo(&self, task: &TaskRow) -> Option<&RepoConfig> {
         self.config
             .repos
             .iter()
             .find(|r| r.slug.eq_ignore_ascii_case(&task.repo))
     }
 
-    async fn task(&self, id: i64) -> Result<TaskRow, PipelineError> {
+    pub(crate) async fn task(&self, id: i64) -> Result<TaskRow, PipelineError> {
         self.store
             .task(id)
             .await?
@@ -579,7 +579,7 @@ where
     /// GitHub side effects after the state is already recorded: a failure to
     /// reach GitHub is never fatal (the state in the store is the truth), but
     /// the effect is stored so the scheduler retries it (spec §3.2).
-    async fn tell(
+    pub(crate) async fn tell(
         &self,
         id: i64,
         slug: &str,
@@ -834,7 +834,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     // ---- Classified: worktree and branch ----
 
     /// The checkout this repo's worktrees come from (D48).
-    fn checkout(&self, repo: &RepoConfig) -> PathBuf {
+    pub(crate) fn checkout(&self, repo: &RepoConfig) -> PathBuf {
         repo.path_in(&self.paths.home)
     }
 
@@ -849,7 +849,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// (`max_concurrency`), but git's per-repo administrative files are not
     /// safe for concurrent writers, so without this two tasks preparing at
     /// once can make `git worktree add` fail outright.
-    fn repo_lock(&self, repo: &RepoConfig) -> Arc<AsyncMutex<()>> {
+    pub(crate) fn repo_lock(&self, repo: &RepoConfig) -> Arc<AsyncMutex<()>> {
         self.repo_locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1954,7 +1954,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     }
 
     /// Runs `commands` as gates and logs the run with its score.
-    async fn gates(
+    pub(crate) async fn gates(
         &self,
         task: &TaskRow,
         wt: &Path,
@@ -1966,7 +1966,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let _ = std::fs::create_dir_all(&scratch);
         let started = now();
         let report = run_gates(wt, commands, self.config.limits.gate_timeout, &scratch).await;
-        if matches!(stage, "post-merge" | "revert-check") {
+        if matches!(stage, "post-merge" | "post-merge-base" | "revert-check") {
             let results: Vec<Value> = report
                 .results
                 .iter()

@@ -4,8 +4,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agents::StageRunner;
+use crate::config::RepoConfig;
 use crate::pipeline::{Pipeline, PipelineError};
 use crate::ports::{Hub, Oracle};
+use crate::store::{CheckPatch, PostMergeCheckRow, StoreError, TaskRow};
+use std::path::PathBuf;
 
 pub const ATTRIBUTION_WAIT_SECS: i64 = 3600;
 pub const INFRA_ERROR_LIMIT: i64 = 5;
@@ -135,7 +138,6 @@ pub fn bounded(s: &str) -> String {
 }
 
 use crate::gates::GateReport;
-use crate::store::PostMergeCheckRow;
 
 /// Commands after at most one rerun (spec section 5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -308,9 +310,299 @@ where
     O: Oracle + Sync,
     H: Hub + Sync,
 {
-    /// Advances every post-merge check of a task by at most one transition.
-    /// Task 5 implements the state handlers.
-    pub async fn process_post_merge(&self, _task_id: i64) -> Result<(), PipelineError> {
+    /// Advances every post-merge check of a task by at most one transition,
+    /// then publishes pending notices (spec sections 5 and 7). Rows exist only
+    /// for merges attributed by `record_merge`.
+    pub async fn process_post_merge(&self, task_id: i64) -> Result<(), PipelineError> {
+        let task = self.task(task_id).await?;
+        let Some(repo) = self.repo(&task).cloned() else {
+            return Ok(());
+        };
+        if repo.post_merge_checks.is_empty() {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for check in self.store.post_merge_checks(task_id).await? {
+            if !check.state.is_terminal() {
+                let lock = self.repo_lock(&repo);
+                let guard = lock.lock().await;
+                let result = self.step_post_merge(&task, &repo, &check).await;
+                // Guard of spec section 9: no worktree outlives its handler.
+                self.discard_check_worktrees(&repo, check.id).await;
+                drop(guard);
+                if let Err(e) = result {
+                    let n = self.store.post_merge_infra_error(check.id).await?;
+                    if n >= INFRA_ERROR_LIMIT {
+                        let now = self.reload(&check).await?;
+                        self.block(&now, FailureKind::InfraError, &e.to_string())
+                            .await?;
+                    } else {
+                        eprintln!(
+                            "provefab: post-merge check {} ({}): {e}",
+                            check.id,
+                            check.state.as_str()
+                        );
+                        first_error.get_or_insert(e);
+                        continue;
+                    }
+                }
+                let now = self.reload(&check).await?;
+                if now.state.is_terminal() {
+                    self.finish_terminal(&repo, &now).await;
+                }
+            }
+            let now = self.reload(&check).await?;
+            if now.state.is_terminal()
+                && let Err(e) = self.notify_post_merge(&task, &repo, &now).await
+            {
+                first_error.get_or_insert(e);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    async fn reload(&self, check: &PostMergeCheckRow) -> Result<PostMergeCheckRow, PipelineError> {
+        self.store
+            .post_merge_check_by_id(check.id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!("post-merge check {} vanished", check.id)).into()
+            })
+    }
+
+    async fn step_post_merge(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
+    ) -> Result<(), PipelineError> {
+        match check.state {
+            CheckState::Queued => self.pm_queued(repo, check).await,
+            CheckState::Verifying => self.pm_verifying(task, repo, check).await,
+            CheckState::VerificationFailed => self.pm_verification_failed(task, repo, check).await,
+            CheckState::PreparingRevert => self.pm_preparing_revert(task, repo, check).await,
+            CheckState::RevertReady => self.pm_revert_ready(task, repo, check).await,
+            CheckState::Passed
+            | CheckState::Superseded
+            | CheckState::RevertOpen
+            | CheckState::Blocked => Ok(()),
+        }
+    }
+
+    fn pm_dir(&self, check_id: i64, suffix: &str) -> PathBuf {
+        self.paths
+            .home
+            .join("post-merge")
+            .join(format!("{check_id}-{suffix}"))
+    }
+
+    const WORKTREE_SUFFIXES: [&'static str; 7] = [
+        "verify",
+        "verify-rerun",
+        "base",
+        "base-rerun",
+        "revert",
+        "revert-check",
+        "revert-check-rerun",
+    ];
+
+    async fn discard_check_worktrees(&self, repo: &RepoConfig, check_id: i64) {
+        let repo_path = self.checkout(repo);
+        for suffix in Self::WORKTREE_SUFFIXES {
+            let wt = self.pm_dir(check_id, suffix);
+            if let Err(e) = self.git.worktree_discard(&repo_path, &wt).await {
+                eprintln!("provefab: could not remove {}: {e}", wt.display());
+            }
+        }
+    }
+
+    /// Terminal cleanup: the local revert branch goes; remote branches never do.
+    async fn finish_terminal(&self, repo: &RepoConfig, check: &PostMergeCheckRow) {
+        if let Some(branch) = &check.revert_branch {
+            let _ = self.git.branch_delete(&self.checkout(repo), branch).await;
+        }
+    }
+
+    async fn advance(
+        &self,
+        check: &PostMergeCheckRow,
+        to: CheckState,
+        patch: CheckPatch,
+    ) -> Result<(), PipelineError> {
+        self.store
+            .advance_post_merge(check.id, check.state, to, &patch)
+            .await?;
+        Ok(())
+    }
+
+    async fn block(
+        &self,
+        check: &PostMergeCheckRow,
+        kind: FailureKind,
+        summary: &str,
+    ) -> Result<(), PipelineError> {
+        self.advance(
+            check,
+            CheckState::Blocked,
+            CheckPatch {
+                failure_kind: Some(kind),
+                failure_summary: Some(summary.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Runs the checks on a fresh detached checkout of `commit`, then reruns
+    /// each failure once on another fresh checkout (spec section 5).
+    #[allow(clippy::too_many_arguments)]
+    async fn pm_run(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
+        commit: &str,
+        suffix: &str,
+        stage: &str,
+        require_clean: bool,
+    ) -> Result<Confirmed, PipelineError> {
+        let repo_path = self.checkout(repo);
+        let wt = self.pm_dir(check.id, suffix);
+        self.git
+            .worktree_fresh_detached(&repo_path, &wt, commit)
+            .await?;
+        let first = self
+            .gates(task, &wt, &repo.post_merge_checks, stage)
+            .await?;
+        let dirty = require_clean && !self.git.clean(&wt).await?;
+        self.git.worktree_discard(&repo_path, &wt).await?;
+        if first.passed() || dirty {
+            return Ok(Confirmed {
+                dirty,
+                ..confirm(&first, None)
+            });
+        }
+        let failing: Vec<String> = first
+            .results
+            .iter()
+            .filter(|r| !r.passed)
+            .map(|r| r.command.clone())
+            .collect();
+        let rerun_wt = self.pm_dir(check.id, &format!("{suffix}-rerun"));
+        self.git
+            .worktree_fresh_detached(&repo_path, &rerun_wt, commit)
+            .await?;
+        let rerun = self.gates(task, &rerun_wt, &failing, stage).await?;
+        self.git.worktree_discard(&repo_path, &rerun_wt).await?;
+        Ok(confirm(&first, Some(&rerun)))
+    }
+
+    async fn pm_queued(
+        &self,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
+    ) -> Result<(), PipelineError> {
+        let repo_path = self.checkout(repo);
+        self.git.fetch(&repo_path).await?;
+        let parents = self.git.parent_count(&repo_path, &check.merge_sha).await?;
+        match revert_plan(parents, check.commit_count, check.auto_merged) {
+            Some(_) => {
+                self.advance(check, CheckState::Verifying, CheckPatch::default())
+                    .await
+            }
+            None => {
+                self.block(
+                    check,
+                    FailureKind::UnsafeMergeStrategy,
+                    &format!(
+                        "{parents} parent(s), {:?} PR commit(s), auto-merged: {}",
+                        check.commit_count, check.auto_merged
+                    ),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn pm_verifying(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
+    ) -> Result<(), PipelineError> {
+        let r = self
+            .pm_run(
+                task,
+                repo,
+                check,
+                &check.merge_sha,
+                "verify",
+                "post-merge",
+                false,
+            )
+            .await?;
+        if r.failed.is_empty() {
+            return self
+                .advance(
+                    check,
+                    CheckState::Passed,
+                    CheckPatch {
+                        flaky: Some(r.flaky),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+        self.advance(
+            check,
+            CheckState::VerificationFailed,
+            CheckPatch {
+                failure_kind: Some(FailureKind::CheckFailed),
+                failure_summary: Some(failure_summary(&r.failed)),
+                failed_commands: Some(r.failed),
+                flaky: Some(r.flaky),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    // Implemented in Task 6.
+    async fn pm_verification_failed(
+        &self,
+        _: &TaskRow,
+        _: &RepoConfig,
+        _: &PostMergeCheckRow,
+    ) -> Result<(), PipelineError> {
+        Ok(())
+    }
+    async fn pm_preparing_revert(
+        &self,
+        _: &TaskRow,
+        _: &RepoConfig,
+        _: &PostMergeCheckRow,
+    ) -> Result<(), PipelineError> {
+        Ok(())
+    }
+    // Implemented in Task 7.
+    async fn pm_revert_ready(
+        &self,
+        _: &TaskRow,
+        _: &RepoConfig,
+        _: &PostMergeCheckRow,
+    ) -> Result<(), PipelineError> {
+        Ok(())
+    }
+    // Implemented in Task 8.
+    async fn notify_post_merge(
+        &self,
+        _: &TaskRow,
+        _: &RepoConfig,
+        _: &PostMergeCheckRow,
+    ) -> Result<(), PipelineError> {
         Ok(())
     }
 }

@@ -264,3 +264,144 @@ async fn another_base_without_a_sha_neither_waits_nor_creates_a_check() {
         Some("merged")
     );
 }
+
+/// README.md becomes `change` in one commit merged on origin/main, recorded as
+/// a merged Provefab PR (pull/8) with a queued check.
+async fn setup(checks: &[&str], change: &str) -> (Fixture, P, i64, String) {
+    let (f, p, id) = open_pr_task(checks).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    let sha = commit_and_push(&repo, "README.md", change, "Merged Provefab change");
+    *p.hub.pr_status.lock().unwrap() = merged(Some(&sha), Some("main"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    // Later comments on pull/8 go to its own per-URL status.
+    let status = p.hub.pr_status.lock().unwrap().clone();
+    p.hub
+        .pr_statuses
+        .lock()
+        .unwrap()
+        .insert("https://github.com/o/r/pull/8".into(), status);
+    (f, p, id, sha)
+}
+
+async fn check(p: &P, id: i64) -> provefab::store::PostMergeCheckRow {
+    p.store.post_merge_checks(id).await.unwrap().remove(0)
+}
+
+async fn tick(p: &P, id: i64) -> CheckState {
+    p.process_post_merge(id).await.unwrap();
+    check(p, id).await.state
+}
+
+/// Ticks until the check is terminal.
+async fn drive(p: &P, id: i64) -> provefab::store::PostMergeCheckRow {
+    for _ in 0..12 {
+        if tick(p, id).await.is_terminal() {
+            return check(p, id).await;
+        }
+    }
+    panic!(
+        "not terminal after 12 ticks: {:?}",
+        check(p, id).await.state
+    );
+}
+
+fn leftovers(f: &Fixture, check_id: i64) -> Vec<String> {
+    let dir = f.home.join("post-merge");
+    std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(&format!("{check_id}-")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_green_merge_passes_in_two_ticks_and_posts_nothing() {
+    let (f, p, id, _) = setup(&["grep -q hello README.md"], "hello world\n").await;
+    assert_eq!(tick(&p, id).await, CheckState::Verifying);
+    assert_eq!(tick(&p, id).await, CheckState::Passed);
+    let c = check(&p, id).await;
+    assert!(c.flaky.is_empty() && c.finished_at.is_some());
+    assert!(p.hub.posted.lock().unwrap().is_empty());
+    assert!(leftovers(&f, c.id).is_empty());
+    // A terminal check costs nothing more.
+    assert_eq!(tick(&p, id).await, CheckState::Passed);
+}
+
+#[tokio::test]
+async fn a_failure_rescued_by_its_rerun_is_flaky_not_failed() {
+    let (f, p, id, _) = setup(&["true"], "hello world\n").await;
+    let mark = f.home.join("flaky-mark");
+    let cmd = format!("test -f {0} || {{ touch {0}; false; }}", mark.display());
+    let mut p = p;
+    p.config.repos[0].post_merge_checks = vec![cmd.clone()];
+    let c = drive(&p, id).await;
+    assert_eq!(c.state, CheckState::Passed);
+    assert_eq!(c.flaky, [cmd]);
+}
+
+#[tokio::test]
+async fn a_failure_twice_is_confirmed_and_timeouts_count_as_failures() {
+    let (_f, p, id, _) = setup(&["sleep 5"], "hello world\n").await;
+    let mut p = p;
+    p.config.limits.gate_timeout = std::time::Duration::from_millis(300);
+    tick(&p, id).await;
+    assert_eq!(tick(&p, id).await, CheckState::VerificationFailed);
+    let c = check(&p, id).await;
+    assert_eq!(c.failure_kind, Some(FailureKind::CheckFailed));
+    assert!(c.failed_commands[0].timed_out);
+}
+
+#[tokio::test]
+async fn crash_residue_that_looks_green_is_never_reused() {
+    let (f, p, id, sha) = setup(&["grep -q hello README.md"], "broken\n").await;
+    assert_eq!(tick(&p, id).await, CheckState::Verifying);
+    let c = check(&p, id).await;
+    // A crashed run left a worktree whose README would pass.
+    let repo = f.config.repos[0].path_in(&f.home);
+    let wt = f.home.join("post-merge").join(format!("{}-verify", c.id));
+    p.git
+        .worktree_fresh_detached(&repo, &wt, &sha)
+        .await
+        .unwrap();
+    std::fs::write(wt.join("README.md"), "hello\n").unwrap();
+    assert_eq!(tick(&p, id).await, CheckState::VerificationFailed);
+    assert!(leftovers(&f, c.id).is_empty());
+}
+
+#[tokio::test]
+async fn a_human_merged_multi_commit_pr_is_blocked_before_running_anything() {
+    let (f, p, id) = open_pr_task(&["touch ran; true"]).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    let sha = commit_and_push(&repo, "README.md", "x\n", "change");
+    *p.hub.pr_status.lock().unwrap() = merged(Some(&sha), Some("main"), Some(3));
+    p.watch_pr(id).await.unwrap();
+    let c = drive(&p, id).await;
+    assert_eq!(
+        (c.state, c.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::UnsafeMergeStrategy))
+    );
+    assert!(
+        p.store
+            .stage_runs(id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.stage != "post-merge")
+    );
+}
+
+#[tokio::test]
+async fn a_removed_repo_or_emptied_checks_leave_rows_untouched() {
+    let (_f, p, id, _) = setup(&["true"], "hello world\n").await;
+    let mut p = p;
+    p.config.repos[0].post_merge_checks.clear();
+    p.process_post_merge(id).await.unwrap();
+    assert_eq!(check(&p, id).await.state, CheckState::Queued);
+    p.config.repos.clear();
+    p.process_post_merge(id).await.unwrap();
+    assert_eq!(check(&p, id).await.state, CheckState::Queued);
+    assert!(p.hub.posted.lock().unwrap().is_empty());
+}
