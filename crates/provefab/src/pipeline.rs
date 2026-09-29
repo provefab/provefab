@@ -1084,6 +1084,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                     status.merge_sha.as_deref(),
                     status.base_ref.as_deref(),
                     status.commit_count,
+                    status.head_sha.as_deref(),
                 )
                 .await?;
                 Ok(task.state)
@@ -1136,7 +1137,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// A merged PR: relabel the issue `<label>:merged`, record the merge and
     /// when, and free the worktree. A failed label edit is kept as a pending
     /// GitHub effect and retried by the scheduler (PR #25), so it never blocks
-    /// recording the merge.
+    /// recording the merge. `head` is the merged PR's head commit: the
+    /// `auto_merged` and `merge_seen` outputs count only for that PR, never for
+    /// an earlier PR of the same task (final review F1).
     async fn record_merge(
         &self,
         task: &TaskRow,
@@ -1144,6 +1147,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
         merge_sha: Option<&str>,
         base: Option<&str>,
         commit_count: Option<usize>,
+        head: Option<&str>,
     ) -> Result<(), PipelineError> {
         if !repo.post_merge_checks.is_empty()
             && (merge_sha.is_none() || base.is_none())
@@ -1151,11 +1155,20 @@ Please reply with what should happen, what happens instead, and how to reproduce
         {
             // GitHub may report `mergeCommit` a little after the merge: keep the PR
             // watched, but never longer than an hour (spec section 4).
-            let first = match self.store.last_output(task.id, "merge_seen").await? {
+            let seen = self
+                .store
+                .last_output(task.id, "merge_seen")
+                .await?
+                .filter(|v| v["pr"].as_str() == task.pr_url.as_deref());
+            let first = match seen {
                 Some(v) => v["at"].as_i64().unwrap_or(0),
                 None => {
                     self.store
-                        .record_output(task.id, "merge_seen", &json!({"at": now()}))
+                        .record_output(
+                            task.id,
+                            "merge_seen",
+                            &json!({"at": now(), "pr": task.pr_url}),
+                        )
                         .await?;
                     now()
                 }
@@ -1175,11 +1188,10 @@ Please reply with what should happen, what happens instead, and how to reproduce
         )
         .await?;
         if !repo.post_merge_checks.is_empty() {
-            let auto_merged = self
-                .store
-                .last_output(task.id, "auto_merged")
-                .await?
-                .is_some();
+            let auto_merged = match (self.store.last_output(task.id, "auto_merged").await?, head) {
+                (Some(v), Some(h)) => v["head"].as_str() == Some(h),
+                _ => false,
+            };
             match (merge_sha, base) {
                 (Some(sha), Some(b)) if b == repo.base => {
                     self.store
@@ -1194,7 +1206,6 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 }
                 // Merged into another branch: not what the checks describe.
                 (_, Some(b)) if b != repo.base => {}
-                (Some(_), Some(_)) => {}
                 _ => {
                     let row = self
                         .store
@@ -2792,6 +2803,8 @@ where
                             status.merge_sha.as_deref(),
                             status.base_ref.as_deref(),
                             status.commit_count,
+                            // The head just merged, not a re-read that may lag.
+                            Some(head),
                         )
                         .await?;
                     Ok(MergeOutcome::Merged)

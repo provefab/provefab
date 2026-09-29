@@ -212,7 +212,11 @@ async fn missing_attribution_waits_an_hour_then_blocks() {
     // An hour later GitHub still has no merge commit: record the merge, block the check.
     let long_ago = provefab::store::now() - provefab::post_merge::ATTRIBUTION_WAIT_SECS - 1;
     p.store
-        .record_output(id, "merge_seen", &json!({"at": long_ago}))
+        .record_output(
+            id,
+            "merge_seen",
+            &json!({"at": long_ago, "pr": "https://github.com/o/r/pull/8"}),
+        )
         .await
         .unwrap();
     p.watch_pr(id).await.unwrap();
@@ -234,7 +238,11 @@ async fn a_missing_base_is_never_inferred() {
     *p.hub.pr_status.lock().unwrap() = merged(Some("abc"), None, Some(1));
     let long_ago = provefab::store::now() - provefab::post_merge::ATTRIBUTION_WAIT_SECS - 1;
     p.store
-        .record_output(id, "merge_seen", &json!({"at": long_ago}))
+        .record_output(
+            id,
+            "merge_seen",
+            &json!({"at": long_ago, "pr": "https://github.com/o/r/pull/8"}),
+        )
         .await
         .unwrap();
     p.watch_pr(id).await.unwrap();
@@ -254,6 +262,57 @@ async fn an_auto_merge_is_recorded_on_the_check() {
     let c = p.store.post_merge_checks(id).await.unwrap();
     assert!(c[0].auto_merged);
     assert_eq!(c[0].commit_count, Some(3));
+}
+
+/// After a reopen the task has a new PR: the auto-merge of the first PR says
+/// nothing about how the second one was merged (final review F1).
+#[tokio::test]
+async fn an_auto_merge_of_an_earlier_pr_does_not_mark_a_later_human_merge() {
+    let (f, p, id) = open_pr_task(&["touch ran; true"]).await;
+    p.store
+        .record_output(id, "auto_merged", &json!({"head": "old-head"}))
+        .await
+        .unwrap();
+    let repo = f.config.repos[0].path_in(&f.home);
+    let sha = commit_and_push(&repo, "README.md", "x\n", "change");
+    let mut status = merged(Some(&sha), Some("main"), Some(3));
+    status.head_sha = Some("new-head".into());
+    *p.hub.pr_status.lock().unwrap() = status;
+    p.watch_pr(id).await.unwrap();
+    assert!(!p.store.post_merge_checks(id).await.unwrap()[0].auto_merged);
+    let c = drive(&p, id).await;
+    assert_eq!(
+        (c.state, c.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::UnsafeMergeStrategy))
+    );
+}
+
+#[tokio::test]
+async fn a_merge_seen_for_another_pr_restarts_the_wait() {
+    let (_f, p, id) = open_pr_task(&["true"]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(None, Some("main"), Some(1));
+    let long_ago = provefab::store::now() - provefab::post_merge::ATTRIBUTION_WAIT_SECS - 1;
+    p.store
+        .record_output(
+            id,
+            "merge_seen",
+            &json!({"at": long_ago, "pr": "https://github.com/o/r/pull/5"}),
+        )
+        .await
+        .unwrap();
+    p.watch_pr(id).await.unwrap();
+    assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
+    assert_eq!(
+        p.store.task(id).await.unwrap().unwrap().pr_state.as_deref(),
+        Some("open")
+    );
+    let seen = p
+        .store
+        .last_output(id, "merge_seen")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen["pr"], "https://github.com/o/r/pull/8");
 }
 
 #[tokio::test]
