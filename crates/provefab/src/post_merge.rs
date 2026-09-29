@@ -8,7 +8,7 @@ use crate::config::RepoConfig;
 use crate::forge::ForgeError;
 use crate::pipeline::{Pipeline, PipelineError};
 use crate::ports::{Hub, Oracle};
-use crate::store::{CheckPatch, PostMergeCheckRow, StoreError, TaskRow};
+use crate::store::{CheckPatch, NoticeTarget, PostMergeCheckRow, StoreError, TaskRow};
 use std::path::PathBuf;
 
 pub const ATTRIBUTION_WAIT_SECS: i64 = 3600;
@@ -794,14 +794,94 @@ where
         )
         .await
     }
-    // Implemented in Task 8.
+    /// One comment per target per check, from fixed templates only (spec section 7).
+    /// The marker makes a crash between the GitHub write and the SQLite write
+    /// harmless; `INFRA_ERROR_LIMIT` consecutive failures give a target up.
     async fn notify_post_merge(
         &self,
-        _: &TaskRow,
-        _: &RepoConfig,
-        _: &PostMergeCheckRow,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
     ) -> Result<(), PipelineError> {
+        let Some(body) = render(check) else {
+            return Ok(());
+        };
+        let mark = marker(check.id);
+        if check.issue_notified_at.is_none() {
+            let posted = async {
+                let seen = self
+                    .hub
+                    .comments(&repo.slug, task.issue_number)
+                    .await?
+                    .iter()
+                    .any(|c| c.body.contains(&mark));
+                if !seen {
+                    self.tell(task.id, &repo.slug, task.issue_number, &body)
+                        .await?;
+                }
+                Ok::<(), PipelineError>(())
+            }
+            .await;
+            self.settle_notice(check, NoticeTarget::Issue, posted)
+                .await?;
+        }
+        if check.pr_notified_at.is_none() {
+            let Some(url) = task.pr_url.as_deref() else {
+                self.store
+                    .mark_post_merge_notified(check.id, NoticeTarget::Pr)
+                    .await?;
+                return Ok(());
+            };
+            let posted = async {
+                let seen = self
+                    .hub
+                    .pr_status(&repo.slug, url)
+                    .await?
+                    .comments
+                    .iter()
+                    .any(|c| c.body.contains(&mark));
+                if !seen {
+                    self.hub.pr_comment(&repo.slug, url, &body).await?;
+                }
+                Ok::<(), PipelineError>(())
+            }
+            .await;
+            self.settle_notice(check, NoticeTarget::Pr, posted).await?;
+        }
         Ok(())
+    }
+
+    /// Marks a target done on success; on failure counts it and gives the
+    /// target up at the limit (logged, returns `Ok`), else returns the error.
+    async fn settle_notice(
+        &self,
+        check: &PostMergeCheckRow,
+        target: NoticeTarget,
+        posted: Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        match posted {
+            Ok(()) => {
+                self.store
+                    .mark_post_merge_notified(check.id, target)
+                    .await?;
+                Ok(())
+            }
+            Err(e) => {
+                let n = self.store.post_merge_infra_error(check.id).await?;
+                if n >= INFRA_ERROR_LIMIT {
+                    eprintln!(
+                        "provefab: gave up notifying {target:?} for post-merge check {}: {e}",
+                        check.id
+                    );
+                    self.store
+                        .mark_post_merge_notified(check.id, target)
+                        .await?;
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 

@@ -746,3 +746,131 @@ async fn an_innocent_later_merge_is_never_reverted() {
         "only the culprit has a revert PR"
     );
 }
+
+fn issue_markers(p: &P, check_id: i64) -> usize {
+    let m = provefab::post_merge::marker(check_id);
+    p.hub
+        .comments
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.body.contains(&m))
+        .count()
+}
+
+fn pr_markers(p: &P, check_id: i64) -> usize {
+    let m = provefab::post_merge::marker(check_id);
+    p.hub.pr_statuses.lock().unwrap()["https://github.com/o/r/pull/8"]
+        .comments
+        .iter()
+        .filter(|c| c.body.contains(&m))
+        .count()
+}
+
+#[tokio::test]
+async fn a_failed_pr_comment_is_retried_without_a_second_issue_comment() {
+    use std::sync::atomic::Ordering;
+    let (_f, p, id, _) = setup(&["false"], "broken\n").await;
+    p.hub.pr_comment_failures.store(1, Ordering::SeqCst);
+    for _ in 0..12 {
+        let _ = p.process_post_merge(id).await;
+    }
+    let c = check(&p, id).await;
+    assert_eq!(c.state, CheckState::Blocked);
+    assert_eq!((issue_markers(&p, c.id), pr_markers(&p, c.id)), (1, 1));
+    assert!(c.issue_notified_at.is_some() && c.pr_notified_at.is_some());
+}
+
+#[tokio::test]
+async fn a_target_that_keeps_failing_is_given_up_after_the_limit() {
+    use std::sync::atomic::Ordering;
+    // No revert PR is ever created here, so every PR comment is the notice.
+    let (_f, p, id, _) = setup(&["false"], "broken\n").await;
+    p.hub.pr_comment_failures.store(1000, Ordering::SeqCst);
+    let mut errors = 0;
+    for _ in 0..20 {
+        if p.process_post_merge(id).await.is_err() {
+            errors += 1;
+        }
+    }
+    let c = check(&p, id).await;
+    assert_eq!(c.state, CheckState::Blocked);
+    // The blocking transition reset the counter: 4 errors, then the 5th gives up.
+    assert_eq!(errors, provefab::post_merge::INFRA_ERROR_LIMIT as usize - 1);
+    assert!(c.pr_notified_at.is_some());
+    assert_eq!(pr_markers(&p, c.id), 0);
+    assert_eq!(issue_markers(&p, c.id), 1);
+}
+
+#[tokio::test]
+async fn each_check_is_announced_by_its_own_id() {
+    let (_f, p, id, _) = setup(&["false"], "broken\n").await;
+    let second = p
+        .store
+        .ensure_post_merge_check(&provefab::store::NewPostMergeCheck {
+            task_id: id,
+            merge_sha: "unknown",
+            base: "main",
+            commit_count: None,
+            auto_merged: false,
+        })
+        .await
+        .unwrap();
+    p.store
+        .advance_post_merge(
+            second.id,
+            CheckState::Queued,
+            CheckState::Blocked,
+            &provefab::store::CheckPatch {
+                failure_kind: Some(FailureKind::AttributionMissing),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..12 {
+        let _ = p.process_post_merge(id).await;
+    }
+    let first = check(&p, id).await;
+    assert_eq!(
+        (issue_markers(&p, first.id), issue_markers(&p, second.id)),
+        (1, 1)
+    );
+    assert_eq!(
+        (pr_markers(&p, first.id), pr_markers(&p, second.id)),
+        (1, 1)
+    );
+}
+
+#[tokio::test]
+async fn nothing_published_contains_command_output_or_local_paths() {
+    // The output joins to SENTINEL_SECRET_42; the command text never contains it.
+    let (f, p, id, _) = setup(
+        &["printf %s SENTINEL_; printf %s SECRET_42; false"],
+        "broken\n",
+    )
+    .await;
+    drive(&p, id).await;
+    tick(&p, id).await;
+    let home = f.home.display().to_string();
+    let mut published: Vec<String> = p.hub.posted.lock().unwrap().clone();
+    published.extend(p.hub.prs.lock().unwrap().iter().map(|pr| pr.3.clone()));
+    assert!(!published.is_empty());
+    for body in published {
+        assert!(!body.contains("SENTINEL_SECRET_42"), "{body}");
+        assert!(!body.contains(&home), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn a_superseded_check_is_announced_once() {
+    let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::VerificationFailed).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    commit_and_push(&repo, "README.md", "hello again\n", "fix");
+    drive(&p, id).await;
+    tick(&p, id).await;
+    tick(&p, id).await;
+    let c = check(&p, id).await;
+    assert_eq!((issue_markers(&p, c.id), pr_markers(&p, c.id)), (1, 1));
+}
