@@ -260,7 +260,14 @@ fn set_pr(
     state: provefab::forge::PrState,
     comments: Vec<Comment>,
 ) {
-    *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus { state, comments };
+    *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
+        state,
+        comments,
+        head_sha: None,
+        merge_sha: None,
+        base_ref: None,
+        commit_count: None,
+    };
 }
 
 #[tokio::test]

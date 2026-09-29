@@ -335,6 +335,10 @@ async fn polling_watches_open_prs() {
     *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
         state: provefab::forge::PrState::Merged,
         comments: vec![],
+        head_sha: None,
+        merge_sha: None,
+        base_ref: None,
+        commit_count: None,
     };
     within(
         10,

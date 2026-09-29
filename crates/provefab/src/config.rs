@@ -142,6 +142,10 @@ pub struct RepoConfig {
     pub trust_pi_project: bool,
     /// Commands run in the worktree after every implement stage. At least one.
     pub gates: Vec<String>,
+    /// Explicit commands run against the squashed base commit after this repo's
+    /// Provefab-created PR is merged. Empty disables post-merge verification.
+    #[serde(default)]
+    pub post_merge_checks: Vec<String>,
 }
 
 impl RepoConfig {
@@ -363,6 +367,9 @@ impl Config {
             if r.gates.iter().all(|g| g.trim().is_empty()) {
                 return Err(ConfigError::NoGates(r.slug.clone()));
             }
+            if r.post_merge_checks.iter().any(|g| g.trim().is_empty()) {
+                return Err(ConfigError::EmptyField(r.slug.clone(), "post_merge_checks"));
+            }
             // An empty label could match every open issue (the label is the authorization).
             if r.label.trim().is_empty() {
                 return Err(ConfigError::EmptyField(r.slug.clone(), "label"));
@@ -506,6 +513,24 @@ review_rounds = 2
         assert_eq!(key.cooldown_key(), "claude-code:api-key");
         assert!(Config::from_toml_str("[jev]\nmodel = \"jev-1.13.0\"\n[[models]]\nid=\"x\"\nworker=\"codex\"\nmodel=\"gpt\"\ntier=\"standard\"\nauth=\"password\"\n")
         .is_err());
+    }
+
+    #[test]
+    fn post_merge_checks_are_opt_in_and_reject_blank_commands() {
+        let base = format!("{BASE}[[repos]]\nslug = \"o/r\"\ngates = [\"make\"]\n");
+        assert!(
+            Config::from_toml_str(&base).unwrap().repos[0]
+                .post_merge_checks
+                .is_empty()
+        );
+        let enabled =
+            Config::from_toml_str(&format!("{base}post_merge_checks = [\"cargo test\"]\n"))
+                .unwrap();
+        assert_eq!(enabled.repos[0].post_merge_checks, ["cargo test"]);
+        assert!(matches!(
+            Config::from_toml_str(&format!("{base}post_merge_checks = [\"   \"]\n")),
+            Err(ConfigError::EmptyField(_, "post_merge_checks"))
+        ));
     }
 
     #[test]

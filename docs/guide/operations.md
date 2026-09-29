@@ -44,6 +44,7 @@ Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume 
 | `~/.provefab/repos/` | the clones Provefab manages |
 | `~/.provefab/worktrees/<id>/` | a task's worktree, removed after the merge |
 | `~/.provefab/sessions/<id>/` | agent transcripts and check outputs, per stage |
+| `~/.provefab/post-merge/` | temporary detached worktrees used to verify merged commits and prepare revert PRs |
 | `~/.provefab/claude/`, `~/.provefab/codex/` | worker plan logins, kept apart from your own sessions |
 | `~/.provefab/claude-api/`, `~/.provefab/codex-api/` | worker API-key sign-ins (the Anthropic key itself stays in the Keychain) |
 | `~/.provefab/prices.json` | model prices, refreshed at most once a day from models.dev (LiteLLM as fallback) |
@@ -83,6 +84,7 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do.
 | `[repos.merge] is read by Provefab Pro` warning | the config asks for auto-merge | expected with this binary: PRs open and wait for you |
 
 To dig into a task:
-- read `provefab log <id>`;
+- read `provefab status` for the latest post-merge state (if opted in);
+- read `provefab log <id>` for the merged SHA and any revert PR URL;
 - read the transcripts in `~/.provefab/sessions/<id>/`;
 - read the check outputs (`gates-N` directories).

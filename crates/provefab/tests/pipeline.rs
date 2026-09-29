@@ -1119,6 +1119,10 @@ async fn stats_count_prs_and_tell_auto_merges_from_human_ones() {
     *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
         state: provefab::forge::PrState::Merged,
         comments: vec![],
+        head_sha: None,
+        merge_sha: None,
+        base_ref: None,
+        commit_count: None,
     };
     p.watch_pr(human).await.unwrap();
     let out = provefab::commands::stats(&p.store).await.unwrap();

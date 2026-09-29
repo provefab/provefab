@@ -63,6 +63,21 @@ pub struct TransitionRow {
     pub at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostMergeCheckRow {
+    pub id: i64,
+    pub task_id: i64,
+    pub merge_sha: String,
+    pub base: String,
+    pub state: String,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub worktree: Option<PathBuf>,
+    pub failure_summary: Option<String>,
+    pub revert_pr_url: Option<String>,
+    pub notified_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageRunRecord {
     pub task_id: i64,
@@ -374,6 +389,105 @@ impl Store {
             |q| q.bind(state.to_string()),
         )
         .await
+    }
+
+    /// Creates the one durable check for a merged commit, or returns the
+    /// existing row when a scheduler retry sees it again.
+    pub async fn ensure_post_merge_check(
+        &self,
+        task_id: i64,
+        merge_sha: &str,
+        base: &str,
+    ) -> Result<PostMergeCheckRow, StoreError> {
+        sqlx::query(
+            "INSERT INTO post_merge_checks (task_id, merge_sha, base, state) VALUES (?, ?, ?, 'queued') ON CONFLICT (task_id, merge_sha) DO NOTHING",
+        )
+        .bind(task_id)
+        .bind(merge_sha)
+        .bind(base)
+        .execute(&self.pool)
+        .await?;
+        self.post_merge_check(task_id, merge_sha)
+            .await?
+            .ok_or(StoreError::Corrupt(format!(
+                "missing post-merge check {task_id}/{merge_sha}"
+            )))
+    }
+
+    pub async fn post_merge_check(
+        &self,
+        task_id: i64,
+        merge_sha: &str,
+    ) -> Result<Option<PostMergeCheckRow>, StoreError> {
+        let row =
+            sqlx::query("SELECT * FROM post_merge_checks WHERE task_id = ? AND merge_sha = ?")
+                .bind(task_id)
+                .bind(merge_sha)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|r| post_merge_check_row(&r)).transpose()
+    }
+
+    pub async fn post_merge_checks(
+        &self,
+        task_id: i64,
+    ) -> Result<Vec<PostMergeCheckRow>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM post_merge_checks WHERE task_id = ? ORDER BY id")
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(post_merge_check_row).collect()
+    }
+
+    pub async fn set_post_merge_running(&self, id: i64, worktree: &Path) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE post_merge_checks SET state = 'running', started_at = ?, worktree = ? WHERE id = ? AND state IN ('queued', 'running')",
+        )
+        .bind(now())
+        .bind(worktree.display().to_string())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finish_post_merge(
+        &self,
+        id: i64,
+        state: &str,
+        failure_summary: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE post_merge_checks SET state = ?, finished_at = ?, failure_summary = ? WHERE id = ?",
+        )
+        .bind(state)
+        .bind(now())
+        .bind(failure_summary)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_post_merge_revert_pr(&self, id: i64, url: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE post_merge_checks SET state = 'revert_open', revert_pr_url = ?, finished_at = ? WHERE id = ?",
+        )
+        .bind(url)
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_post_merge_notified(&self, id: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE post_merge_checks SET notified_at = ? WHERE id = ?")
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// The issue came back after its PR was merged.
@@ -693,6 +807,22 @@ fn parse_state(s: &str) -> Result<TaskState, StoreError> {
     TaskState::parse(s).ok_or_else(|| StoreError::Corrupt(s.to_string()))
 }
 
+fn post_merge_check_row(r: &SqliteRow) -> Result<PostMergeCheckRow, StoreError> {
+    Ok(PostMergeCheckRow {
+        id: r.get("id"),
+        task_id: r.get("task_id"),
+        merge_sha: r.get("merge_sha"),
+        base: r.get("base"),
+        state: r.get("state"),
+        started_at: r.get("started_at"),
+        finished_at: r.get("finished_at"),
+        worktree: r.get::<Option<String>, _>("worktree").map(PathBuf::from),
+        failure_summary: r.get("failure_summary"),
+        revert_pr_url: r.get("revert_pr_url"),
+        notified_at: r.get("notified_at"),
+    })
+}
+
 fn task_row(r: &SqliteRow) -> Result<TaskRow, StoreError> {
     let kind: Option<String> = r.get("kind");
     let worktree: Option<String> = r.get("worktree");
@@ -739,6 +869,7 @@ mod tests {
                 "58482ad7ee578abba1976c7bc8f21ed4c3c2a481c6a24f74d64164e7f37c01e6dc1931ad68e527a67df118bf2983cdbd",
                 "fa9d5e7daa5ddeec2a821c7123b4fcca83a08f59d147187aac8a58405466bc12e383f228b0a8574c97fa57817f6fa432",
                 "9f9cca5cfdefacd436e685a2daf6b99f3a4d7104dbda6fd6c5df338adc59f1379ec0d15f86887d96c4ec23b3c1e3eaa5",
+                "4cc4e9197c7f327ed444613b4be9fbd3423d6ecac96e41bed592668a89f38f9f086a1f300d675a8b349488d2785bd697",
             ]
         );
     }

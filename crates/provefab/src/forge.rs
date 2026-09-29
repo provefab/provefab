@@ -269,6 +269,63 @@ impl Git {
         Ok(())
     }
 
+    /// Creates an isolated detached worktree at an exact commit. Unlike task
+    /// worktrees this never creates or reuses a branch.
+    pub async fn worktree_detached(
+        &self,
+        repo: &Path,
+        path: &Path,
+        commit: &str,
+    ) -> Result<(), ForgeError> {
+        let dir = path.display().to_string();
+        self.git(repo, &["worktree", "prune"]).await?;
+        if path.join(".git").exists() {
+            let actual = self.head(path).await?;
+            if actual != commit {
+                return Err(ForgeError::WrongWorktree {
+                    path: dir,
+                    actual,
+                    wanted: commit.to_string(),
+                });
+            }
+            return self.exclude_provefab_dir(path).await;
+        }
+        self.git(repo, &["worktree", "add", "--detach", &dir, commit])
+            .await?;
+        self.exclude_provefab_dir(path).await
+    }
+
+    /// Reverts one exact commit without invoking hooks. A conflict is returned
+    /// untouched so the caller can remove the worktree and ask a human.
+    pub async fn revert(&self, worktree: &Path, commit: &str) -> Result<(), ForgeError> {
+        self.git(worktree, &["revert", "--no-edit", commit]).await?;
+        Ok(())
+    }
+
+    /// A resumed revert must be exactly one git-generated revert commit on
+    /// the base we verified. Never reuse an unrelated branch with this name.
+    pub async fn prepared_revert(
+        &self,
+        worktree: &Path,
+        base: &str,
+        original: &str,
+    ) -> Result<bool, ForgeError> {
+        let parent = self.git(worktree, &["rev-parse", "HEAD^"]).await?;
+        let message = self.git(worktree, &["log", "-1", "--format=%B"]).await?;
+        Ok(parent == base && message.contains(&format!("This reverts commit {original}.")))
+    }
+
+    /// Checks that validation commands have not changed the proposed revert.
+    pub async fn clean(&self, worktree: &Path) -> Result<bool, ForgeError> {
+        Ok(self
+            .git(
+                worktree,
+                &["status", "--porcelain", "--untracked-files=all"],
+            )
+            .await?
+            .is_empty())
+    }
+
     /// Stages everything and commits. `None` when there is nothing to commit.
     pub async fn commit_all(
         &self,
@@ -600,6 +657,14 @@ pub enum PrState {
 pub struct PrStatus {
     pub state: PrState,
     pub comments: Vec<Comment>,
+    /// The PR branch head commit, useful for diagnostics.
+    pub head_sha: Option<String>,
+    /// The squashed merge commit on the base branch.
+    pub merge_sha: Option<String>,
+    /// The PR target branch, used to verify the configured base.
+    pub base_ref: Option<String>,
+    /// A multi-commit PR cannot safely be undone by reverting only its last SHA.
+    pub commit_count: Option<usize>,
 }
 
 /// The `comments` array of `gh issue view` / `gh pr view --json comments`.
@@ -770,7 +835,7 @@ impl Gh {
                     "--repo",
                     slug,
                     "--json",
-                    "number,state,comments,reviews",
+                    "number,state,comments,reviews,headRefOid,mergeCommit,baseRefName,commits",
                 ],
                 None,
             )
@@ -846,7 +911,23 @@ impl Gh {
                 ));
             }
         };
-        Ok(PrStatus { state, comments })
+        Ok(PrStatus {
+            state,
+            comments,
+            head_sha: v
+                .get("headRefOid")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            merge_sha: v
+                .pointer("/mergeCommit/oid")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            base_ref: v
+                .get("baseRefName")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            commit_count: v.get("commits").and_then(Value::as_array).map(Vec::len),
+        })
     }
 
     /// Squash-merges the PR and deletes its branch, only if its head is still
@@ -915,6 +996,16 @@ impl Gh {
         let n = number.to_string();
         self.gh(
             &["issue", "comment", &n, "--repo", slug, "--body-file", "-"],
+            Some(&with_prefix(body)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Posts a bot comment on a pull request.
+    pub async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
+        self.gh(
+            &["pr", "comment", url, "--repo", slug, "--body-file", "-"],
             Some(&with_prefix(body)),
         )
         .await?;
@@ -1533,11 +1624,16 @@ mod tests {
         );
         assert_eq!(s.comments[1].association, "MEMBER");
         std::fs::write(dir.path().join("api.txt"), "[]").unwrap();
-        let gh = fake_gh(dir.path(), r#"{"state":"MERGED","comments":[]}"#);
-        assert_eq!(
-            gh.pr_status("o/r", "u").await.unwrap().state,
-            PrState::Merged
+        let gh = fake_gh(
+            dir.path(),
+            r#"{"state":"MERGED","comments":[],"headRefOid":"branch-head","mergeCommit":{"oid":"merged-sha"},"baseRefName":"main","commits":[{"oid":"branch-head"}]}"#,
         );
+        let merged = gh.pr_status("o/r", "u").await.unwrap();
+        assert_eq!(merged.state, PrState::Merged);
+        assert_eq!(merged.head_sha.as_deref(), Some("branch-head"));
+        assert_eq!(merged.merge_sha.as_deref(), Some("merged-sha"));
+        assert_eq!(merged.base_ref.as_deref(), Some("main"));
+        assert_eq!(merged.commit_count, Some(1));
         let gh = fake_gh(dir.path(), r#"{"state":"DRAFT?","comments":[]}"#);
         assert!(gh.pr_status("o/r", "u").await.is_err());
         let gh = fake_gh(dir.path(), "");

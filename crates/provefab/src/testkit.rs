@@ -275,6 +275,10 @@ impl FakeHub {
             pr_status: Mutex::new(crate::forge::PrStatus {
                 state: crate::forge::PrState::Open,
                 comments: Vec::new(),
+                head_sha: None,
+                merge_sha: None,
+                base_ref: None,
+                commit_count: None,
             }),
             issue_is_open: Default::default(),
             merged: Mutex::new(Vec::new()),
@@ -335,6 +339,16 @@ impl Hub for FakeHub {
         }
         self.posted.lock().unwrap().push(body.to_string());
         self.add_comment("me", &crate::forge::with_prefix(body));
+        Ok(())
+    }
+    async fn pr_comment(&self, _: &str, _: &str, body: &str) -> Result<(), ForgeError> {
+        self.posted.lock().unwrap().push(body.to_string());
+        self.pr_status.lock().unwrap().comments.push(Comment {
+            author: "me".into(),
+            association: "MEMBER".into(),
+            body: crate::forge::with_prefix(body),
+            created_at: crate::store::rfc3339(crate::store::now()),
+        });
         Ok(())
     }
     async fn edit_labels(

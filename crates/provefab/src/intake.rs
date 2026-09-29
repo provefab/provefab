@@ -114,6 +114,7 @@ mod tests {
             poll_interval: Duration::from_secs(180),
             trust_pi_project: false,
             gates: vec!["make test".into()],
+            post_merge_checks: Vec::new(),
         }
     }
 

@@ -235,6 +235,21 @@ fn findings_text(r: &ReviewOutput) -> String {
         .join("\n")
 }
 
+fn post_merge_failure(report: &GateReport) -> String {
+    report
+        .results
+        .iter()
+        .filter(|r| !r.passed)
+        .map(|r| {
+            format!(
+                "- `{}` (exit {:?}; details in local provefab log)",
+                r.command, r.exit
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -1078,7 +1093,14 @@ Please reply with what should happen, what happens instead, and how to reproduce
         match status.state {
             PrState::Open => Ok(task.state),
             PrState::Merged => {
-                self.record_merge(&task, &repo).await?;
+                self.record_merge(
+                    &task,
+                    &repo,
+                    status.merge_sha.as_deref(),
+                    status.base_ref.as_deref(),
+                    status.commit_count,
+                )
+                .await?;
                 Ok(task.state)
             }
             PrState::Closed => {
@@ -1130,7 +1152,19 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// when, and free the worktree. A failed label edit is kept as a pending
     /// GitHub effect and retried by the scheduler (PR #25), so it never blocks
     /// recording the merge.
-    async fn record_merge(&self, task: &TaskRow, repo: &RepoConfig) -> Result<(), PipelineError> {
+    async fn record_merge(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        merge_sha: Option<&str>,
+        base: Option<&str>,
+        commit_count: Option<usize>,
+    ) -> Result<(), PipelineError> {
+        if !repo.post_merge_checks.is_empty() && (merge_sha.is_none() || base.is_none()) {
+            // GitHub may not expose mergeCommit immediately after a squash.
+            // Keep the PR watched so the next poll can recover its exact SHA.
+            return Ok(());
+        }
         let merged = format!("{}:merged", repo.label);
         let in_pr = format!("{}:in-pr", repo.label);
         self.relabel(
@@ -1141,10 +1175,26 @@ Please reply with what should happen, what happens instead, and how to reproduce
             &[&in_pr],
         )
         .await?;
-        self.store.set_pr_state(task.id, "merged").await?;
+        if let (Some(sha), Some(base)) = (merge_sha, base)
+            && base == repo.base
+            && !repo.post_merge_checks.is_empty()
+        {
+            let check = self
+                .store
+                .ensure_post_merge_check(task.id, sha, base)
+                .await?;
+            if commit_count != Some(1) {
+                self.store.finish_post_merge(check.id, "blocked", Some("PR does not have exactly one commit; reverting only its last merge SHA would be unsafe")).await?;
+            }
+        }
         self.store
-            .record_output(task.id, "merged_at", &json!({"at": now()}))
+            .record_output(
+                task.id,
+                "merged_at",
+                &json!({"at": now(), "sha": merge_sha, "base": base}),
+            )
             .await?;
+        self.store.set_pr_state(task.id, "merged").await?;
         let wt = self.paths.worktree(task.id);
         if wt.exists() {
             let lock = self.repo_lock(repo);
@@ -1153,6 +1203,253 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 eprintln!("provefab: could not remove {}: {e}", wt.display());
             }
         }
+        Ok(())
+    }
+
+    /// Runs the opt-in post-merge checks and, on failure, prepares a human-reviewed
+    /// revert PR. The check row is the idempotency boundary for scheduler retries.
+    pub async fn process_post_merge(&self, id: i64) -> Result<(), PipelineError> {
+        let task = self.task(id).await?;
+        let Some(repo) = self.repo(&task).cloned() else {
+            return Ok(());
+        };
+        if repo.post_merge_checks.is_empty()
+            || task.state != TaskState::PrOpen
+            || task.pr_url.is_none()
+            || !matches!(
+                task.pr_state.as_deref(),
+                Some("merged" | "done" | "archived")
+            )
+        {
+            return Ok(());
+        }
+        let Some(merged) = self.store.last_output(id, "merged_at").await? else {
+            return Ok(());
+        };
+        let (Some(sha), Some(base)) = (
+            merged.get("sha").and_then(Value::as_str),
+            merged.get("base").and_then(Value::as_str),
+        ) else {
+            // Old tasks, or a provider that did not return the PR metadata, cannot
+            // be safely attributed. Never guess a commit to verify or revert.
+            return Ok(());
+        };
+        if base != repo.base {
+            return Ok(());
+        }
+        let Some(check) = self.store.post_merge_check(id, sha).await? else {
+            // Opting in later must not retroactively revert an old merge.
+            return Ok(());
+        };
+        if check.state == "passed" {
+            return Ok(());
+        }
+        if matches!(check.state.as_str(), "revert_open" | "blocked") {
+            if check.notified_at.is_none() {
+                let message = if let Some(url) = &check.revert_pr_url {
+                    format!(
+                        "Post-merge checks failed for `{sha}`. A human-reviewed revert PR is open: {url}."
+                    )
+                } else {
+                    format!(
+                        "Post-merge verification for `{sha}` needs a human: {}",
+                        check
+                            .failure_summary
+                            .as_deref()
+                            .unwrap_or("rollback unavailable")
+                    )
+                };
+                self.notify_post_merge(&task, &repo, &message).await?;
+            }
+            return Ok(());
+        }
+        if !matches!(check.state.as_str(), "queued" | "running" | "failed") {
+            return Ok(());
+        }
+        let repo_path = self.checkout(&repo);
+        let lock = self.repo_lock(&repo);
+        let _guard = lock.lock().await;
+        self.git.fetch(&repo_path).await?;
+        let base_ref = self.git.base_ref(&repo_path, &repo.base).await;
+        let current_base = self.git.rev_parse(&repo_path, &base_ref).await?;
+        if !self.git.is_ancestor(&repo_path, sha, &current_base).await? {
+            self.store
+                .finish_post_merge(
+                    check.id,
+                    "blocked",
+                    Some("merged commit is not an ancestor of the current base"),
+                )
+                .await?;
+            self.notify_post_merge(&task, &repo, "The merged commit is no longer an ancestor of the current base branch; Provefab did not attempt a rollback.")
+                .await?;
+            return Ok(());
+        }
+        let failure = if check.state == "failed" {
+            check.failure_summary.clone().unwrap_or_default()
+        } else {
+            let verify_wt = self
+                .paths
+                .home
+                .join("post-merge")
+                .join(format!("{id}-{}", &sha[..sha.len().min(12)]));
+            if check.state == "running" && verify_wt.exists() {
+                // A killed gate may have left generated files or edits behind.
+                // Retry on a fresh checkout of the exact commit, not its residue.
+                self.git.worktree_remove(&repo_path, &verify_wt).await?;
+            }
+            self.git
+                .worktree_detached(&repo_path, &verify_wt, sha)
+                .await?;
+            self.store
+                .set_post_merge_running(check.id, &verify_wt)
+                .await?;
+            let report = self
+                .gates(&task, &verify_wt, &repo.post_merge_checks, "post-merge")
+                .await?;
+            let _ = self.git.worktree_remove(&repo_path, &verify_wt).await;
+            if report.passed() {
+                self.store
+                    .finish_post_merge(check.id, "passed", None)
+                    .await?;
+                return Ok(());
+            }
+            let failure = post_merge_failure(&report);
+            self.store
+                .finish_post_merge(check.id, "failed", Some(&failure))
+                .await?;
+            failure
+        };
+
+        let branch = format!("provefab/revert-{id}-{}", &sha[..sha.len().min(12)]);
+        let revert_wt = self
+            .paths
+            .home
+            .join("post-merge")
+            .join(format!("{id}-revert"));
+        if check.state == "failed" && revert_wt.exists() {
+            self.git.worktree_remove(&repo_path, &revert_wt).await?;
+        }
+        self.git
+            .worktree_add(&repo_path, &revert_wt, &branch, &base_ref)
+            .await?;
+        if self.git.head(&revert_wt).await? == current_base {
+            if let Err(e) = self.git.revert(&revert_wt, sha).await {
+                let _ = self.git.worktree_remove(&repo_path, &revert_wt).await;
+                self.store
+                    .finish_post_merge(check.id, "blocked", Some(&format!("revert conflict: {e}")))
+                    .await?;
+                self.notify_post_merge(&task, &repo, &format!("Post-merge checks failed, but the revert conflicted: {e}. A human must resolve it.")).await?;
+                return Ok(());
+            }
+        } else if !self
+            .git
+            .prepared_revert(&revert_wt, &current_base, sha)
+            .await?
+        {
+            self.store
+                .finish_post_merge(
+                    check.id,
+                    "blocked",
+                    Some("revert branch is not based on the current base commit"),
+                )
+                .await?;
+            self.notify_post_merge(&task, &repo, "The revert branch is not based on the current base commit. Human intervention required.").await?;
+            return Ok(());
+        }
+        let revert_report = self
+            .gates(&task, &revert_wt, &repo.post_merge_checks, "revert-check")
+            .await?;
+        if !revert_report.passed() {
+            let detail = post_merge_failure(&revert_report);
+            let _ = self.git.worktree_remove(&repo_path, &revert_wt).await;
+            self.store
+                .finish_post_merge(
+                    check.id,
+                    "blocked",
+                    Some(&format!("revert checks failed: {detail}")),
+                )
+                .await?;
+            self.notify_post_merge(&task, &repo, &format!("Post-merge checks failed and the proposed revert does not pass them: {detail}. A human must intervene.")).await?;
+            return Ok(());
+        }
+        if !self.git.clean(&revert_wt).await? {
+            let _ = self.git.worktree_remove(&repo_path, &revert_wt).await;
+            self.store
+                .finish_post_merge(
+                    check.id,
+                    "blocked",
+                    Some("revert checks modified the checkout"),
+                )
+                .await?;
+            self.notify_post_merge(&task, &repo, "The revert passed checks but a verification command modified the checkout. Human intervention required.").await?;
+            return Ok(());
+        }
+        // git revert --no-edit already committed. Never call commit_all: it
+        // would either find nothing or include files generated by a check.
+        let revert_sha = self.git.head(&revert_wt).await?;
+        self.git.push(&revert_wt, &branch).await?;
+        let body = format!(
+            "## Provefab post-merge verification failed\n\nOriginal PR: {}\nIssue: {}\nMerged commit: `{sha}`\nBase before revert: `{current_base}`\n\nThe configured checks failed:\n\n{failure}\n\nThe reverted tree passed the same checks. This pull request requires human review; Provefab will not merge it automatically.\n",
+            task.pr_url.as_deref().unwrap_or("unknown"),
+            task.issue_url
+        );
+        let url = self
+            .hub
+            .pr_create(
+                &repo.slug,
+                &branch,
+                &repo.base,
+                &format!("Revert Provefab change ({sha})"),
+                &body,
+            )
+            .await?;
+        self.store.set_post_merge_revert_pr(check.id, &url).await?;
+        self.notify_post_merge(&task, &repo, &format!("Post-merge checks failed for `{sha}`. A human-reviewed revert PR is open: {url}. Revert commit: `{revert_sha}`.")).await?;
+        let _ = self.git.worktree_remove(&repo_path, &revert_wt).await;
+        Ok(())
+    }
+
+    async fn notify_post_merge(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        message: &str,
+    ) -> Result<(), PipelineError> {
+        let Some(check) = self.store.post_merge_checks(task.id).await?.pop() else {
+            return Ok(());
+        };
+        if check.notified_at.is_some() {
+            return Ok(());
+        }
+        let marker = format!(
+            "<!-- provefab-post-merge:{}:{} -->",
+            task.id, check.merge_sha
+        );
+        let body = format!("{message}\n\n{marker}");
+        // Check remote comments before each post: a crash between the GitHub
+        // write and the SQLite write must not produce a comment storm.
+        if !self
+            .hub
+            .comments(&repo.slug, task.issue_number)
+            .await?
+            .iter()
+            .any(|c| c.body.contains(&marker))
+        {
+            self.tell(task.id, &repo.slug, task.issue_number, &body)
+                .await?;
+        }
+        if let Some(url) = task.pr_url.as_deref()
+            && !self
+                .hub
+                .pr_status(&repo.slug, url)
+                .await?
+                .comments
+                .iter()
+                .any(|c| c.body.contains(&marker))
+        {
+            self.hub.pr_comment(&repo.slug, url, &body).await?;
+        }
+        self.store.mark_post_merge_notified(check.id).await?;
         Ok(())
     }
 
@@ -1880,6 +2177,24 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let _ = std::fs::create_dir_all(&scratch);
         let started = now();
         let report = run_gates(wt, commands, self.config.limits.gate_timeout, &scratch).await;
+        if matches!(stage, "post-merge" | "revert-check") {
+            let results: Vec<Value> = report
+                .results
+                .iter()
+                .map(|r| {
+                    json!({
+                        "command": r.command,
+                        "exit": r.exit,
+                        "passed": r.passed,
+                        "timed_out": r.timed_out,
+                        "output_tail": r.output_tail,
+                    })
+                })
+                .collect();
+            let path = scratch.join("results.json");
+            std::fs::write(&path, json!({"results": results}).to_string())
+                .map_err(|e| ForgeError::Parse(path.display().to_string(), e.to_string()))?;
+        }
         self.store
             .record_stage_run(&StageRunRecord {
                 task_id: task.id,
@@ -2680,7 +2995,16 @@ where
                         .store
                         .record_output(self.task.id, "auto_merged", &json!({"head": head}))
                         .await?;
-                    self.p.record_merge(self.task, self.repo).await?;
+                    let status = self.p.hub.pr_status(&self.repo.slug, self.url).await?;
+                    self.p
+                        .record_merge(
+                            self.task,
+                            self.repo,
+                            status.merge_sha.as_deref(),
+                            status.base_ref.as_deref().or(Some(self.repo.base.as_str())),
+                            status.commit_count,
+                        )
+                        .await?;
                     Ok(MergeOutcome::Merged)
                 }
                 Err(e) => {

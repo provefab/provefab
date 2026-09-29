@@ -185,6 +185,9 @@ where
                             Ok(TaskState::PrOpen) => {}
                             other => report(t.id, other),
                         }
+                        if let Err(e) = p.process_post_merge(t.id).await {
+                            eprintln!("provefab: post-merge verification for task {}: {e}", t.id);
+                        }
                     }
                 }
             }

@@ -14,6 +14,7 @@
    - stops if nothing works.
 7. **Review** by a different model provider than the implementer's. If it asks for changes, the implementer gets all of them, earlier rounds included, and must write a test for each.
 8. **Pull request.** Provefab commits, pushes and opens the PR. Its text lists the checks, the routing, and any deleted or disabled tests. It comments on the issue and sets `provefab:in-pr`. The PR then waits for your review.
+9. **Optional post-merge verification.** If you set `post_merge_checks`, Provefab runs them on the exact merged base-branch commit of its own PR. If they fail, it tries a revert on the current base. A revert PR opens **only if the reverted tree passes the same checks**. Revert conflicts, PRs with multiple commits (which cannot safely be undone by reverting only the last SHA), or failing revert checks require a human; Provefab never merges a revert PR itself. These are repository commands, not production monitoring; they cannot detect failures your checks do not cover.
 
 ## Writing issues that land
 
@@ -57,11 +58,12 @@ What works best:
 - **routes:** for each stage, the model it ran on and why, for example `review -> sonnet-sub: subscription, quota weight 1.0 (prefer subscription)`.
 - **stage runs:** every stage, with its model, outcome, turns, tokens (`in/out`, then `(+cache read/write)` when the model cached), cost, check score and session directory (full transcript). The cost is in dollars for a model signed in by API key (`cost $0.0123`) and in quota units for a subscription (`quota 0.42`: millions of tokens times the model's quota weight). A `total:` line sums the task.
 The pull request's **Routing** section lists the model of each stage and ends with the task's cost, for example `Cost: $0.4210 API · 1.20 quota units.` A part that is zero is left out.
+- **post-merge checks:** merged SHA, check status, failure summary and the revert PR link, if any. Session directories for `post-merge` and `revert-check` in **stage runs** contain command results.
 - **last plan / review / failure:** the latest structured answers.
 
 ## Measuring
 
-`provefab stats` sums up each repository: how many issues became pull requests, how many were merged (automatically or by a person), closed or reopened after a merge, the median time from issue to pull request, and which reviewers approved the merged ones. Automatic merges are counted from the version that introduced the command on.
+`provefab stats` sums up each repository: how many issues became pull requests, how many were merged (automatically or by a person), closed or reopened after a merge, post-merge check outcomes and revert PRs, the median time from issue to pull request, and which reviewers approved the merged ones. Automatic merges are counted from the version that introduced the command on.
 
 ## Trying it safely
 

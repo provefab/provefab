@@ -134,6 +134,12 @@ pub trait Hub {
         number: u64,
         body: &str,
     ) -> impl Future<Output = Result<(), ForgeError>> + Send;
+    fn pr_comment(
+        &self,
+        slug: &str,
+        url: &str,
+        body: &str,
+    ) -> impl Future<Output = Result<(), ForgeError>> + Send;
     fn edit_labels(
         &self,
         slug: &str,
@@ -192,6 +198,9 @@ impl Hub for Gh {
     }
     async fn comment(&self, slug: &str, number: u64, body: &str) -> Result<(), ForgeError> {
         Gh::comment(self, slug, number, body).await
+    }
+    async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
+        Gh::pr_comment(self, slug, url, body).await
     }
     async fn edit_labels(
         &self,

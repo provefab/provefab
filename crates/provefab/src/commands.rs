@@ -122,15 +122,30 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
             .map(|r| r.reason.clone())
             .unwrap_or_default();
         let why = why.lines().next().unwrap_or_default();
+        let checks = store.post_merge_checks(t.id).await?;
+        let post_merge = checks
+            .last()
+            .map(|c| {
+                format!(
+                    "  post-merge: {}{}",
+                    c.state,
+                    c.revert_pr_url
+                        .as_ref()
+                        .map(|u| format!(" {u}"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:>4}  {}#{}  {:<12} {}{}",
+            "{:>4}  {}#{}  {:<12} {}{}{}",
             t.id,
             t.repo,
             t.issue_number,
             t.state.as_str(),
             why,
-            t.pr_url.map(|u| format!("  {u}")).unwrap_or_default()
+            t.pr_url.map(|u| format!("  {u}")).unwrap_or_default(),
+            post_merge
         );
     }
     Ok(out)
@@ -150,6 +165,9 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
         auto: u32,
         closed: u32,
         reopened_after_merge: u32,
+        post_merge_passed: u32,
+        post_merge_failed: u32,
+        revert_prs: u32,
         stopped: u32,
         seconds_to_pr: Vec<i64>,
         reviewers: BTreeMap<String, u32>,
@@ -171,6 +189,17 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
             transitions.iter().find(|x| x.to == TaskState::PrOpen),
         ) {
             r.seconds_to_pr.push(opened.at - first.at);
+        }
+        for check in store.post_merge_checks(t.id).await? {
+            match check.state.as_str() {
+                "passed" => r.post_merge_passed += 1,
+                "failed" | "blocked" => r.post_merge_failed += 1,
+                "revert_open" => {
+                    r.post_merge_failed += 1;
+                    r.revert_prs += 1;
+                }
+                _ => {}
+            }
         }
         match t.pr_state.as_deref() {
             Some("merged" | "done") => {
@@ -212,7 +241,7 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
         let pct = (r.prs * 100).checked_div(r.tasks).unwrap_or(0);
         let _ = writeln!(
             out,
-            "{slug}: {} tasks · {} PRs ({pct}%) · merged {} (auto {}, by hand {}) · closed {} · stopped {} · reopened after merge {}",
+            "{slug}: {} tasks · {} PRs ({pct}%) · merged {} (auto {}, by hand {}) · closed {} · stopped {} · reopened after merge {} · post-merge passed {} failed {} revert PRs {}",
             r.tasks,
             r.prs,
             r.merged,
@@ -220,7 +249,10 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
             r.merged - r.auto,
             r.closed,
             r.stopped,
-            r.reopened_after_merge
+            r.reopened_after_merge,
+            r.post_merge_passed,
+            r.post_merge_failed,
+            r.revert_prs
         );
         let _ = writeln!(out, "  median issue to PR: {median}");
         let pairs: Vec<String> = r
@@ -323,6 +355,25 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
     }
     if let Some(total) = crate::cost::summary(&runs) {
         let _ = writeln!(out, "  total: {total}");
+    }
+    let post_merge = store.post_merge_checks(id).await?;
+    if !post_merge.is_empty() {
+        out.push_str("\npost-merge checks:\n");
+        for c in post_merge {
+            let _ = writeln!(
+                out,
+                "  {} {} on {}{}{}",
+                c.state,
+                c.merge_sha,
+                c.base,
+                c.revert_pr_url
+                    .map(|u| format!("  revert {u}"))
+                    .unwrap_or_default(),
+                c.failure_summary
+                    .map(|s| format!("  failure: {s}"))
+                    .unwrap_or_default()
+            );
+        }
     }
     for kind in ["plan", "review", "failure"] {
         if let Some(v) = store.last_output(id, kind).await? {
@@ -751,6 +802,28 @@ pub async fn doctor(
                 .map_err(|e| format!("{}: {e}", path.display())),
             ));
         }
+        checks.push(Check {
+            name: format!("post-merge {}", repo.slug),
+            ok: !repo
+                .post_merge_checks
+                .iter()
+                .any(|g| gate_shares_build_dir(g)),
+            detail: if repo.post_merge_checks.is_empty() {
+                "off (opt in with post_merge_checks)".to_string()
+            } else if repo
+                .post_merge_checks
+                .iter()
+                .any(|g| gate_shares_build_dir(g))
+            {
+                "a shared build directory may test another commit; use worktree-local build output"
+                    .to_string()
+            } else {
+                format!(
+                    "{} command(s); reverts always require human review",
+                    repo.post_merge_checks.len()
+                )
+            },
+        });
         let shares_build_dir = repo.gates.iter().any(|g| gate_shares_build_dir(g));
         checks.push(Check {
             name: format!("gates {}", repo.slug),
