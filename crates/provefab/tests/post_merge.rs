@@ -826,6 +826,26 @@ fn pr_markers(p: &P, check_id: i64) -> usize {
         .count()
 }
 
+/// A new PR after a reopen does not redirect the notices of the merged one (final review F2).
+#[tokio::test]
+async fn notices_and_the_revert_name_the_merged_pr_after_a_new_pr_opens() {
+    let (_f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    p.store
+        .set_pr(id, "https://github.com/o/r/pull/9", "open")
+        .await
+        .unwrap();
+    let c = drive(&p, id).await;
+    assert_eq!(c.state, CheckState::RevertOpen);
+    assert_eq!(c.pr_url.as_deref(), Some("https://github.com/o/r/pull/8"));
+    assert_eq!(pr_markers(&p, c.id), 1);
+    let body = p.hub.prs.lock().unwrap()[0].3.clone();
+    assert!(
+        body.contains("Original pull request: https://github.com/o/r/pull/8"),
+        "{body}"
+    );
+    assert!(!body.contains("pull/9"), "{body}");
+}
+
 #[tokio::test]
 async fn a_failed_pr_comment_is_retried_without_a_second_issue_comment() {
     use std::sync::atomic::Ordering;
@@ -870,6 +890,7 @@ async fn each_check_is_announced_by_its_own_id() {
             task_id: id,
             merge_sha: "unknown",
             base: "main",
+            pr_url: Some("https://github.com/o/r/pull/8"),
             commit_count: None,
             auto_merged: false,
         })

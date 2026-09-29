@@ -127,6 +127,28 @@ where
         p.refresh_prices().await;
         if !(opts.once && polled_once) {
             p.retry_pending(&in_flight).await;
+            // Post-merge rows advance on every poll, whatever the task's state: a
+            // reopen moves the task out of `PrOpen` but its check must still finish
+            // (final review F2). Tasks a worker is driving are included on purpose:
+            // a check only reads the task and takes the repo lock for git work.
+            let post_merge: Vec<crate::store::TaskRow> =
+                match p.store.tasks_with_open_post_merge().await {
+                    Ok(ids) => {
+                        let mut tasks = Vec::new();
+                        for id in ids {
+                            match p.store.task(id).await {
+                                Ok(Some(t)) => tasks.push(t),
+                                Ok(None) => {}
+                                Err(e) => eprintln!("provefab: task {id}: {e}"),
+                            }
+                        }
+                        tasks
+                    }
+                    Err(e) => {
+                        eprintln!("provefab: could not list post-merge checks: {e}");
+                        Vec::new()
+                    }
+                };
             for repo in &p.config.repos {
                 let due = next_poll
                     .get(&repo.slug)
@@ -157,16 +179,20 @@ where
                         }
                     }
                 }
+                // Once per task: each task belongs to one repository. The hourly
+                // throttle below is for the reopen watch only (spec section 5).
+                for t in &post_merge {
+                    if repo_of(&p.config, &t.repo).is_some_and(|r| r.slug == repo.slug)
+                        && let Err(e) = p.process_post_merge(t.id).await
+                    {
+                        eprintln!("provefab: post-merge verification for task {}: {e}", t.id);
+                    }
+                }
                 // Merged, closed or reopened: the PR watcher (D52).
                 for t in listed(&p, &[TaskState::PrOpen]).await {
                     if !in_flight.contains(&t.id)
                         && repo_of(&p.config, &t.repo).is_some_and(|r| r.slug == repo.slug)
                     {
-                        // Post-merge rows advance every tick; the hourly throttle
-                        // below is for the reopen watch only (spec section 5).
-                        if let Err(e) = p.process_post_merge(t.id).await {
-                            eprintln!("provefab: post-merge verification for task {}: {e}", t.id);
-                        }
                         // After the merge only a reopen matters: check hourly (Plan 4 review I2).
                         if matches!(t.pr_state.as_deref(), Some("merged" | "done")) {
                             let recent = p

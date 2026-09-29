@@ -296,9 +296,11 @@ pub fn render(row: &PostMergeCheckRow) -> Option<String> {
     Some(format!("{text}\n\n{}", marker(row.id)))
 }
 
-pub fn revert_pr_body(original_pr: &str, issue_url: &str, row: &PostMergeCheckRow) -> String {
+/// Names the merged PR from the row, never the task's current PR (final review F2).
+pub fn revert_pr_body(issue_url: &str, row: &PostMergeCheckRow) -> String {
     format!(
-        "## Provefab post-merge verification failed\n\nOriginal pull request: {original_pr}\nIssue: {issue_url}\nMerged commit: `{}`\nBase tip: `{}`\n\nThese checks failed on the merged commit and still fail on the current base:\n\n{}\n\nThe reverted tree passes the same checks.\n\nProvefab will not merge this revert automatically.\n",
+        "## Provefab post-merge verification failed\n\nOriginal pull request: {}\nIssue: {issue_url}\nMerged commit: `{}`\nBase tip: `{}`\n\nThese checks failed on the merged commit and still fail on the current base:\n\n{}\n\nThe reverted tree passes the same checks.\n\nProvefab will not merge this revert automatically.\n",
+        row.pr_url.as_deref().unwrap_or("unknown"),
         row.merge_sha,
         row.base_sha.as_deref().unwrap_or("unknown"),
         command_lines(&row.failed_commands)
@@ -761,11 +763,7 @@ where
                     .await;
             }
         }
-        let body = revert_pr_body(
-            task.pr_url.as_deref().unwrap_or("unknown"),
-            &task.issue_url,
-            check,
-        );
+        let body = revert_pr_body(&task.issue_url, check);
         let title = format!(
             "Revert Provefab change {}",
             &check.merge_sha[..check.merge_sha.len().min(12)]
@@ -833,7 +831,7 @@ where
                 .await?;
         }
         if check.pr_notified_at.is_none() {
-            let Some(url) = task.pr_url.as_deref() else {
+            let Some(url) = check.pr_url.as_deref() else {
                 self.store
                     .mark_post_merge_notified(check.id, NoticeTarget::Pr)
                     .await?;
@@ -996,6 +994,7 @@ mod tests {
             task_id: 7,
             merge_sha: "abc123".into(),
             base: "main".into(),
+            pr_url: Some("https://github.com/o/r/pull/8".into()),
             commit_count: Some(1),
             auto_merged: false,
             state,
@@ -1056,7 +1055,6 @@ mod tests {
     #[test]
     fn the_revert_pr_body_names_both_commits_and_never_auto_merges() {
         let body = revert_pr_body(
-            "https://github.com/o/r/pull/8",
             "https://github.com/o/r/issues/7",
             &row(CheckState::RevertReady, Some(FailureKind::CheckFailed)),
         );

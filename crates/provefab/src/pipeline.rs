@@ -1199,6 +1199,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                             task_id: task.id,
                             merge_sha: sha,
                             base: b,
+                            pr_url: task.pr_url.as_deref(),
                             commit_count,
                             auto_merged,
                         })
@@ -1213,6 +1214,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                             task_id: task.id,
                             merge_sha: merge_sha.unwrap_or("unknown"),
                             base: base.unwrap_or(&repo.base),
+                            pr_url: task.pr_url.as_deref(),
                             commit_count,
                             auto_merged,
                         })

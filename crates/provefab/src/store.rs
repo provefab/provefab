@@ -70,6 +70,8 @@ pub struct PostMergeCheckRow {
     pub task_id: i64,
     pub merge_sha: String,
     pub base: String,
+    /// The merged pull request, not the task's current one.
+    pub pr_url: Option<String>,
     pub commit_count: Option<i64>,
     pub auto_merged: bool,
     pub state: CheckState,
@@ -93,6 +95,7 @@ pub struct NewPostMergeCheck<'a> {
     pub task_id: i64,
     pub merge_sha: &'a str,
     pub base: &'a str,
+    pub pr_url: Option<&'a str>,
     pub commit_count: Option<usize>,
     pub auto_merged: bool,
 }
@@ -437,12 +440,13 @@ impl Store {
         new: &NewPostMergeCheck<'_>,
     ) -> Result<PostMergeCheckRow, StoreError> {
         sqlx::query(
-            "INSERT INTO post_merge_checks (task_id, merge_sha, base, commit_count, auto_merged, state) \
-             VALUES (?, ?, ?, ?, ?, 'queued') ON CONFLICT (task_id, merge_sha) DO NOTHING",
+            "INSERT INTO post_merge_checks (task_id, merge_sha, base, pr_url, commit_count, auto_merged, state) \
+             VALUES (?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT (task_id, merge_sha) DO NOTHING",
         )
         .bind(new.task_id)
         .bind(new.merge_sha)
         .bind(new.base)
+        .bind(new.pr_url)
         .bind(new.commit_count.map(|n| n as i64))
         .bind(new.auto_merged)
         .execute(&self.pool)
@@ -588,6 +592,26 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Tasks with a check still to advance, or a failed check with a notice
+    /// still to post, whatever the task's own state (final review F2).
+    pub async fn tasks_with_open_post_merge(&self) -> Result<Vec<i64>, StoreError> {
+        // The terminal states, as pinned by `CheckState::is_terminal` and its test.
+        let rows = sqlx::query(
+            "SELECT DISTINCT task_id FROM post_merge_checks \
+             WHERE state NOT IN (?, ?, ?, ?) \
+             OR (state <> ? AND (issue_notified_at IS NULL OR pr_notified_at IS NULL)) \
+             ORDER BY task_id",
+        )
+        .bind(CheckState::Passed.as_str())
+        .bind(CheckState::Superseded.as_str())
+        .bind(CheckState::RevertOpen.as_str())
+        .bind(CheckState::Blocked.as_str())
+        .bind(CheckState::Passed.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get("task_id")).collect())
     }
 
     /// `(state, count)` over every check, in `CheckState::ALL` order, zeros omitted.
@@ -940,6 +964,7 @@ fn post_merge_check_row(r: &SqliteRow) -> Result<PostMergeCheckRow, StoreError> 
         task_id: r.get("task_id"),
         merge_sha: r.get("merge_sha"),
         base: r.get("base"),
+        pr_url: r.get("pr_url"),
         commit_count: r.get("commit_count"),
         auto_merged: r.get::<i64, _>("auto_merged") != 0,
         state: CheckState::parse(&state).ok_or_else(|| StoreError::Corrupt(state.clone()))?,
@@ -1008,7 +1033,7 @@ mod tests {
                 "58482ad7ee578abba1976c7bc8f21ed4c3c2a481c6a24f74d64164e7f37c01e6dc1931ad68e527a67df118bf2983cdbd",
                 "fa9d5e7daa5ddeec2a821c7123b4fcca83a08f59d147187aac8a58405466bc12e383f228b0a8574c97fa57817f6fa432",
                 "9f9cca5cfdefacd436e685a2daf6b99f3a4d7104dbda6fd6c5df338adc59f1379ec0d15f86887d96c4ec23b3c1e3eaa5",
-                "d2ab25f12a77bff674bfa242dcb660c001350fe7ee3c0101499094191c7e1ce912efa09d9b9c548e812abf14ded32af3",
+                "daca2e3a57485b3a91ce46779913c341fec2ab5c757e523088b9c89a9fe3683a62f86b83b3adf5775babc4a8fb17ac49",
             ]
         );
     }
@@ -1311,6 +1336,7 @@ mod tests {
             task_id,
             merge_sha: sha,
             base: "main",
+            pr_url: Some("https://github.com/o/r/pull/8"),
             commit_count: Some(1),
             auto_merged: false,
         }
@@ -1331,6 +1357,7 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.state, CheckState::Queued);
         assert_eq!(a.commit_count, Some(1));
+        assert_eq!(a.pr_url.as_deref(), Some("https://github.com/o/r/pull/8"));
         assert_eq!(s.post_merge_checks(id).await.unwrap().len(), 1);
     }
 
@@ -1427,5 +1454,49 @@ mod tests {
             .unwrap();
         let c = s.post_merge_check_by_id(c.id).await.unwrap().unwrap();
         assert!(c.issue_notified_at.is_some() && c.pr_notified_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_post_merge_work_is_listed_whatever_the_task_state() {
+        let (_d, s) = store().await;
+        let id = merged_task(&s).await;
+        let other = s.add_issue(&issue(2)).await.unwrap().unwrap();
+        assert!(s.tasks_with_open_post_merge().await.unwrap().is_empty());
+        let a = s
+            .ensure_post_merge_check(&new_check(id, "abc"))
+            .await
+            .unwrap();
+        let b = s
+            .ensure_post_merge_check(&new_check(other, "def"))
+            .await
+            .unwrap();
+        assert_eq!(s.tasks_with_open_post_merge().await.unwrap(), [id, other]);
+        // A pass has nothing to announce: done.
+        s.advance_post_merge(
+            a.id,
+            CheckState::Queued,
+            CheckState::Passed,
+            &CheckPatch::default(),
+        )
+        .await
+        .unwrap();
+        // A blocked check stays listed until both targets are notified.
+        s.advance_post_merge(
+            b.id,
+            CheckState::Queued,
+            CheckState::Blocked,
+            &CheckPatch::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.tasks_with_open_post_merge().await.unwrap(), [other]);
+        s.mark_post_merge_notified(b.id, NoticeTarget::Issue)
+            .await
+            .unwrap();
+        assert_eq!(s.tasks_with_open_post_merge().await.unwrap(), [other]);
+        s.mark_post_merge_notified(b.id, NoticeTarget::Pr)
+            .await
+            .unwrap();
+        assert!(s.tasks_with_open_post_merge().await.unwrap().is_empty());
     }
 }

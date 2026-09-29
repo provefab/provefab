@@ -1,11 +1,13 @@
 -- Post-merge verification (docs/specs/2026-09-29-post-merge-verification-design.md, section 10).
 -- One row per merged commit; `state` follows the section 5 state machine.
 -- `merge_sha` is the literal 'unknown' when GitHub never reported it.
+-- `pr_url` is the merged pull request: the task may open another one later.
 CREATE TABLE post_merge_checks (
     id                INTEGER PRIMARY KEY,
     task_id           INTEGER NOT NULL REFERENCES tasks (id),
     merge_sha         TEXT NOT NULL,
     base              TEXT NOT NULL,
+    pr_url            TEXT,
     commit_count      INTEGER,
     auto_merged       INTEGER NOT NULL DEFAULT 0,
     state             TEXT NOT NULL,

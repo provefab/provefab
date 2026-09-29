@@ -452,3 +452,69 @@ async fn post_merge_checks_advance_on_every_tick() {
     let c = p.store.post_merge_checks(t.id).await.unwrap();
     assert_eq!(c[0].state, provefab::post_merge::CheckState::Passed);
 }
+
+/// A task that left `PrOpen` after its merge (a reopen that needs a person)
+/// still has its check driven to the end (final review F2).
+#[tokio::test]
+async fn post_merge_checks_advance_after_the_task_leaves_pr_open() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.config.repos[0].post_merge_checks = vec!["true".into()];
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let source = FakeSource(p.hub.issue.clone());
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    let repo = f.config.repos[0].path_in(&f.home);
+    std::fs::write(repo.join("MERGED.md"), "merged\n").unwrap();
+    git(&repo, &["add", "MERGED.md"]);
+    git(&repo, &["commit", "-qm", "squash merge"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let sha = git(&repo, &["rev-parse", "HEAD"]);
+    *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
+        state: provefab::forge::PrState::Merged,
+        comments: vec![],
+        head_sha: None,
+        merge_sha: Some(sha),
+        base_ref: Some("main".into()),
+        commit_count: Some(1),
+    };
+    within(
+        10,
+        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    let t = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap();
+    let c = p.store.post_merge_checks(t.id).await.unwrap();
+    assert_eq!(c[0].state, provefab::post_merge::CheckState::Queued);
+    p.store
+        .transition(t.id, NeedsYou, "reopened")
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        within(
+            10,
+            provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        )
+        .await
+        .unwrap();
+    }
+    let c = p.store.post_merge_checks(t.id).await.unwrap();
+    assert_eq!(c[0].state, provefab::post_merge::CheckState::Passed);
+}
