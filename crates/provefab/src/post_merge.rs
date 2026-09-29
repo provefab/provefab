@@ -607,6 +607,8 @@ where
         let r = self
             .pm_run(task, repo, check, &tip, "base", "post-merge-base", false)
             .await?;
+        // failure_kind/failed_commands are kept on Superseded on purpose: they describe the
+        // failure on the merged commit; render and CLI output key on state first.
         let to = if r.failed.is_empty() {
             CheckState::Superseded
         } else {
@@ -660,10 +662,6 @@ where
         }
         let revert_sha = self.git.head(&wt).await?;
         self.git.worktree_discard(&repo_path, &wt).await?;
-        let branch = format!("provefab/revert-{}-{}", check.id, check.base_moves);
-        self.git
-            .branch_force(&repo_path, &branch, &revert_sha)
-            .await?;
         let r = self
             .pm_run(
                 task,
@@ -693,6 +691,11 @@ where
                 )
                 .await;
         }
+        // Created only once the revert is proven, so no blocked row leaks a branch.
+        let branch = format!("provefab/revert-{}-{}", check.id, check.base_moves);
+        self.git
+            .branch_force(&repo_path, &branch, &revert_sha)
+            .await?;
         self.advance(
             check,
             CheckState::RevertReady,

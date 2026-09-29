@@ -427,6 +427,7 @@ async fn a_fix_already_on_the_base_supersedes_the_revert() {
     assert_eq!(c.base_sha.as_deref(), Some(fix.as_str()));
     assert!(p.hub.prs.lock().unwrap().is_empty());
     assert_eq!(git(&f.origin, &["branch", "--list", "provefab/*"]), "");
+    assert_eq!(git(&repo, &["branch", "--list", "provefab/*"]), "");
 }
 
 #[tokio::test]
@@ -466,8 +467,10 @@ async fn a_conflicting_revert_is_blocked() {
 
 #[tokio::test]
 async fn a_revert_that_still_fails_is_blocked() {
-    let (_f, p, id, _) = setup(&["false"], "broken\n").await;
+    let (f, p, id, _) = setup(&["false"], "broken\n").await;
     let c = drive(&p, id).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    assert_eq!(git(&repo, &["branch", "--list", "provefab/*"]), "");
     assert_eq!(
         (c.state, c.failure_kind),
         (CheckState::Blocked, Some(FailureKind::RevertChecksFailed))
@@ -478,12 +481,14 @@ async fn a_revert_that_still_fails_is_blocked() {
 #[tokio::test]
 async fn a_check_that_edits_tracked_files_on_the_revert_is_blocked() {
     // Fails on the merge (README is broken), passes on the revert but rewrites README.
-    let (_f, p, id, _) = setup(
+    let (f, p, id, _) = setup(
         &["grep -q hello README.md && echo changed > README.md"],
         "broken\n",
     )
     .await;
     let c = drive(&p, id).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    assert_eq!(git(&repo, &["branch", "--list", "provefab/*"]), "");
     assert_eq!(
         (c.state, c.failure_kind),
         (CheckState::Blocked, Some(FailureKind::DirtyTree))
