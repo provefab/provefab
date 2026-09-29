@@ -200,6 +200,12 @@ mod tests {
             tier,
             max_concurrency: 1,
             auth: crate::config::Auth::Subscription,
+            price_id: None,
+            price_in: None,
+            price_out: None,
+            price_cache_read: None,
+            price_cache_write: None,
+            quota_weight: None,
         }
     }
 

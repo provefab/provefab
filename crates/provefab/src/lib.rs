@@ -17,6 +17,7 @@ pub mod pipeline;
 pub mod plugins;
 pub mod policy;
 pub mod ports;
+pub mod prices;
 pub mod prompts;
 pub mod router;
 pub mod scheduler;

@@ -128,7 +128,7 @@ impl Drop for Slot<'_> {
 
 /// What `Pipeline::claim` found.
 enum Claim<'a> {
-    Run(ModelEntry, Slot<'a>),
+    Run(Box<ModelEntry>, Slot<'a>),
     /// No model is free (cooling down or at `max_concurrency`).
     Busy,
     /// The daily worker budget is spent (D53, issue #12).
@@ -1396,7 +1396,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             model_id: model.id.clone(),
             recorded: false,
         };
-        Ok(Claim::Run(model, slot))
+        Ok(Claim::Run(Box::new(model), slot))
     }
 
     async fn wait(&self, task: &TaskRow, stage: Stage) -> Result<TaskState, PipelineError> {
@@ -1675,7 +1675,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return self.plan_ready(task, repo, &wt, kind, &p).await;
         }
         let (model, slot) = match self.claim(task, Stage::Plan).await? {
-            Claim::Run(m, s) => (m, s),
+            Claim::Run(m, s) => (*m, s),
             Claim::Busy => return self.wait(task, Stage::Plan).await,
             Claim::OverBudget => return self.over_budget(task, repo).await,
         };
@@ -1883,7 +1883,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
         };
         let (model, slot) = match self.claim(task, Stage::Implement).await? {
-            Claim::Run(m, s) => (m, s),
+            Claim::Run(m, s) => (*m, s),
             Claim::Busy => return self.wait(task, Stage::Implement).await,
             Claim::OverBudget => return self.over_budget(task, repo).await,
         };
@@ -2142,7 +2142,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return Ok(state);
         }
         let (model, slot) = match self.claim(task, Stage::Review).await? {
-            Claim::Run(m, s) => (m, s),
+            Claim::Run(m, s) => (*m, s),
             Claim::Busy => return self.wait(task, Stage::Review).await,
             Claim::OverBudget => return self.over_budget(task, repo).await,
         };
