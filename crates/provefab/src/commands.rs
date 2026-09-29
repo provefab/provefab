@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::forge::{ForgeError, Git};
 use crate::paths::Paths;
 use crate::ports::Hub;
+use crate::post_merge::CheckState;
 use crate::store::{NewIssue, Store, StoreError};
 use crate::task::TaskState;
 
@@ -128,7 +129,7 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
             .map(|c| {
                 format!(
                     "  post-merge: {}{}",
-                    c.state,
+                    c.state.as_str(),
                     c.revert_pr_url
                         .as_ref()
                         .map(|u| format!(" {u}"))
@@ -191,13 +192,13 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
             r.seconds_to_pr.push(opened.at - first.at);
         }
         for check in store.post_merge_checks(t.id).await? {
-            match check.state.as_str() {
-                "passed" => r.post_merge_passed += 1,
-                "failed" | "blocked" => r.post_merge_failed += 1,
-                "revert_open" => {
+            match check.state {
+                CheckState::Passed => r.post_merge_passed += 1,
+                CheckState::RevertOpen => {
                     r.post_merge_failed += 1;
                     r.revert_prs += 1;
                 }
+                CheckState::Blocked => r.post_merge_failed += 1,
                 _ => {}
             }
         }
@@ -363,7 +364,7 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
             let _ = writeln!(
                 out,
                 "  {} {} on {}{}{}",
-                c.state,
+                c.state.as_str(),
                 c.merge_sha,
                 c.base,
                 c.revert_pr_url

@@ -10,6 +10,7 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
 };
 
+use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
 use crate::task::{TaskKind, TaskState};
 
 #[derive(Debug, thiserror::Error)]
@@ -69,13 +70,51 @@ pub struct PostMergeCheckRow {
     pub task_id: i64,
     pub merge_sha: String,
     pub base: String,
-    pub state: String,
+    pub commit_count: Option<i64>,
+    pub auto_merged: bool,
+    pub state: CheckState,
+    pub failure_kind: Option<FailureKind>,
+    pub failure_summary: Option<String>,
+    pub failed_commands: Vec<FailedCommand>,
+    pub flaky: Vec<String>,
+    pub base_sha: Option<String>,
+    pub revert_sha: Option<String>,
+    pub revert_branch: Option<String>,
+    pub revert_pr_url: Option<String>,
+    pub base_moves: i64,
+    pub infra_errors: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
-    pub worktree: Option<PathBuf>,
+    pub issue_notified_at: Option<i64>,
+    pub pr_notified_at: Option<i64>,
+}
+
+pub struct NewPostMergeCheck<'a> {
+    pub task_id: i64,
+    pub merge_sha: &'a str,
+    pub base: &'a str,
+    pub commit_count: Option<usize>,
+    pub auto_merged: bool,
+}
+
+/// Columns a transition sets. `None` keeps the stored value.
+#[derive(Debug, Default, Clone)]
+pub struct CheckPatch {
+    pub failure_kind: Option<FailureKind>,
     pub failure_summary: Option<String>,
+    pub failed_commands: Option<Vec<FailedCommand>>,
+    pub flaky: Option<Vec<String>>,
+    pub base_sha: Option<String>,
+    pub revert_sha: Option<String>,
+    pub revert_branch: Option<String>,
     pub revert_pr_url: Option<String>,
-    pub notified_at: Option<i64>,
+    pub bump_base_moves: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTarget {
+    Issue,
+    Pr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -391,27 +430,42 @@ impl Store {
         .await
     }
 
-    /// Creates the one durable check for a merged commit, or returns the
-    /// existing row when a scheduler retry sees it again.
+    /// Creates the one check for a merged commit, or returns the existing row
+    /// when a scheduler retry sees the merge again.
     pub async fn ensure_post_merge_check(
         &self,
-        task_id: i64,
-        merge_sha: &str,
-        base: &str,
+        new: &NewPostMergeCheck<'_>,
     ) -> Result<PostMergeCheckRow, StoreError> {
         sqlx::query(
-            "INSERT INTO post_merge_checks (task_id, merge_sha, base, state) VALUES (?, ?, ?, 'queued') ON CONFLICT (task_id, merge_sha) DO NOTHING",
+            "INSERT INTO post_merge_checks (task_id, merge_sha, base, commit_count, auto_merged, state) \
+             VALUES (?, ?, ?, ?, ?, 'queued') ON CONFLICT (task_id, merge_sha) DO NOTHING",
         )
-        .bind(task_id)
-        .bind(merge_sha)
-        .bind(base)
+        .bind(new.task_id)
+        .bind(new.merge_sha)
+        .bind(new.base)
+        .bind(new.commit_count.map(|n| n as i64))
+        .bind(new.auto_merged)
         .execute(&self.pool)
         .await?;
-        self.post_merge_check(task_id, merge_sha)
+        self.post_merge_check(new.task_id, new.merge_sha)
             .await?
-            .ok_or(StoreError::Corrupt(format!(
-                "missing post-merge check {task_id}/{merge_sha}"
-            )))
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!(
+                    "missing post-merge check {}/{}",
+                    new.task_id, new.merge_sha
+                ))
+            })
+    }
+
+    pub async fn post_merge_check_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<PostMergeCheckRow>, StoreError> {
+        let row = sqlx::query("SELECT * FROM post_merge_checks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| post_merge_check_row(&r)).transpose()
     }
 
     pub async fn post_merge_check(
@@ -439,55 +493,110 @@ impl Store {
         rows.iter().map(post_merge_check_row).collect()
     }
 
-    pub async fn set_post_merge_running(&self, id: i64, worktree: &Path) -> Result<(), StoreError> {
-        sqlx::query(
-            "UPDATE post_merge_checks SET state = 'running', started_at = ?, worktree = ? WHERE id = ? AND state IN ('queued', 'running')",
-        )
-        .bind(now())
-        .bind(worktree.display().to_string())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn finish_post_merge(
+    /// Compare-and-set transition (spec section 5): `false`, and nothing
+    /// written, when the row is no longer in `from`. A successful transition
+    /// resets the infra error count; a terminal one stamps `finished_at`.
+    pub async fn advance_post_merge(
         &self,
         id: i64,
-        state: &str,
-        failure_summary: Option<&str>,
+        from: CheckState,
+        to: CheckState,
+        patch: &CheckPatch,
+    ) -> Result<bool, StoreError> {
+        let failed_commands = patch
+            .failed_commands
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        let flaky = patch
+            .flaky
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        let at = now();
+        let done = sqlx::query(
+            "UPDATE post_merge_checks SET state = ?, \
+               failure_kind = COALESCE(?, failure_kind), \
+               failure_summary = COALESCE(?, failure_summary), \
+               failed_commands = COALESCE(?, failed_commands), \
+               flaky = COALESCE(?, flaky), \
+               base_sha = COALESCE(?, base_sha), \
+               revert_sha = COALESCE(?, revert_sha), \
+               revert_branch = COALESCE(?, revert_branch), \
+               revert_pr_url = COALESCE(?, revert_pr_url), \
+               base_moves = base_moves + ?, \
+               infra_errors = 0, \
+               started_at = COALESCE(started_at, ?), \
+               finished_at = CASE WHEN ? THEN ? ELSE finished_at END \
+             WHERE id = ? AND state = ?",
+        )
+        .bind(to.as_str())
+        .bind(patch.failure_kind.map(FailureKind::as_str))
+        .bind(patch.failure_summary.as_deref().map(bounded))
+        .bind(failed_commands)
+        .bind(flaky)
+        .bind(patch.base_sha.as_deref())
+        .bind(patch.revert_sha.as_deref())
+        .bind(patch.revert_branch.as_deref())
+        .bind(patch.revert_pr_url.as_deref())
+        .bind(i64::from(patch.bump_base_moves))
+        .bind(at)
+        .bind(to.is_terminal())
+        .bind(at)
+        .bind(id)
+        .bind(from.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Counts one more consecutive infra error; returns the new count.
+    pub async fn post_merge_infra_error(&self, id: i64) -> Result<i64, StoreError> {
+        let n: i64 = sqlx::query_scalar(
+            "UPDATE post_merge_checks SET infra_errors = infra_errors + 1 WHERE id = ? RETURNING infra_errors",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    pub async fn mark_post_merge_notified(
+        &self,
+        id: i64,
+        target: NoticeTarget,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "UPDATE post_merge_checks SET state = ?, finished_at = ?, failure_summary = ? WHERE id = ?",
-        )
-        .bind(state)
-        .bind(now())
-        .bind(failure_summary)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn set_post_merge_revert_pr(&self, id: i64, url: &str) -> Result<(), StoreError> {
-        sqlx::query(
-            "UPDATE post_merge_checks SET state = 'revert_open', revert_pr_url = ?, finished_at = ? WHERE id = ?",
-        )
-        .bind(url)
-        .bind(now())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn mark_post_merge_notified(&self, id: i64) -> Result<(), StoreError> {
-        sqlx::query("UPDATE post_merge_checks SET notified_at = ? WHERE id = ?")
+        let sql = match target {
+            NoticeTarget::Issue => {
+                "UPDATE post_merge_checks SET issue_notified_at = ? WHERE id = ?"
+            }
+            NoticeTarget::Pr => "UPDATE post_merge_checks SET pr_notified_at = ? WHERE id = ?",
+        };
+        sqlx::query(sql)
             .bind(now())
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// `(state, count)` over every check, in `CheckState::ALL` order, zeros omitted.
+    pub async fn post_merge_state_counts(&self) -> Result<Vec<(CheckState, i64)>, StoreError> {
+        let rows = sqlx::query("SELECT state, COUNT(*) AS n FROM post_merge_checks GROUP BY state")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut counts = Vec::new();
+        for s in CheckState::ALL {
+            if let Some(r) = rows
+                .iter()
+                .find(|r| r.get::<String, _>("state") == s.as_str())
+            {
+                counts.push((s, r.get::<i64, _>("n")));
+            }
+        }
+        Ok(counts)
     }
 
     /// The issue came back after its PR was merged.
@@ -808,18 +917,40 @@ fn parse_state(s: &str) -> Result<TaskState, StoreError> {
 }
 
 fn post_merge_check_row(r: &SqliteRow) -> Result<PostMergeCheckRow, StoreError> {
+    let state: String = r.get("state");
+    let kind: Option<String> = r.get("failure_kind");
+    let failed_commands = match r.get::<Option<String>, _>("failed_commands") {
+        Some(s) => serde_json::from_str(&s).map_err(|e| StoreError::Corrupt(e.to_string()))?,
+        None => Vec::new(),
+    };
+    let flaky = match r.get::<Option<String>, _>("flaky") {
+        Some(s) => serde_json::from_str(&s).map_err(|e| StoreError::Corrupt(e.to_string()))?,
+        None => Vec::new(),
+    };
     Ok(PostMergeCheckRow {
         id: r.get("id"),
         task_id: r.get("task_id"),
         merge_sha: r.get("merge_sha"),
         base: r.get("base"),
-        state: r.get("state"),
+        commit_count: r.get("commit_count"),
+        auto_merged: r.get::<i64, _>("auto_merged") != 0,
+        state: CheckState::parse(&state).ok_or_else(|| StoreError::Corrupt(state.clone()))?,
+        failure_kind: kind
+            .map(|k| FailureKind::parse(&k).ok_or(StoreError::Corrupt(k)))
+            .transpose()?,
+        failure_summary: r.get("failure_summary"),
+        failed_commands,
+        flaky,
+        base_sha: r.get("base_sha"),
+        revert_sha: r.get("revert_sha"),
+        revert_branch: r.get("revert_branch"),
+        revert_pr_url: r.get("revert_pr_url"),
+        base_moves: r.get("base_moves"),
+        infra_errors: r.get("infra_errors"),
         started_at: r.get("started_at"),
         finished_at: r.get("finished_at"),
-        worktree: r.get::<Option<String>, _>("worktree").map(PathBuf::from),
-        failure_summary: r.get("failure_summary"),
-        revert_pr_url: r.get("revert_pr_url"),
-        notified_at: r.get("notified_at"),
+        issue_notified_at: r.get("issue_notified_at"),
+        pr_notified_at: r.get("pr_notified_at"),
     })
 }
 
@@ -869,7 +1000,7 @@ mod tests {
                 "58482ad7ee578abba1976c7bc8f21ed4c3c2a481c6a24f74d64164e7f37c01e6dc1931ad68e527a67df118bf2983cdbd",
                 "fa9d5e7daa5ddeec2a821c7123b4fcca83a08f59d147187aac8a58405466bc12e383f228b0a8574c97fa57817f6fa432",
                 "9f9cca5cfdefacd436e685a2daf6b99f3a4d7104dbda6fd6c5df338adc59f1379ec0d15f86887d96c4ec23b3c1e3eaa5",
-                "4cc4e9197c7f327ed444613b4be9fbd3423d6ecac96e41bed592668a89f38f9f086a1f300d675a8b349488d2785bd697",
+                "d2ab25f12a77bff674bfa242dcb660c001350fe7ee3c0101499094191c7e1ce912efa09d9b9c548e812abf14ded32af3",
             ]
         );
     }
@@ -1161,5 +1292,132 @@ mod tests {
         s.reset_counters(id).await.unwrap();
         let t = s.task(id).await.unwrap().unwrap();
         assert!(!t.escalated && t.attempts == 0 && t.review_rounds == 0);
+    }
+
+    async fn merged_task(s: &Store) -> i64 {
+        s.add_issue(&issue(1)).await.unwrap().unwrap()
+    }
+
+    fn new_check(task_id: i64, sha: &str) -> NewPostMergeCheck<'_> {
+        NewPostMergeCheck {
+            task_id,
+            merge_sha: sha,
+            base: "main",
+            commit_count: Some(1),
+            auto_merged: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_merge_check_creation_is_idempotent() {
+        let (_d, s) = store().await;
+        let id = merged_task(&s).await;
+        let a = s
+            .ensure_post_merge_check(&new_check(id, "abc"))
+            .await
+            .unwrap();
+        let b = s
+            .ensure_post_merge_check(&new_check(id, "abc"))
+            .await
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.state, CheckState::Queued);
+        assert_eq!(a.commit_count, Some(1));
+        assert_eq!(s.post_merge_checks(id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn advance_is_compare_and_set_and_patches_only_given_columns() {
+        let (_d, s) = store().await;
+        let id = merged_task(&s).await;
+        let c = s
+            .ensure_post_merge_check(&new_check(id, "abc"))
+            .await
+            .unwrap();
+        // Wrong `from`: nothing written.
+        assert!(
+            !s.advance_post_merge(
+                c.id,
+                CheckState::Verifying,
+                CheckState::Passed,
+                &CheckPatch::default()
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(s.post_merge_infra_error(c.id).await.unwrap(), 1);
+        let patch = CheckPatch {
+            base_sha: Some("base1".into()),
+            failure_summary: Some("é".repeat(3000)),
+            bump_base_moves: true,
+            ..Default::default()
+        };
+        assert!(
+            s.advance_post_merge(
+                c.id,
+                CheckState::Queued,
+                CheckState::VerificationFailed,
+                &patch
+            )
+            .await
+            .unwrap()
+        );
+        let c = s.post_merge_check_by_id(c.id).await.unwrap().unwrap();
+        assert_eq!(c.state, CheckState::VerificationFailed);
+        assert_eq!(c.base_sha.as_deref(), Some("base1"));
+        assert_eq!(
+            c.failure_summary.as_ref().unwrap().chars().count(),
+            crate::post_merge::SUMMARY_MAX
+        );
+        assert_eq!((c.base_moves, c.infra_errors), (1, 0));
+        assert!(c.started_at.is_some() && c.finished_at.is_none());
+        // `None` keeps `base_sha`; a terminal state stamps `finished_at`.
+        assert!(
+            s.advance_post_merge(
+                c.id,
+                CheckState::VerificationFailed,
+                CheckState::Blocked,
+                &CheckPatch::default()
+            )
+            .await
+            .unwrap()
+        );
+        let c = s.post_merge_check_by_id(c.id).await.unwrap().unwrap();
+        assert_eq!(c.base_sha.as_deref(), Some("base1"));
+        assert!(c.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_post_merge_state_is_corruption_not_a_default() {
+        let (_d, s) = store().await;
+        let id = merged_task(&s).await;
+        let c = s
+            .ensure_post_merge_check(&new_check(id, "abc"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE post_merge_checks SET state = 'failed' WHERE id = ?")
+            .bind(c.id)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.post_merge_check_by_id(c.id).await,
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn notification_targets_are_tracked_separately() {
+        let (_d, s) = store().await;
+        let id = merged_task(&s).await;
+        let c = s
+            .ensure_post_merge_check(&new_check(id, "abc"))
+            .await
+            .unwrap();
+        s.mark_post_merge_notified(c.id, NoticeTarget::Issue)
+            .await
+            .unwrap();
+        let c = s.post_merge_check_by_id(c.id).await.unwrap().unwrap();
+        assert!(c.issue_notified_at.is_some() && c.pr_notified_at.is_none());
     }
 }
