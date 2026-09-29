@@ -1132,19 +1132,14 @@ async fn stats_count_prs_and_tell_auto_merges_from_human_ones() {
 #[tokio::test]
 async fn cheapest_first_but_cross_review_still_wins() {
     let mut f = fixture(&["test -f feature.txt"]);
-    // std-claude and std-codex are both Standard; make codex the cheaper subscription.
-    f.config
-        .models
-        .iter_mut()
-        .find(|m| m.id == "std-claude")
-        .unwrap()
-        .quota_weight = Some(5.0);
-    f.config
-        .models
-        .iter_mut()
-        .find(|m| m.id == "std-codex")
-        .unwrap()
-        .quota_weight = Some(1.0);
+    // std-claude and std-codex are both Standard; on API keys, codex is cheaper.
+    // (Quota weights are not compared across vendors, D76: dollars are.)
+    for (id, price) in [("std-claude", 10.0), ("std-codex", 1.0)] {
+        let m = f.config.models.iter_mut().find(|m| m.id == id).unwrap();
+        m.auth = provefab::config::Auth::ApiKey;
+        m.price_in = Some(price);
+        m.price_out = Some(price);
+    }
     let p = pipeline(
         &f,
         Box::new(happy),

@@ -48,6 +48,7 @@ impl Routing {
 
 /// The catalog sorted by `prefer`; ties keep catalog order.
 pub fn ordered(catalog: &[ModelEntry], table: &PriceTable, prefer: Prefer) -> Vec<ModelEntry> {
+    let unpriced_sub = |m: &ModelEntry| m.quota_weight.is_none() && price_of(m, table).is_none();
     let rank = |m: &ModelEntry| -> (u8, f64) {
         let api = is_api(m);
         let group = match prefer {
@@ -58,9 +59,10 @@ pub fn ordered(catalog: &[ModelEntry], table: &PriceTable, prefer: Prefer) -> Ve
         let cost = if !api {
             match prefer {
                 Prefer::Cheapest => 0.0,
-                // Unpriced subscriptions rank after every priced one too.
-                _ if m.quota_weight.is_none() && price_of(m, table).is_none() => f64::MAX,
-                _ => quota_weight(m, catalog, table),
+                // Unpriced subscriptions rank after every priced one.
+                _ if unpriced_sub(m) => f64::MAX,
+                // Weights are ordered per vendor below (D76).
+                _ => 0.0,
             }
         } else {
             // Unpriced API models rank after every priced one.
@@ -74,7 +76,33 @@ pub fn ordered(catalog: &[ModelEntry], table: &PriceTable, prefer: Prefer) -> Ve
         a.0.cmp(&b.0)
             .then(a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
     });
-    ranked.into_iter().map(|(_, m)| m.clone()).collect()
+    let mut out: Vec<&ModelEntry> = ranked.into_iter().map(|(_, m)| m).collect();
+    if prefer != Prefer::Cheapest {
+        // D76: a quota weight is relative to its own vendor, so it only orders
+        // that vendor's priced subscriptions, inside the slots they already hold.
+        let subs: Vec<usize> = (0..out.len())
+            .filter(|&i| !is_api(out[i]) && !unpriced_sub(out[i]))
+            .collect();
+        let mut vendors: Vec<String> = subs.iter().map(|&i| out[i].provider_key()).collect();
+        vendors.dedup();
+        for v in vendors {
+            let slots: Vec<usize> = subs
+                .iter()
+                .copied()
+                .filter(|&i| out[i].provider_key() == v)
+                .collect();
+            let mut models: Vec<&ModelEntry> = slots.iter().map(|&i| out[i]).collect();
+            models.sort_by(|a, b| {
+                quota_weight(a, catalog, table)
+                    .partial_cmp(&quota_weight(b, catalog, table))
+                    .unwrap_or(Ordering::Equal)
+            });
+            for (slot, m) in slots.into_iter().zip(models) {
+                out[slot] = m;
+            }
+        }
+    }
+    out.into_iter().cloned().collect()
 }
 
 /// Why `m` sits where it does in the order, for the routing log.
@@ -239,5 +267,53 @@ mod tests {
         ];
         assert_eq!(ordered(&cat, &t, Prefer::Subscription)[0].id, "opus-sub");
         assert!(why(&cat[0], &cat, &t, Prefer::Subscription).contains("no price"));
+    }
+
+    /// D76: quota weights are only comparable within a vendor. Across vendors,
+    /// file order decides, and a model in another tier changes nothing.
+    #[test]
+    fn quota_weight_orders_within_a_vendor_only() {
+        let t = table();
+        let ids = |v: Vec<ModelEntry>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        let cat = vec![
+            m(
+                "opus-sub",
+                WorkerKind::ClaudeCode,
+                "opus",
+                "",
+                Tier::Standard,
+                Auth::Subscription,
+            ),
+            m(
+                "sol-sub",
+                WorkerKind::Codex,
+                "gpt-6-sol",
+                "",
+                Tier::Standard,
+                Auth::Subscription,
+            ),
+            m(
+                "sonnet-sub",
+                WorkerKind::ClaudeCode,
+                "sonnet",
+                "",
+                Tier::Standard,
+                Auth::Subscription,
+            ),
+            // Another tier: makes Claude weights 4.0 and 8.0, Codex stays 1.0.
+            m(
+                "haiku-sub",
+                WorkerKind::ClaudeCode,
+                "haiku",
+                "",
+                Tier::Fast,
+                Auth::Subscription,
+            ),
+        ];
+        // Claude keeps its file slots (0, 2, 3), sorted by weight inside them.
+        assert_eq!(
+            ids(ordered(&cat, &t, Prefer::Subscription)),
+            ["haiku-sub", "sol-sub", "sonnet-sub", "opus-sub"]
+        );
     }
 }

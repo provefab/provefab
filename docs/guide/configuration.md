@@ -43,7 +43,7 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 | `price_id` | none | The price entry to use, as `provider/model` (for example `anthropic/claude-sonnet-5-5`), when the automatic match is wrong. |
 | `price_in`, `price_out` | none | USD per million input and output tokens. Set both to override the fetched prices. |
 | `price_cache_read`, `price_cache_write` | the input price | USD per million cached tokens read and written, with `price_in` and `price_out`. |
-| `quota_weight` | relative price | Subscription models only: how much of your plan one token uses, compared with the cheapest model of the same vendor in the catalog (1.0). |
+| `quota_weight` | relative price | Subscription models only: how much of your plan one token uses, compared with the cheapest model of the same vendor in the catalog (1.0). It orders that vendor's models only. |
 
 **Subscription or API key, per model.** Each model signs in its own way, so you can switch one line and run `provefab service install`. You can also list the same model twice in the same tier, once per sign-in mode: when the subscription hits its usage limit, that entry pauses and the API-key entry takes the next stages. Both still count as the same model family for cross-review. The daily budget (`max_stage_runs_per_day`) caps API spend too.
 
@@ -55,7 +55,8 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
    - Review takes the implementation tier when a subtle mistake would cost little (`review_risk` below 1.5), `frontier` when it would cost a lot (3.0 or more), and one tier above otherwise.
    - Without a Jev key, every stage runs on `standard`.
 2. **The model inside the tier**, following `[routing] prefer`:
-   - subscription models first, the lowest `quota_weight` first, then API-key models, the cheapest first;
+   - subscription models first, then API-key models, the cheapest first;
+   - among one vendor's subscriptions, the lowest `quota_weight` first; between vendors (Claude and Codex, say), file order decides, since a weight only compares models of the same vendor;
    - a model with no known price comes after the priced ones (subscription or API key);
    - ties keep file order.
 3. **The rules that come first:**
