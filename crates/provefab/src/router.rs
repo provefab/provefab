@@ -41,8 +41,26 @@ pub fn stage_tiers(v: &Verdict) -> StageTiers {
             v.difficulty_confidence
         ));
     }
-    let mut plan = implement.up();
-    let review = implement.up();
+    // D70: Jev lowers plan and review to the implement tier when they are easy,
+    // and lifts review to Frontier when a subtle mistake would be costly.
+    let mut plan = match v.plan_depth {
+        Some(d) if d < 1.5 => {
+            reasons.push(format!("plan_depth {d:.2} < 1.5 -> plan {implement:?}"));
+            implement
+        }
+        _ => implement.up(),
+    };
+    let review = match v.review_risk {
+        Some(r) if r < 1.5 => {
+            reasons.push(format!("review_risk {r:.2} < 1.5 -> review {implement:?}"));
+            implement
+        }
+        Some(r) if r >= 3.0 => {
+            reasons.push(format!("review_risk {r:.2} >= 3.0 -> review Frontier"));
+            Tier::Frontier
+        }
+        _ => implement.up(),
+    };
     if v.scope >= ARCHITECTURAL_SCOPE {
         plan = Tier::Frontier;
         reasons.push(format!(
@@ -154,7 +172,57 @@ mod tests {
             scope,
             underspecified: 0.1,
             jev_model: "jev-1.13.0".into(),
+            plan_depth: None,
+            review_risk: None,
         }
+    }
+
+    fn v2(difficulty: f64, plan: Option<f64>, risk: Option<f64>) -> Verdict {
+        Verdict {
+            plan_depth: plan,
+            review_risk: risk,
+            ..verdict(difficulty, 0.9, 0.5)
+        }
+    }
+
+    #[test]
+    fn simple_plans_and_low_risk_reviews_stay_at_the_implement_tier() {
+        let t = stage_tiers(&v2(2.0, Some(0.5), Some(0.5)));
+        assert_eq!(
+            (t.plan, t.implement, t.review),
+            (Tier::Standard, Tier::Standard, Tier::Standard)
+        );
+        assert!(
+            t.reasons.iter().any(|r| r.contains("plan_depth")),
+            "{:?}",
+            t.reasons
+        );
+        let t = stage_tiers(&v2(2.0, Some(2.0), Some(3.5)));
+        assert_eq!((t.plan, t.review), (Tier::Frontier, Tier::Frontier));
+        let t = stage_tiers(&v2(2.0, Some(2.0), Some(2.0)));
+        assert_eq!(t.review, Tier::Frontier); // implement Standard + 1
+        // High risk lifts a Fast implement straight to a Frontier review.
+        let t = stage_tiers(&v2(0.5, Some(0.5), Some(3.0)));
+        assert_eq!(
+            (t.plan, t.implement, t.review),
+            (Tier::Fast, Tier::Fast, Tier::Frontier)
+        );
+    }
+
+    /// Plan review focus 3.
+    #[test]
+    fn old_verdicts_keep_todays_tiers() {
+        let old: Verdict = serde_json::from_value(serde_json::json!({
+            "task_kind": "feature", "difficulty": 2.0, "difficulty_confidence": 0.9,
+            "scope": 0.5, "underspecified": 0.1, "jev_model": "jev-1.13.0"
+        }))
+        .unwrap();
+        assert_eq!((old.plan_depth, old.review_risk), (None, None));
+        let t = stage_tiers(&old);
+        assert_eq!(
+            (t.plan, t.implement, t.review),
+            (Tier::Frontier, Tier::Standard, Tier::Frontier)
+        );
     }
 
     #[test]

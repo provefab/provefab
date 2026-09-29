@@ -581,6 +581,8 @@ pub fn verdict(kind: TaskKind, underspecified: f64) -> Verdict {
         scope: 1.0,
         underspecified,
         jev_model: "jev-1.13.0".into(),
+        plan_depth: None,
+        review_risk: None,
     }
 }
 

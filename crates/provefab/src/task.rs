@@ -140,6 +140,12 @@ pub struct Verdict {
     pub underspecified: f64,
     /// Exact Jev version that produced this verdict, for the audit log.
     pub jev_model: String,
+    /// 0 to 4: design needed to plan (D70). `None` for older verdicts.
+    #[serde(default)]
+    pub plan_depth: Option<f64>,
+    /// 0 to 4: cost of an unnoticed subtle mistake (D70). `None` for older verdicts.
+    #[serde(default)]
+    pub review_risk: Option<f64>,
 }
 
 #[cfg(test)]
