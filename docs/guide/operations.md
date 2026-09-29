@@ -46,6 +46,7 @@ Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume 
 | `~/.provefab/sessions/<id>/` | agent transcripts and check outputs, per stage |
 | `~/.provefab/claude/`, `~/.provefab/codex/` | worker plan logins, kept apart from your own sessions |
 | `~/.provefab/claude-api/`, `~/.provefab/codex-api/` | worker API-key sign-ins (the Anthropic key itself stays in the Keychain) |
+| `~/.provefab/prices.json` | model prices, refreshed at most once a day from models.dev (LiteLLM as fallback) |
 | `~/.provefab/bin/provefab` | the binary the service runs |
 
 `PROVEFAB_HOME` moves all of this elsewhere.
@@ -77,6 +78,8 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do.
 | every task in `waiting` | every model of the tier is paused, or the daily budget is reached | `provefab status` gives the reason; wait, or widen the catalog or the budget |
 | the service cannot find `claude` or `cargo` | `PATH` frozen at install time | run `provefab service install` again from a terminal where the tool is found |
 | `another provefab run is already working` | the service already runs | `provefab service uninstall` before a manual pass |
+| `price <id>: no price` in `doctor` | the model matched no known price (a new model, a typo, or a Pi provider models.dev does not list); it still runs, ranked after priced models, and its cost is not counted | set `price_id = "provider/model"`, or `price_in` and `price_out` |
+| `prices: snapshot` or an old cache in `doctor` | the machine could not reach models.dev or LiteLLM | nothing to do: routing uses the cache or the built-in prices; the service tries again the next day |
 | `[repos.merge] is read by Provefab Pro` warning | the config asks for auto-merge | expected with this binary: PRs open and wait for you |
 
 To dig into a task:

@@ -2,18 +2,19 @@
 
 Provefab turns labelled GitHub issues into pull requests that arrive green, reviewed by a second model, with their evidence.
 
-It runs on your Mac as a service. AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI, signed in with your own plan or your own API key, chosen per model), and Jev, TypeSafe's classifier, picks the right model for each stage. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
+It runs on your Mac as a service. AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI, signed in with your own plan or your own API key, chosen per model), and Jev, TypeSafe's classifier, rates each issue so that every stage runs on the cheapest model that can do it: your plans first, then your API keys by price, with prices updated daily. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
 
 ```
 issue labelled `provefab`
-  -> Jev classification (kind, difficulty, scope) and model choice
+  -> Jev classification (kind, difficulty, scope, planning depth, review risk)
+  -> cheapest capable model per stage
   -> plan (read-only) -> implement (every tool call filtered by the guard)
   -> your repository's checks (your commands: fmt, lint, tests...)
   -> review by a different model provider
   -> Provefab commits and pushes, opens the PR, comments on the issue
 ```
 
-The pull request then waits for your click. Provefab Pro adds a second reviewer on another model and merge policies (auto-merge small, tested changes under fail-closed conditions); it is not in this repository.
+The pull request then waits for your click. Provefab Pro adds a second reviewer on another model, merge policies (auto-merge small, tested changes under fail-closed conditions) and cost reports per repository and model; it is not in this repository.
 
 ## Quick start
 
