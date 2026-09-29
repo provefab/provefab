@@ -125,6 +125,7 @@ impl Worker for ClaudeCodeWorker {
             final_text: state.final_text,
             usage: state.usage,
             turns: state.turns,
+            actual_model: state.actual_model,
         })
     }
 }
@@ -138,6 +139,7 @@ struct ClaudeState {
     final_text: Option<String>,
     usage: Usage,
     turns: u32,
+    actual_model: Option<String>,
 }
 
 impl ClaudeState {
@@ -191,6 +193,9 @@ impl ClaudeState {
                     }
                 }
             }
+            "system" if v.get("subtype").and_then(Value::as_str) == Some("init") => {
+                self.actual_model = v.get("model").and_then(Value::as_str).map(str::to_string);
+            }
             "system" if v.get("subtype").and_then(Value::as_str) == Some("api_retry") => {
                 let error = v
                     .get("error")
@@ -208,15 +213,13 @@ impl ClaudeState {
             }
             "result" => {
                 self.turns = v.get("num_turns").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let n = |p: &str| v.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+                // input_tokens excludes cache tokens; they are priced apart (D74).
                 self.usage = Usage {
-                    input_tokens: v
-                        .pointer("/usage/input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    output_tokens: v
-                        .pointer("/usage/output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
+                    input_tokens: n("/usage/input_tokens"),
+                    output_tokens: n("/usage/output_tokens"),
+                    cache_read_tokens: n("/usage/cache_read_input_tokens"),
+                    cache_write_tokens: n("/usage/cache_creation_input_tokens"),
                 };
                 self.output = v.get("structured_output").filter(|o| !o.is_null()).cloned();
                 self.final_text = v.get("result").and_then(Value::as_str).map(str::to_string);
@@ -416,10 +419,10 @@ mod tests {
         let events = feed(
             &mut s,
             &[
-                json!({"type":"system","subtype":"init"}),
+                json!({"type":"system","subtype":"init","model":"claude-sonnet-5-5"}),
                 json!({"type":"assistant","message":{"content":[{"type":"text","text":"Checking"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git push"}}]}}),
                 json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"denied"}]}}),
-                json!({"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done","structured_output":{"verdict":"approve"},"usage":{"input_tokens":50,"output_tokens":7}}),
+                json!({"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done","structured_output":{"verdict":"approve"},"usage":{"input_tokens":50,"cache_creation_input_tokens":1000,"cache_read_input_tokens":20000,"output_tokens":7}}),
             ],
         );
         assert_eq!(
@@ -443,9 +446,12 @@ mod tests {
             s.usage,
             Usage {
                 input_tokens: 50,
-                output_tokens: 7
+                output_tokens: 7,
+                cache_read_tokens: 20000,
+                cache_write_tokens: 1000,
             }
         );
+        assert_eq!(s.actual_model.as_deref(), Some("claude-sonnet-5-5"));
     }
 
     #[test]

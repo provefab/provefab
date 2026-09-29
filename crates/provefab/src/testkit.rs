@@ -95,6 +95,7 @@ pub fn done(output: Option<Value>) -> Option<StageResult> {
         final_text: None,
         usage: Usage::default(),
         turns: 3,
+        actual_model: None,
     })
 }
 
@@ -105,6 +106,7 @@ pub fn exit(e: ExitReason) -> Option<StageResult> {
         final_text: None,
         usage: Usage::default(),
         turns: 1,
+        actual_model: None,
     })
 }
 
@@ -169,6 +171,22 @@ pub fn happy(
         }
         _ => done(Some(approve())),
     }
+}
+
+/// `happy`, with token usage on every result (cost tests).
+pub fn happy_with_usage(
+    m: &ModelEntry,
+    req: &StageRequest,
+    tx: &UnboundedSender<WorkerEvent>,
+) -> Option<StageResult> {
+    happy(m, req, tx).map(|mut r| {
+        r.usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            ..Usage::default()
+        };
+        r
+    })
 }
 
 #[derive(Default)]

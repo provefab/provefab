@@ -142,6 +142,7 @@ impl Worker for CodexWorker {
             final_text: state.final_text,
             usage: state.usage,
             turns: state.turns,
+            actual_model: None,
         })
     }
 }
@@ -226,14 +227,12 @@ impl CodexState {
                 self.completed = true;
                 self.turns += 1;
                 emit(WorkerEvent::TurnEnd);
-                self.usage.input_tokens += v
-                    .pointer("/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                self.usage.output_tokens += v
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let n = |p: &str| v.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+                // Codex's input_tokens include the cached ones (D74).
+                let cached = n("/usage/cached_input_tokens");
+                self.usage.input_tokens += n("/usage/input_tokens").saturating_sub(cached);
+                self.usage.cache_read_tokens += cached;
+                self.usage.output_tokens += n("/usage/output_tokens");
             }
             "turn.failed" => {
                 self.error = Some(
@@ -384,7 +383,7 @@ mod tests {
                 json!({"type":"item.started","item":{"id":"3","type":"file_change","changes":[{"path":"/w/a.rs","kind":"add"}],"status":"in_progress"}}),
                 json!({"type":"item.completed","item":{"id":"3","type":"file_change","changes":[{"path":"/w/a.rs","kind":"add"}],"status":"completed"}}),
                 json!({"type":"item.completed","item":{"id":"4","type":"agent_message","text":"{\"verdict\":\"approve\"}"}}),
-                json!({"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":7}}),
+                json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":7}}),
             ],
         );
         assert_eq!(
@@ -413,9 +412,12 @@ mod tests {
         assert_eq!(s.output, Some(json!({"verdict": "approve"})));
         assert_eq!(
             s.usage,
+            // Codex's input_tokens include the cached ones: split them.
             Usage {
-                input_tokens: 100,
-                output_tokens: 7
+                input_tokens: 200,
+                output_tokens: 7,
+                cache_read_tokens: 800,
+                cache_write_tokens: 0,
             }
         );
     }

@@ -1498,9 +1498,22 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Ok(Outcome::Looping(p)) => format!("loop_detected {p:.2}"),
             Err(e) => format!("worker_error: {e}"),
         };
-        let (turns, usage) = match &outcome {
-            Ok(Outcome::Finished(r)) => (r.turns, r.usage),
-            _ => (0, Default::default()),
+        let (turns, usage, actual_model) = match &outcome {
+            Ok(Outcome::Finished(r)) => (r.turns, r.usage, r.actual_model.clone()),
+            _ => (0, Default::default(), None),
+        };
+        let cost = {
+            let prices = self
+                .prices
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::cost::stage_cost(
+                model,
+                &self.config.models,
+                &usage,
+                actual_model.as_deref(),
+                &prices,
+            )
         };
         // Serialises this record+mark with `claim`'s count+claim, so a claim
         // freed here is never missed by another worker's count (issue #12).
@@ -1518,6 +1531,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 gate_score: None,
                 started_at: started,
                 finished_at: now(),
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                actual_model,
+                cost_usd: cost.usd,
+                quota_units: cost.quota_units,
             })
             .await?;
         slot.recorded();
@@ -1848,6 +1866,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 gate_score: Some(report.score.to_string()),
                 started_at: started,
                 finished_at: now(),
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                actual_model: None,
+                cost_usd: None,
+                quota_units: None,
             })
             .await?;
         Ok(report)
@@ -2437,7 +2460,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
             _ => b.push_str("Jev was unavailable.\n"),
         }
-        for r in self.store.stage_runs(task.id).await? {
+        let runs = self.store.stage_runs(task.id).await?;
+        for r in &runs {
             if r.model_id.is_empty() {
                 continue;
             }
@@ -2450,6 +2474,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 )),
                 None => b.push_str(&format!("- {}: `{}`\n", r.stage, r.model_id)),
             }
+        }
+        if let Some(cost) = crate::cost::summary(&runs) {
+            b.push_str(&format!("\nCost: {cost}.\n"));
         }
         b.push('\n');
         b.push_str("## Checks\n\n");

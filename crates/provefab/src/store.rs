@@ -76,6 +76,12 @@ pub struct StageRunRecord {
     pub gate_score: Option<String>,
     pub started_at: i64,
     pub finished_at: i64,
+    /// Cost per stage (D74).
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub actual_model: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub quota_units: Option<f64>,
 }
 
 pub struct Store {
@@ -429,8 +435,9 @@ impl Store {
 
     pub async fn record_stage_run(&self, run: &StageRunRecord) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO stage_runs (task_id, stage, model_id, exit, turns, input_tokens, output_tokens, session_dir, gate_score, started_at, finished_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO stage_runs (task_id, stage, model_id, exit, turns, input_tokens, output_tokens, session_dir, gate_score, started_at, finished_at,
+                                     cache_read_tokens, cache_write_tokens, actual_model, cost_usd, quota_units)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run.task_id)
         .bind(&run.stage)
@@ -443,6 +450,11 @@ impl Store {
         .bind(&run.gate_score)
         .bind(run.started_at)
         .bind(run.finished_at)
+        .bind(run.cache_read_tokens as i64)
+        .bind(run.cache_write_tokens as i64)
+        .bind(&run.actual_model)
+        .bind(run.cost_usd)
+        .bind(run.quota_units)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -467,6 +479,11 @@ impl Store {
                 gate_score: r.get("gate_score"),
                 started_at: r.get("started_at"),
                 finished_at: r.get("finished_at"),
+                cache_read_tokens: r.get::<i64, _>("cache_read_tokens") as u64,
+                cache_write_tokens: r.get::<i64, _>("cache_write_tokens") as u64,
+                actual_model: r.get("actual_model"),
+                cost_usd: r.get("cost_usd"),
+                quota_units: r.get("quota_units"),
             })
             .collect())
     }
@@ -721,6 +738,7 @@ mod tests {
             [
                 "58482ad7ee578abba1976c7bc8f21ed4c3c2a481c6a24f74d64164e7f37c01e6dc1931ad68e527a67df118bf2983cdbd",
                 "fa9d5e7daa5ddeec2a821c7123b4fcca83a08f59d147187aac8a58405466bc12e383f228b0a8574c97fa57817f6fa432",
+                "9f9cca5cfdefacd436e685a2daf6b99f3a4d7104dbda6fd6c5df338adc59f1379ec0d15f86887d96c4ec23b3c1e3eaa5",
             ]
         );
     }
@@ -875,6 +893,11 @@ mod tests {
             gate_score: Some("0,0,0".into()),
             started_at: 10,
             finished_at: 20,
+            cache_read_tokens: 3000,
+            cache_write_tokens: 400,
+            actual_model: Some("claude-sonnet-5-5".into()),
+            cost_usd: Some(0.0123),
+            quota_units: None,
         };
         s.record_stage_run(&run).await.unwrap();
         assert_eq!(s.stage_runs(id).await.unwrap(), vec![run]);

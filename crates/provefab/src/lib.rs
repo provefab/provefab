@@ -7,6 +7,7 @@ pub mod codex_setup;
 pub mod commands;
 pub mod config;
 pub mod cooldown;
+pub mod cost;
 pub mod forge;
 pub mod gates;
 pub mod guard;

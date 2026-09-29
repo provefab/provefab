@@ -1172,3 +1172,27 @@ async fn cheapest_first_but_cross_review_still_wins() {
     let log = provefab::commands::log(&p.store, id).await.unwrap();
     assert!(log.contains("routes:"), "{log}");
 }
+
+#[tokio::test]
+async fn stage_costs_reach_the_log_and_the_pr_body() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    for m in &mut f.config.models {
+        m.auth = provefab::config::Auth::ApiKey;
+        m.price_in = Some(1.0);
+        m.price_out = Some(1.0);
+    }
+    let p = pipeline(
+        &f,
+        Box::new(happy_with_usage),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    assert!(log.contains("cost $0.0011"), "{log}"); // (1000 + 100) x $1/M
+    assert!(log.contains("total: $"), "{log}");
+    let body = p.hub.prs.lock().unwrap()[0].3.clone();
+    assert!(body.contains("Cost: $"), "{body}");
+}

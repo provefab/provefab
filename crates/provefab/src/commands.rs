@@ -288,10 +288,21 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
         }
     }
     out.push_str("\nstage runs:\n");
-    for r in store.stage_runs(id).await? {
+    let runs = store.stage_runs(id).await?;
+    for r in &runs {
+        let cache = if r.cache_read_tokens + r.cache_write_tokens > 0 {
+            format!(" (+cache {}/{})", r.cache_read_tokens, r.cache_write_tokens)
+        } else {
+            String::new()
+        };
+        let cost = match (r.cost_usd, r.quota_units) {
+            (Some(d), _) => format!("  cost {}", crate::cost::usd(d)),
+            (None, Some(q)) => format!("  quota {q:.2}"),
+            _ => String::new(),
+        };
         let _ = writeln!(
             out,
-            "  {} {:<10} {:<12} {}  turns {}  tokens {}/{}{}  {}",
+            "  {} {:<10} {:<12} {}  turns {}  tokens {}/{}{cache}{cost}{}  {}",
             r.started_at,
             r.stage,
             if r.model_id.is_empty() {
@@ -304,10 +315,14 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
             r.input_tokens,
             r.output_tokens,
             r.gate_score
+                .as_ref()
                 .map(|s| format!("  score {s}"))
                 .unwrap_or_default(),
             r.session_dir.display()
         );
+    }
+    if let Some(total) = crate::cost::summary(&runs) {
+        let _ = writeln!(out, "  total: {total}");
     }
     for kind in ["plan", "review", "failure"] {
         if let Some(v) = store.last_output(id, kind).await? {
