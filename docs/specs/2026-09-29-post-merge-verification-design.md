@@ -68,16 +68,17 @@ One row per merged commit. Each scheduler tick performs **at most one transition
 | `queued` | Fetch. Decide merge strategy (section 6). | `verifying`, or `blocked` (`unsafe_merge_strategy`) |
 | `verifying` | Remove `<id>-verify` if present, create a fresh detached worktree at `merge_sha`, run all checks. Rerun each failing or timed-out command **once** in a new fresh worktree. | all pass first time: `passed`; pass after rerun: `passed` with `flaky` set; any command fails twice: `verification_failed` |
 | `verification_failed` | Fetch. `merge_sha` must be an ancestor of the base tip, else `blocked` (`base_diverged`). Record `base_sha` = base tip. Run checks in a fresh detached worktree `<id>-base` at `base_sha` (same one-rerun rule). | base passes: `superseded`; base fails: `preparing_revert` |
-| `preparing_revert` | Remove `<id>-revert`; delete local branch `provefab/revert-<id>`; create it at `base_sha` in a fresh worktree. Apply the revert (section 6). Run checks on the reverted tree (one-rerun rule). Require a clean worktree afterwards. Record `revert_sha` = HEAD. | `revert_ready`; or `blocked` (`revert_conflict`, `revert_checks_failed`, `dirty_tree`) |
-| `revert_ready` | Fetch. If the base tip is not `base_sha`: increment `base_moves`, go to `verification_failed`; on the 3rd move, `blocked` (`base_moved`). Else push `revert_sha` to `provefab/revert-<id>`. If the remote branch already exists it must equal `revert_sha`, else `blocked` (`branch_conflict`). Create the PR; a reused PR must be same-repo, target `repo.base`, and have head `revert_sha`, else `blocked` (`branch_conflict`). Record `revert_pr_url`. | `revert_open` |
+| `preparing_revert` | Create a fresh detached worktree `<id>-revert` at `base_sha`. Apply the revert (section 6). Run checks on the reverted tree (one-rerun rule). Require a clean worktree afterwards. Record `revert_sha` = HEAD and point local branch `provefab/revert-<id>-<base_moves>` at it (`revert_branch`). | `revert_ready`; or `blocked` (`revert_conflict`, `revert_checks_failed`, `dirty_tree`) |
+| `revert_ready` | Fetch. If the base tip is not `base_sha`: increment `base_moves`, go to `verification_failed`; on the 3rd move, `blocked` (`base_moved`). Else push `revert_sha` to `revert_branch`. If the remote branch already exists it must equal `revert_sha`, else `blocked` (`branch_conflict`). Create the PR; a reused PR must be same-repo, target `repo.base`, and have head `revert_sha`, else `blocked` (`branch_conflict`). Record `revert_pr_url`. | `revert_open` |
 | `passed`, `superseded`, `revert_open`, `blocked` | Terminal. Only pending notifications (section 7) and cleanup (section 9). | |
 
 Rules:
 
 - `verifying`, `verification_failed`, `preparing_revert` have no external side effects: replay is harmless.
 - `revert_ready` side effects are idempotent because the exact `revert_sha` is recorded first and verified on the remote branch and the PR head. The branch is never the source of truth.
-- The branch name derives from the check id, so it never collides with task branches or another check.
+- The branch name derives from the check id and the attempt (`base_moves`), so it never collides with task branches, another check, or a branch pushed by an earlier attempt before the base moved (which would otherwise read as `branch_conflict`).
 - The revert PR is not a task: it never triggers post-merge verification itself.
+- The scheduler advances post-merge rows on **every** tick, before the hourly throttle it applies to merged tasks' reopen watch (`scheduler.rs`); otherwise a failure would take one hour per transition.
 - A command failure is never retried beyond the single rerun. Infra errors follow section 8.
 
 ## 6. Merge strategies and revert construction
@@ -114,7 +115,7 @@ A git/gh error, or an `Err` from the gate runner, leaves the state unchanged, is
 - Paths: `~/.provefab/post-merge/<check_id>-verify`, `-verify-rerun`, `-base`, `-revert`. Derived from the id, not stored.
 - Every worktree is removed before it is created: residue from a crash is never reused.
 - A guard removes the worktree on every exit path of the state handler, including errors. No worktree outlives its state: `revert_ready` pushes `revert_sha` from the main checkout (`git push origin <revert_sha>:refs/heads/provefab/revert-<id>`; worktrees share the object store), so `-revert` is removed at the end of `preparing_revert` too.
-- On reaching a terminal state: sweep any `<check_id>-*` directory left behind, run `git worktree prune`, delete the local `provefab/revert-<id>` branch.
+- On reaching a terminal state: sweep any `<check_id>-*` directory left behind, run `git worktree prune`, delete the local `revert_branch`. Remote revert branches are never deleted by Provefab.
 
 ## 10. Data model
 
@@ -131,6 +132,7 @@ CREATE TABLE post_merge_checks (
     state             TEXT NOT NULL,
     failure_kind      TEXT,
     failure_summary   TEXT,
+    failed_commands   TEXT,              -- JSON [{command, exit, timed_out}], source of published text
     flaky             TEXT,              -- JSON array of commands saved by a rerun
     base_sha          TEXT,
     revert_sha        TEXT,
@@ -147,6 +149,8 @@ CREATE TABLE post_merge_checks (
 CREATE INDEX post_merge_checks_task ON post_merge_checks (task_id);
 CREATE INDEX post_merge_checks_state ON post_merge_checks (state);
 ```
+
+When GitHub never returned the merge SHA (`attribution_missing`), `merge_sha` holds the literal `unknown`; real SHAs are hex, so it cannot collide, and `UNIQUE (task_id, merge_sha)` keeps it single.
 
 `state` values: `queued`, `verifying`, `verification_failed`, `preparing_revert`, `revert_ready`, `passed`, `superseded`, `revert_open`, `blocked`. The Rust side uses an enum with `FromStr`/`as_str`; unknown values are an error, never a default.
 
