@@ -1380,6 +1380,7 @@ dependencies = [
  "jev",
  "libc",
  "provefab",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",

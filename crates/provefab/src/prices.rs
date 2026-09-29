@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Auth, ModelEntry, WorkerKind};
+use crate::paths::Paths;
+
+pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+pub const LITELLM_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+/// Prices are refreshed at most once a day (D71).
+pub const MAX_AGE: i64 = 86_400;
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// USD per million tokens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,6 +151,85 @@ impl PriceTable {
 }
 
 /// `(3 × input + output) / 4`: agents read far more than they write.
+/// models.dev (anthropic and openai) at build time: the last resort offline.
+pub fn snapshot() -> PriceTable {
+    let mut t = PriceTable::from_models_dev(include_str!("prices_snapshot.json"), 0)
+        .expect("the built-in price snapshot parses");
+    t.source = "snapshot".into();
+    t
+}
+
+/// The cached table in `$PROVEFAB_HOME/prices.json`, if readable.
+pub fn cached(paths: &Paths) -> Option<PriceTable> {
+    let raw = std::fs::read_to_string(paths.prices()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// A fresh cache as is; otherwise models.dev, then LiteLLM (`urls`), written
+/// back to the cache; on failure the stale cache, then the built-in snapshot.
+/// Never fails: routing must work offline.
+pub async fn load(paths: &Paths, urls: [&str; 2], now: i64) -> PriceTable {
+    let cache = cached(paths);
+    if let Some(c) = &cache
+        && now - c.fetched_at < MAX_AGE
+    {
+        return c.clone();
+    }
+    match fetch(urls, now).await {
+        Ok(t) => {
+            if let Err(e) = write_cache(paths, &t) {
+                eprintln!("provefab: prices: cannot write the cache: {e}");
+            }
+            t
+        }
+        Err(e) => {
+            let fallback = cache.unwrap_or_else(snapshot);
+            eprintln!(
+                "provefab: prices: {e}; using the {} prices",
+                fallback.source
+            );
+            fallback
+        }
+    }
+}
+
+async fn fetch(urls: [&str; 2], now: i64) -> Result<PriceTable, String> {
+    let client = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let get = async |url: &str| -> Result<String, String> {
+        let r = client.get(url).send().await.map_err(|e| e.to_string())?;
+        let r = r.error_for_status().map_err(|e| e.to_string())?;
+        r.text().await.map_err(|e| e.to_string())
+    };
+    let first = match get(urls[0]).await {
+        Ok(body) => PriceTable::from_models_dev(&body, now),
+        Err(e) => Err(format!("models.dev: {e}")),
+    };
+    match first {
+        Ok(t) => Ok(t),
+        Err(e1) => {
+            let second = match get(urls[1]).await {
+                Ok(body) => PriceTable::from_litellm(&body, now),
+                Err(e) => Err(format!("litellm: {e}")),
+            };
+            second.map_err(|e2| format!("{e1}; {e2}"))
+        }
+    }
+}
+
+/// Atomic: a temporary file renamed over the cache, so a crash never leaves junk.
+fn write_cache(paths: &Paths, t: &PriceTable) -> std::io::Result<()> {
+    let path = paths.prices();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(t)?)?;
+    std::fs::rename(tmp, path)
+}
+
 pub fn blended(p: &Price) -> f64 {
     (3.0 * p.input + p.output) / 4.0
 }
@@ -361,5 +448,101 @@ mod tests {
         o.quota_weight = Some(7.5);
         assert_eq!(quota_weight(&o, &cat, &t), 7.5);
         assert_eq!(blended(&t.models["anthropic/claude-opus-5-5"]), 8.0);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cache_is_used_without_fetching() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::new(dir.path());
+        let t = PriceTable {
+            source: "cache".into(),
+            fetched_at: 1000,
+            models: md().models,
+        };
+        std::fs::write(paths.prices(), serde_json::to_string(&t).unwrap()).unwrap();
+        let got = load(
+            &paths,
+            ["http://127.0.0.1:9/none", "http://127.0.0.1:9/none"],
+            1000 + 60,
+        )
+        .await;
+        assert_eq!(got.source, "cache");
+    }
+
+    #[tokio::test]
+    async fn a_stale_cache_is_refreshed_from_models_dev() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/prices/models_dev.json")),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::new(dir.path());
+        let got = load(&paths, [&server.uri(), "http://127.0.0.1:9/none"], 100_000).await;
+        assert_eq!(got.source, "models.dev");
+        assert_eq!(cached(&paths).unwrap().fetched_at, 100_000);
+    }
+
+    /// Plan review focus 2.
+    #[tokio::test]
+    async fn a_broken_feed_falls_back_and_keeps_the_cache() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let broken = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>"))
+            .mount(&broken)
+            .await;
+        let lite = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/prices/litellm.json")),
+            )
+            .mount(&lite)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::new(dir.path());
+        assert_eq!(
+            load(&paths, [&broken.uri(), &lite.uri()], 1).await.source,
+            "litellm"
+        );
+        // Both broken: keep the (stale) cache, never overwrite it with junk.
+        let stale = cached(&paths).unwrap();
+        let got = load(&paths, [&broken.uri(), &broken.uri()], 10_000_000).await;
+        assert_eq!(got, stale);
+        assert_eq!(cached(&paths).unwrap(), stale);
+        // No cache at all: the built-in snapshot.
+        let empty = tempfile::tempdir().unwrap();
+        let got = load(
+            &crate::paths::Paths::new(empty.path()),
+            [&broken.uri(), &broken.uri()],
+            1,
+        )
+        .await;
+        assert_eq!(got.source, "snapshot");
+        assert!(!got.models.is_empty());
+    }
+
+    /// Live, ignored by default: the real feed resolves opus and sonnet.
+    #[tokio::test]
+    #[ignore]
+    async fn live_models_dev_resolves_claude_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = load(
+            &crate::paths::Paths::new(dir.path()),
+            [MODELS_DEV_URL, LITELLM_URL],
+            crate::store::now(),
+        )
+        .await;
+        assert_eq!(t.source, "models.dev");
+        assert!(
+            t.models
+                .keys()
+                .any(|k| k.starts_with("anthropic/claude-opus-"))
+        );
     }
 }
