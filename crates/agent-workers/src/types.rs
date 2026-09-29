@@ -60,8 +60,11 @@ pub enum ExitReason {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
+    /// Uncached input only; cache reads and writes are counted apart (D74).
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +75,8 @@ pub struct StageResult {
     pub final_text: Option<String>,
     pub usage: Usage,
     pub turns: u32,
+    /// The model the CLI reports it ran, when it says (an alias resolved).
+    pub actual_model: Option<String>,
 }
 
 /// The worker could not be started or its output could not be read.

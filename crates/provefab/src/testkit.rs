@@ -95,6 +95,7 @@ pub fn done(output: Option<Value>) -> Option<StageResult> {
         final_text: None,
         usage: Usage::default(),
         turns: 3,
+        actual_model: None,
     })
 }
 
@@ -105,6 +106,7 @@ pub fn exit(e: ExitReason) -> Option<StageResult> {
         final_text: None,
         usage: Usage::default(),
         turns: 1,
+        actual_model: None,
     })
 }
 
@@ -169,6 +171,22 @@ pub fn happy(
         }
         _ => done(Some(approve())),
     }
+}
+
+/// `happy`, with token usage on every result (cost tests).
+pub fn happy_with_usage(
+    m: &ModelEntry,
+    req: &StageRequest,
+    tx: &UnboundedSender<WorkerEvent>,
+) -> Option<StageResult> {
+    happy(m, req, tx).map(|mut r| {
+        r.usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            ..Usage::default()
+        };
+        r
+    })
 }
 
 #[derive(Default)]
@@ -530,6 +548,15 @@ pub async fn pipeline<O: Oracle>(
         paths,
         config: f.config.clone(),
         cooldowns: Mutex::new(Cooldowns::default()),
+        prices: std::sync::RwLock::new(
+            crate::prices::PriceTable::from_models_dev(
+                include_str!("../tests/fixtures/prices/models_dev.json"),
+                // Fresh, so the loop never refreshes (fetches) in tests.
+                crate::store::now(),
+            )
+            .unwrap(),
+        ),
+        price_attempt: std::sync::atomic::AtomicI64::new(0),
         repo_locks: Mutex::new(std::collections::HashMap::new()),
         budget: tokio::sync::Mutex::new(()),
         policy: f.policy.clone(),
@@ -581,6 +608,8 @@ pub fn verdict(kind: TaskKind, underspecified: f64) -> Verdict {
         scope: 1.0,
         underspecified,
         jev_model: "jev-1.13.0".into(),
+        plan_depth: None,
+        review_risk: None,
     }
 }
 

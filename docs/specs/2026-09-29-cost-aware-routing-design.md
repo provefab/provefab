@@ -118,7 +118,7 @@ Jev only moves tiers inside these bounds. At worst, a crafted issue causes an un
    - `"subscription"` (default): subscription models before API-key models;
    - `"api_key"`: the reverse;
    - `"cheapest"`: one list, with subscription models ranked as cost 0.
-2. Subscription models: lower quota weight first.
+2. Subscription models: lower quota weight first, within one vendor; between vendors, catalog order (D76).
 3. API-key models: lower blended price first.
 4. Ties: catalog order, as today.
 
@@ -206,3 +206,4 @@ The same change updates what people read, so docs never describe old behaviour.
 | D73 | `[routing] prefer = "subscription"` by default | Subscriptions are already paid; API keys take over when a plan is paused (BYOK cooldowns) | Users on API keys only complain about the default |
 | D74 | Record cache tokens, the actual model, and cost per stage in a new migration | Claude's `input_tokens` excludes cache tokens, so costs were understated; approach C needs exact data | none |
 | D75 | Cheapest-capable routing, prices and per-stage cost are free; cost reports (and later history-based routing and dollar caps) are Pro | User's choice: saving money is an adoption argument for the free core; steering spend across a team is what teams pay for; routing stays in the core, so no new extension seam is needed now | Pro needs to change routing itself (approach C): then add a routing extension point |
+| D76 | A quota weight orders only the subscriptions of its own vendor, inside the catalog slots they hold; between vendors, file order decides (user's choice 2026-09-29, after the final review) | Weights are relative within a vendor (D72), so comparing Claude and Codex weights compares different units; with a global sort, adding a model in another tier could move a tier's work to another vendor | A vendor publishes quota consumption comparable across vendors |

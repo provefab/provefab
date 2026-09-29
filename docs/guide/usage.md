@@ -53,8 +53,10 @@ What works best:
 ## Reading `provefab log <id>`
 
 - **transitions:** every state change, with its reason. For a tool error, the full detail is here and never on GitHub.
-- **routing:** Jev's verdict (kind, difficulty and confidence, scope, vagueness) and the tiers chosen.
-- **stage runs:** every stage, with its model, outcome, turns, tokens, check score and session directory (full transcript).
+- **routing:** Jev's verdict (kind, difficulty and confidence, scope, vagueness, planning depth, review risk), the tiers chosen, and why, for example `review_risk 0.80 < 1.5 -> review Standard`.
+- **routes:** for each stage, the model it ran on and why, for example `review -> sonnet-sub: subscription, quota weight 1.0 (prefer subscription)`.
+- **stage runs:** every stage, with its model, outcome, turns, tokens (`in/out`, then `(+cache read/write)` when the model cached), cost, check score and session directory (full transcript). The cost is in dollars for a model signed in by API key (`cost $0.0123`) and in quota units for a subscription (`quota 0.42`: millions of tokens times the model's quota weight). A `total:` line sums the task.
+The pull request's **Routing** section lists the model of each stage and ends with the task's cost, for example `Cost: $0.4210 API · 1.20 quota units.` A part that is zero is left out.
 - **last plan / review / failure:** the latest structured answers.
 
 ## Measuring

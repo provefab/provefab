@@ -1127,3 +1127,94 @@ async fn stats_count_prs_and_tell_auto_merges_from_human_ones() {
     assert!(out.contains("merged 2 (auto 1, by hand 1)"), "{out}");
     assert!(out.contains("reviewers:"), "{out}");
 }
+
+/// Cost order applies inside the tier, but review still avoids the implementer's family.
+#[tokio::test]
+async fn cheapest_first_but_cross_review_still_wins() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    // std-claude and std-codex are both Standard; on API keys, codex is cheaper.
+    // (Quota weights are not compared across vendors, D76: dollars are.)
+    for (id, price) in [("std-claude", 10.0), ("std-codex", 1.0)] {
+        let m = f.config.models.iter_mut().find(|m| m.id == id).unwrap();
+        m.auth = provefab::config::Auth::ApiKey;
+        m.price_in = Some(price);
+        m.price_out = Some(price);
+    }
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let stages = p.runner.stages();
+    let implement = stages
+        .iter()
+        .find(|(_, s)| s == "implement")
+        .unwrap()
+        .0
+        .clone();
+    let review = stages
+        .iter()
+        .find(|(_, s)| s == "review")
+        .unwrap()
+        .0
+        .clone();
+    assert_eq!(implement, "std-codex");
+    assert_ne!(review, "std-codex");
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    assert!(log.contains("routes:"), "{log}");
+}
+
+#[tokio::test]
+async fn stage_costs_reach_the_log_and_the_pr_body() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    for m in &mut f.config.models {
+        m.auth = provefab::config::Auth::ApiKey;
+        m.price_in = Some(1.0);
+        m.price_out = Some(1.0);
+    }
+    let p = pipeline(
+        &f,
+        Box::new(happy_with_usage),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    assert!(log.contains("cost $0.0011"), "{log}"); // (1000 + 100) x $1/M
+    assert!(log.contains("total: $"), "{log}");
+    let body = p.hub.prs.lock().unwrap()[0].3.clone();
+    assert!(body.contains("Cost: $"), "{body}");
+}
+
+/// Review finding 1: offline, the loop must not refetch prices on every tick.
+#[tokio::test]
+async fn a_failed_price_refresh_waits_before_trying_again() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+    let broken = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>"))
+        .mount(&broken)
+        .await;
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.config.routing.prices_url = Some(broken.uri());
+    f.config.routing.litellm_url = Some(broken.uri());
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    p.prices.write().unwrap().fetched_at = 0;
+    p.refresh_prices().await;
+    p.refresh_prices().await;
+    p.refresh_prices().await;
+    // One attempt: models.dev, then LiteLLM. Later ticks wait.
+    assert_eq!(broken.received_requests().await.unwrap().len(), 2);
+}

@@ -42,6 +42,22 @@ pub struct ModelEntry {
     pub max_concurrency: u32,
     #[serde(default)]
     pub auth: Auth,
+    /// `provider/model` key in the price table when the automatic match is wrong.
+    #[serde(default)]
+    pub price_id: Option<String>,
+    /// Manual prices, USD per million tokens; override the fetched ones.
+    #[serde(default)]
+    pub price_in: Option<f64>,
+    #[serde(default)]
+    pub price_out: Option<f64>,
+    #[serde(default)]
+    pub price_cache_read: Option<f64>,
+    #[serde(default)]
+    pub price_cache_write: Option<f64>,
+    /// Subscription models: how much quota a stage uses, relative to the
+    /// vendor's cheapest model (default derived from prices, D72).
+    #[serde(default)]
+    pub quota_weight: Option<f64>,
 }
 
 fn one() -> u32 {
@@ -93,6 +109,9 @@ pub struct Config {
     pub repos: Vec<RepoConfig>,
     #[serde(default)]
     pub limits: Limits,
+    /// Order inside a tier (D73).
+    #[serde(default)]
+    pub routing: crate::routing::Routing,
 }
 
 /// One repository Provefab watches (spec §2.3).

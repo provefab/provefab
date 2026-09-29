@@ -128,6 +128,7 @@ impl Worker for PiWorker {
             final_text: state.final_text,
             usage: state.usage,
             turns: state.turns,
+            actual_model: None,
         })
     }
 }
@@ -184,14 +185,12 @@ impl PiState {
                 if v.pointer("/message/role").and_then(Value::as_str) == Some("assistant") =>
             {
                 let msg = &v["message"];
-                self.usage.input_tokens += msg
-                    .pointer("/usage/input")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                self.usage.output_tokens += msg
-                    .pointer("/usage/output")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let n = |p: &str| msg.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+                // Field names from pi-ai's `Usage` type (D74).
+                self.usage.input_tokens += n("/usage/input");
+                self.usage.output_tokens += n("/usage/output");
+                self.usage.cache_read_tokens += n("/usage/cacheRead");
+                self.usage.cache_write_tokens += n("/usage/cacheWrite");
                 let text: Vec<&str> = msg
                     .get("content")
                     .and_then(Value::as_array)
@@ -341,7 +340,8 @@ mod tests {
             &[
                 json!({"type":"tool_execution_start","toolCallId":"1","toolName":"bash","args":{"command":"ls"}}),
                 json!({"type":"tool_execution_end","toolCallId":"1","toolName":"bash","result":{},"isError":true}),
-                json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":100,"output":20},"stopReason":"toolUse"}}),
+                json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":100,"output":20,"cacheRead":300,"cacheWrite":40},"stopReason":"toolUse"}}),
+                json!({"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":1,"output":0,"cacheRead":5,"cacheWrite":0},"stopReason":"toolUse"}}),
                 json!({"type":"tool_execution_end","toolCallId":"2","toolName":"submit_result","result":{"details":{"verdict":"approve"}},"isError":false}),
                 json!({"type":"turn_end","message":{},"toolResults":[]}),
             ],
@@ -365,8 +365,10 @@ mod tests {
         assert_eq!(
             s.usage,
             Usage {
-                input_tokens: 100,
-                output_tokens: 20
+                input_tokens: 101,
+                output_tokens: 20,
+                cache_read_tokens: 305,
+                cache_write_tokens: 40,
             }
         );
         assert_eq!(s.turns, 1);

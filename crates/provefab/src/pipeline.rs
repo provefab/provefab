@@ -58,6 +58,11 @@ pub struct Pipeline<R, O, H> {
     pub paths: Paths,
     pub config: Config,
     pub cooldowns: Mutex<Cooldowns>,
+    /// Model prices for ordering each tier (D71, D73); refreshed daily.
+    pub prices: std::sync::RwLock<crate::prices::PriceTable>,
+    /// When the loop last tried to refresh prices, so a failure (offline)
+    /// waits `prices::RETRY_AFTER` instead of refetching on every tick.
+    pub price_attempt: std::sync::atomic::AtomicI64,
     /// One lock per repo slug, so tasks in the same repo that run in parallel
     /// (`max_concurrency`) never fetch or `git worktree add` at once: git's
     /// shared per-repo administrative files aren't safe for concurrent writers.
@@ -128,7 +133,7 @@ impl Drop for Slot<'_> {
 
 /// What `Pipeline::claim` found.
 enum Claim<'a> {
-    Run(ModelEntry, Slot<'a>),
+    Run(Box<ModelEntry>, Slot<'a>),
     /// No model is free (cooling down or at `max_concurrency`).
     Busy,
     /// The daily worker budget is spent (D53, issue #12).
@@ -1353,12 +1358,60 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Stage::Review => self.review_avoid(task).await?,
             _ => Vec::new(),
         };
+        let catalog = self.ordered_models();
         let avail = self
             .cooldowns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .availability();
-        Ok(select(tier, &self.config.models, &avail, SystemTime::now(), &avoid).cloned())
+        Ok(select(tier, &catalog, &avail, SystemTime::now(), &avoid).cloned())
+    }
+
+    /// Swaps in a newer price table once the one held is a day old (D71). Cheap
+    /// when fresh: only the timestamp is compared.
+    pub async fn refresh_prices(&self) {
+        let fetched_at = self
+            .prices
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fetched_at;
+        let t = now();
+        let last = self
+            .price_attempt
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if t - fetched_at < crate::prices::MAX_AGE || t - last < crate::prices::RETRY_AFTER {
+            return;
+        }
+        self.price_attempt
+            .store(t, std::sync::atomic::Ordering::Relaxed);
+        let fresh = crate::prices::load(&self.paths, self.config.routing.price_urls(), now()).await;
+        *self
+            .prices
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+    }
+
+    /// The catalog in `[routing] prefer` order, so `select` tries the cheapest
+    /// usable model of the tier first (D73).
+    fn ordered_models(&self) -> Vec<ModelEntry> {
+        let prices = self
+            .prices
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::routing::ordered(&self.config.models, &prices, self.config.routing.prefer)
+    }
+
+    fn route_why(&self, model: &ModelEntry) -> String {
+        let prices = self
+            .prices
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::routing::why(
+            model,
+            &self.config.models,
+            &prices,
+            self.config.routing.prefer,
+        )
     }
 
     /// Picks a model and counts it as running in the same critical section, so
@@ -1372,6 +1425,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Stage::Review => self.review_avoid(task).await?,
             _ => Vec::new(),
         };
+        let catalog = self.ordered_models();
         // Serialises this count+claim with `run_stage`'s record+mark, so the
         // count below can never be undercut by a run that is about to be
         // recorded on another worker (issue #12).
@@ -1385,9 +1439,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return Ok(Claim::OverBudget);
         }
         let avail = cooldowns.availability();
-        let Some(model) =
-            select(tier, &self.config.models, &avail, SystemTime::now(), &avoid).cloned()
-        else {
+        let Some(model) = select(tier, &catalog, &avail, SystemTime::now(), &avoid).cloned() else {
             return Ok(Claim::Busy);
         };
         cooldowns.start(&model.id);
@@ -1396,7 +1448,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             model_id: model.id.clone(),
             recorded: false,
         };
-        Ok(Claim::Run(model, slot))
+        Ok(Claim::Run(Box::new(model), slot))
     }
 
     async fn wait(&self, task: &TaskRow, stage: Stage) -> Result<TaskState, PipelineError> {
@@ -1457,6 +1509,13 @@ Please reply with what should happen, what happens instead, and how to reproduce
         watch: bool,
         mut slot: Slot<'_>,
     ) -> Result<Option<Result<Outcome, String>>, PipelineError> {
+        self.store
+            .record_output(
+                task.id,
+                "route",
+                &json!({"stage": stage, "model": model.id, "why": self.route_why(model)}),
+            )
+            .await?;
         let started = now();
         let started_at = SystemTime::now();
         let session = req.session_dir.clone();
@@ -1466,9 +1525,22 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Ok(Outcome::Looping(p)) => format!("loop_detected {p:.2}"),
             Err(e) => format!("worker_error: {e}"),
         };
-        let (turns, usage) = match &outcome {
-            Ok(Outcome::Finished(r)) => (r.turns, r.usage),
-            _ => (0, Default::default()),
+        let (turns, usage, actual_model) = match &outcome {
+            Ok(Outcome::Finished(r)) => (r.turns, r.usage, r.actual_model.clone()),
+            _ => (0, Default::default(), None),
+        };
+        let cost = {
+            let prices = self
+                .prices
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::cost::stage_cost(
+                model,
+                &self.config.models,
+                &usage,
+                actual_model.as_deref(),
+                &prices,
+            )
         };
         // Serialises this record+mark with `claim`'s count+claim, so a claim
         // freed here is never missed by another worker's count (issue #12).
@@ -1486,6 +1558,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 gate_score: None,
                 started_at: started,
                 finished_at: now(),
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                actual_model,
+                cost_usd: cost.usd,
+                quota_units: cost.quota_units,
             })
             .await?;
         slot.recorded();
@@ -1675,7 +1752,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return self.plan_ready(task, repo, &wt, kind, &p).await;
         }
         let (model, slot) = match self.claim(task, Stage::Plan).await? {
-            Claim::Run(m, s) => (m, s),
+            Claim::Run(m, s) => (*m, s),
             Claim::Busy => return self.wait(task, Stage::Plan).await,
             Claim::OverBudget => return self.over_budget(task, repo).await,
         };
@@ -1816,6 +1893,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 gate_score: Some(report.score.to_string()),
                 started_at: started,
                 finished_at: now(),
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                actual_model: None,
+                cost_usd: None,
+                quota_units: None,
             })
             .await?;
         Ok(report)
@@ -1883,7 +1965,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
         };
         let (model, slot) = match self.claim(task, Stage::Implement).await? {
-            Claim::Run(m, s) => (m, s),
+            Claim::Run(m, s) => (*m, s),
             Claim::Busy => return self.wait(task, Stage::Implement).await,
             Claim::OverBudget => return self.over_budget(task, repo).await,
         };
@@ -2142,7 +2224,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return Ok(state);
         }
         let (model, slot) = match self.claim(task, Stage::Review).await? {
-            Claim::Run(m, s) => (m, s),
+            Claim::Run(m, s) => (*m, s),
             Claim::Busy => return self.wait(task, Stage::Review).await,
             Claim::OverBudget => return self.over_budget(task, repo).await,
         };
@@ -2405,7 +2487,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
             _ => b.push_str("Jev was unavailable.\n"),
         }
-        for r in self.store.stage_runs(task.id).await? {
+        let runs = self.store.stage_runs(task.id).await?;
+        for r in &runs {
             if r.model_id.is_empty() {
                 continue;
             }
@@ -2418,6 +2501,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 )),
                 None => b.push_str(&format!("- {}: `{}`\n", r.stage, r.model_id)),
             }
+        }
+        if let Some(cost) = crate::cost::summary(&runs) {
+            b.push_str(&format!("\nCost: {cost}.\n"));
         }
         b.push('\n');
         b.push_str("## Checks\n\n");

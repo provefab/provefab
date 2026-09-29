@@ -31,6 +31,11 @@ impl Paths {
         self.home.join("provefab.db")
     }
 
+    /// Cached model prices (D71).
+    pub fn prices(&self) -> PathBuf {
+        self.home.join("prices.json")
+    }
+
     pub fn plugins(&self) -> PathBuf {
         self.home.join("plugins")
     }

@@ -39,15 +39,43 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 | `provider` | `""` | Pi only: the `--provider`. |
 | `tier` | required | `fast`, `standard` or `frontier`. |
 | `max_concurrency` | `1` | How many stages this model may run at once. |
-| `auth` | `subscription` | Claude Code and Codex only: `subscription` (your plan's login) or `api_key` (your own API key, set with `provefab login <worker> --api-key`). Pi reads its provider's own credentials. |
+| `auth` | `subscription` | Claude Code and Codex only: `subscription` (your plan's login) or `api_key` (your own API key, set with `provefab login <worker> --api-key`). Pi reads its provider's own credentials and always counts as an API key. |
+| `price_id` | none | The price entry to use, as `provider/model` (for example `anthropic/claude-sonnet-5-5`), when the automatic match is wrong. |
+| `price_in`, `price_out` | none | USD per million input and output tokens. Set both to override the fetched prices. |
+| `price_cache_read`, `price_cache_write` | the input price | USD per million cached tokens read and written, with `price_in` and `price_out`. |
+| `quota_weight` | relative price | Subscription models only: how much of your plan one token uses, compared with the cheapest model of the same vendor in the catalog (1.0). It orders that vendor's models only. |
 
-How the tier is chosen:
-- Jev estimates the issue's difficulty and scope. Implementation takes the matching tier; planning and review take one tier above.
-- Within a tier, Provefab takes the first free model, in file order.
-- An empty tier falls back to the nearest configured one.
-- Review avoids the implementer's provider when the catalog allows it.
+**Subscription or API key, per model.** Each model signs in its own way, so you can switch one line and run `provefab service install`. You can also list the same model twice in the same tier, once per sign-in mode: when the subscription hits its usage limit, that entry pauses and the API-key entry takes the next stages. Both still count as the same model family for cross-review. The daily budget (`max_stage_runs_per_day`) caps API spend too.
 
-**Subscription or API key, per model.** Each model signs in its own way, so you can switch one line and run `provefab service install`. You can also list the same model twice, subscription first and API key second, in the same tier: when the subscription hits its usage limit, that entry pauses and the API-key entry takes the next stages. Both still count as the same model family for cross-review. The daily budget (`max_stage_runs_per_day`) caps API spend too.
+### How Provefab picks a model
+
+1. **The tier.** Jev rates each issue once, at intake:
+   - Implementation takes the tier that matches the difficulty, one tier up when Jev is unsure.
+   - Planning takes the implementation tier when Jev rates the planning simple (`plan_depth` below 1.5), and one tier above otherwise. An architectural scope always plans on `frontier`.
+   - Review takes the implementation tier when a subtle mistake would cost little (`review_risk` below 1.5), `frontier` when it would cost a lot (3.0 or more), and one tier above otherwise.
+   - Without a Jev key, every stage runs on `standard`.
+2. **The model inside the tier**, following `[routing] prefer`:
+   - subscription models first, then API-key models, the cheapest first;
+   - among one vendor's subscriptions, the lowest `quota_weight` first; between vendors (Claude and Codex, say), file order decides, since a weight only compares models of the same vendor;
+   - a model with no known price comes after the priced ones (subscription or API key);
+   - ties keep file order.
+3. **The rules that come first:**
+   - a stage never runs below its tier (an empty tier falls back to the nearest configured one, stronger first);
+   - review avoids the implementer's model family whenever the catalog allows it, even when that family is cheaper;
+   - a paused model (usage limit) is skipped;
+   - an implementation that fails again after a retry moves one tier up.
+
+`provefab log <id>` shows the tiers and, for each stage, the model and why it was chosen.
+
+## `[routing]`
+
+| Field | Default | Role |
+|---|---|---|
+| `prefer` | `subscription` | `subscription`: your plans first (already paid), API keys when they are paused. `api_key`: API keys first. `cheapest`: one list in which subscriptions count as free. |
+| `prices_url` | models.dev | Where prices are fetched from, for a mirror. |
+| `litellm_url` | LiteLLM's price list | The fallback source, for a mirror. |
+
+**Prices.** Provefab fetches model prices from [models.dev](https://models.dev) at most once a day, with LiteLLM's price list as fallback, and keeps them in `~/.provefab/prices.json`. Offline, it uses that cache, or the prices built into the binary, and tries again an hour later. A price set in `provefab.toml` always wins. Claude Code aliases (`sonnet`, `opus`, `haiku`) match the newest model of that family. `provefab doctor` shows the price each model uses. The request sends no data about you or your code.
 
 **Tip:** list at least two providers, for example Claude and Codex, so that reviews are cross-checked by a different model family.
 

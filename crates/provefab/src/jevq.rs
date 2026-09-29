@@ -86,6 +86,32 @@ pub fn classify_questions() -> Questions {
         "underspecified".into(),
         Question::noul("Is information needed to implement this missing from the issue?"),
     );
+    q.insert(
+        "plan_depth".into(),
+        Question::score(
+            "Does planning this change need design decisions, or only finding where to change the code?",
+            [
+                "Only locate the code to change",
+                "A small, obvious change once located",
+                "Some choices between approaches",
+                "Design across several parts",
+                "Deep design or research",
+            ],
+        ),
+    );
+    q.insert(
+        "review_risk".into(),
+        Question::score(
+            "How costly would an unnoticed subtle mistake in this change be?",
+            [
+                "Cosmetic: text, formatting, docs",
+                "Minor: easy to notice and fix",
+                "Moderate: a wrong result in some cases",
+                "High: data loss, security, concurrency or money",
+                "Critical: silent corruption or a security hole in production",
+            ],
+        ),
+    );
     q
 }
 
@@ -120,6 +146,9 @@ fn verdict_from(r: &Response) -> Result<Verdict, JevError> {
         scope: r.score("scope")?.score,
         underspecified: r.noul("underspecified")?,
         jev_model: r.model.clone(),
+        // Optional: a missing answer keeps today's tiers (D70).
+        plan_depth: r.score("plan_depth").ok().map(|s| s.score),
+        review_risk: r.score("review_risk").ok().map(|s| s.score),
     })
 }
 
@@ -284,7 +313,9 @@ mod tests {
                     "task_kind": {"type": "choice"},
                     "difficulty": {"type": "score"},
                     "scope": {"type": "score"},
-                    "underspecified": {"type": "noul"}
+                    "underspecified": {"type": "noul"},
+                    "plan_depth": {"type": "score"},
+                    "review_risk": {"type": "score"}
                 }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -293,7 +324,9 @@ mod tests {
                     "task_kind": {"type": "choice", "choice": "bugfix", "probabilities": {"bugfix": 0.9}, "confidence": 0.8},
                     "difficulty": {"type": "score", "score": 1.2, "probabilities": {}, "confidence": 0.7},
                     "scope": {"type": "score", "score": 0.4, "probabilities": {}, "confidence": 0.9},
-                    "underspecified": {"type": "noul", "noul": 0.1}
+                    "underspecified": {"type": "noul", "noul": 0.1},
+                    "plan_depth": {"type": "score", "score": 0.5, "probabilities": {}, "confidence": 0.8},
+                    "review_risk": {"type": "score", "score": 3.2, "probabilities": {}, "confidence": 0.8}
                 },
                 "usage": {"input_tokens": 1, "output_tokens": 1}
             })))
@@ -312,8 +345,12 @@ mod tests {
                 scope: 0.4,
                 underspecified: 0.1,
                 jev_model: "jev-1.13.0".into(),
+                plan_depth: Some(0.5),
+                review_risk: Some(3.2),
             }
         );
+        let q = classify_questions();
+        assert!(q.contains_key("plan_depth") && q.contains_key("review_risk"));
         let sent: Value =
             serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
         assert_eq!(sent["state"]["body"].as_str().unwrap().len(), BODY_LIMIT);

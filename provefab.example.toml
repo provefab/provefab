@@ -8,8 +8,14 @@ model = "jev-1.13.0"            # full, pinned version; never "jev-latest"
 underspecified_threshold = 0.7  # above this, Provefab asks a question instead of coding
 loop_threshold = 0.8            # above this, an agent going in circles is stopped
 
+# Which model a stage takes inside its tier (docs/guide/configuration.md).
+[routing]
+prefer = "subscription"          # your plans first, then API keys by price;
+                                 # or "api_key", or "cheapest"
+# prices_url = "https://models.dev/api.json"   # a mirror; prices refresh daily
+
 # The catalog: the models Provefab may use, by tier.
-# Each stage takes the first free model of the tier it needs, in this order.
+# Inside a tier, the cheapest usable model goes first (see [routing]).
 [[models]]
 id = "claude-sonnet"
 worker = "claude-code"           # "claude-code", "codex" or "pi"
@@ -18,6 +24,11 @@ tier = "standard"                # "fast", "standard" or "frontier"
 max_concurrency = 1
 # auth = "api_key"               # your own API key instead of your subscription
                                  # (set it once: provefab login claude --api-key)
+# price_id = "anthropic/claude-sonnet-5-5"   # when the automatic price match is wrong
+# price_in = 2.0                 # USD per million tokens; overrides fetched prices
+# price_out = 10.0
+# quota_weight = 1.0             # subscription only: plan usage per token, vs the
+                                 # vendor's cheapest model in this catalog
 
 [[models]]
 id = "codex-gpt"
