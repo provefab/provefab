@@ -18,11 +18,15 @@ The pull request then waits for your click. Provefab Pro adds a second reviewer 
 
 ## Quick start
 
-Requirements: macOS, Rust 1.96 or newer, `git` and `gh` (signed in with `gh auth login`), and at least one worker: `claude` (Claude Code) or `codex` (Codex CLI).
+Requirements: macOS, `git` and `gh` (signed in with `gh auth login`), and at least one worker: `claude` (Claude Code) or `codex` (Codex CLI).
 
 ```bash
-# 1. Install the binary (it embeds the worker plugins).
-cargo install --path crates/provefab
+# 1. Install the binary (it embeds the worker plugins), either way:
+#    a. signed and notarized build, no Rust needed: download
+#       provefab-<version>-macos-universal.zip from the Releases page, unzip, then
+sudo install -m 755 provefab /usr/local/bin/provefab
+#    b. from source, with Rust 1.96 or newer:
+cargo install --git https://github.com/provefab/provefab --tag v0.1.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
 provefab login claude        # Claude plan login, in ~/.provefab/claude

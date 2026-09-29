@@ -16,7 +16,7 @@ provefab service uninstall             # stop and remove the service
 - it freezes the `PATH` of the terminal you run it from.
 
 **Run `install` again** after:
-- installing a new Provefab version (`cargo install --path crates/provefab`);
+- installing a new Provefab version (the zip from the GitHub Releases page, or `cargo install --git https://github.com/provefab/provefab --tag <version> --locked provefab`);
 - installing or moving a tool (`claude`, `codex`, `gh`, `cargo`...);
 - editing `provefab.toml`.
 
