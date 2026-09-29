@@ -149,6 +149,28 @@ mod tests {
     }
 
     #[test]
+    fn implement_prompt_keeps_agents_in_scope() {
+        let p = render(Template::Implement, &[]);
+        assert!(p.contains("stays within what the issue asks"), "{p}");
+        assert!(
+            p.contains("Never edit a test or a file unrelated to the issue"),
+            "{p}"
+        );
+        assert!(
+            p.contains("stop, make no workaround, and say so plainly in your last message"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn review_prompt_blocks_out_of_scope_changes() {
+        let p = render(Template::Review, &[("diff", "+added line")]);
+        assert!(p.contains("outside the issue's scope"), "{p}");
+        assert!(p.contains("is a blocking finding"), "{p}");
+        assert!(p.contains("names the out-of-scope part"), "{p}");
+    }
+
+    #[test]
     fn marked_values_sit_between_their_markers() {
         let p = render(Template::Implement, &[("feedback", "FB")]);
         let begin = p

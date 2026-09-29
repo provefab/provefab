@@ -21,3 +21,4 @@ Diff against {{base}}:
 Return the structured answer:
 - verdict: "approve" if the change resolves the issue correctly and safely, "changes" otherwise.
 - findings: each problem with file, line (or null), severity ("blocking" or "minor") and a short, concrete text. Only blocking findings justify "changes".
+- Any change outside the issue's scope (files or behaviour the issue does not ask for) is a blocking finding, and the finding names the out-of-scope part.
