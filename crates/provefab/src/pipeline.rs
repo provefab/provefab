@@ -1145,11 +1145,14 @@ Please reply with what should happen, what happens instead, and how to reproduce
         base: Option<&str>,
         commit_count: Option<usize>,
     ) -> Result<(), PipelineError> {
-        if !repo.post_merge_checks.is_empty() && (merge_sha.is_none() || base.is_none()) {
+        if !repo.post_merge_checks.is_empty()
+            && (merge_sha.is_none() || base.is_none())
+            && base.is_none_or(|b| b == repo.base)
+        {
             // GitHub may report `mergeCommit` a little after the merge: keep the PR
             // watched, but never longer than an hour (spec section 4).
             let first = match self.store.last_output(task.id, "merge_seen").await? {
-                Some(v) => v["at"].as_i64().unwrap_or_else(now),
+                Some(v) => v["at"].as_i64().unwrap_or(0),
                 None => {
                     self.store
                         .record_output(task.id, "merge_seen", &json!({"at": now()}))
@@ -1190,6 +1193,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                         .await?;
                 }
                 // Merged into another branch: not what the checks describe.
+                (_, Some(b)) if b != repo.base => {}
                 (Some(_), Some(_)) => {}
                 _ => {
                     let row = self

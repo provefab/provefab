@@ -252,3 +252,15 @@ async fn opting_in_later_never_checks_an_old_merge() {
     p.process_post_merge(id).await.unwrap();
     assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn another_base_without_a_sha_neither_waits_nor_creates_a_check() {
+    let (_f, p, id) = open_pr_task(&["true"]).await;
+    *p.hub.pr_status.lock().unwrap() = merged(None, Some("release"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
+    assert_eq!(
+        p.store.task(id).await.unwrap().unwrap().pr_state.as_deref(),
+        Some("merged")
+    );
+}
