@@ -332,26 +332,34 @@ where
                 let result = self.step_post_merge(&task, &repo, &check).await;
                 // Guard of spec section 9: no worktree outlives its handler.
                 self.discard_check_worktrees(&repo, check.id).await;
-                drop(guard);
-                if let Err(e) = result {
-                    let n = self.store.post_merge_infra_error(check.id).await?;
-                    if n >= INFRA_ERROR_LIMIT {
-                        let now = self.reload(&check).await?;
-                        self.block(&now, FailureKind::InfraError, &e.to_string())
-                            .await?;
-                    } else {
-                        eprintln!(
-                            "provefab: post-merge check {} ({}): {e}",
-                            check.id,
-                            check.state.as_str()
-                        );
-                        first_error.get_or_insert(e);
-                        continue;
+                let retry = match result {
+                    Ok(()) => None,
+                    Err(e) => {
+                        let n = self.store.post_merge_infra_error(check.id).await?;
+                        if n >= INFRA_ERROR_LIMIT {
+                            let now = self.reload(&check).await?;
+                            self.block(&now, FailureKind::InfraError, &e.to_string())
+                                .await?;
+                            None
+                        } else {
+                            Some(e)
+                        }
                     }
-                }
+                };
+                // Still under the lock: the cleanup writes to the shared checkout.
                 let now = self.reload(&check).await?;
                 if now.state.is_terminal() {
                     self.finish_terminal(&repo, &now).await;
+                }
+                drop(guard);
+                if let Some(e) = retry {
+                    eprintln!(
+                        "provefab: post-merge check {} ({}): {e}",
+                        check.id,
+                        check.state.as_str()
+                    );
+                    first_error.get_or_insert(e);
+                    continue;
                 }
             }
             let now = self.reload(&check).await?;
@@ -422,10 +430,12 @@ where
         }
     }
 
-    /// Terminal cleanup: the local revert branch goes; remote branches never do.
+    /// Terminal cleanup: the local revert branch of every attempt goes (one per
+    /// base move); remote branches never do.
     async fn finish_terminal(&self, repo: &RepoConfig, check: &PostMergeCheckRow) {
-        if let Some(branch) = &check.revert_branch {
-            let _ = self.git.branch_delete(&self.checkout(repo), branch).await;
+        for n in 0..=check.base_moves {
+            let branch = format!("provefab/revert-{}-{n}", check.id);
+            let _ = self.git.branch_delete(&self.checkout(repo), &branch).await;
         }
     }
 
@@ -499,8 +509,12 @@ where
             .worktree_fresh_detached(&repo_path, &rerun_wt, commit)
             .await?;
         let rerun = self.gates(task, &rerun_wt, &failing, stage).await?;
+        let dirty = require_clean && !self.git.clean(&rerun_wt).await?;
         self.git.worktree_discard(&repo_path, &rerun_wt).await?;
-        Ok(confirm(&first, Some(&rerun)))
+        Ok(Confirmed {
+            dirty,
+            ..confirm(&first, Some(&rerun))
+        })
     }
 
     async fn pm_queued(
@@ -772,15 +786,25 @@ where
             .hub
             .pr_create(&repo.slug, &branch, &repo.base, &title, &body)
             .await?;
-        let head = self.hub.pr_status(&repo.slug, &url).await?.head_sha;
-        if head.as_deref() != Some(revert_sha.as_str()) {
-            return self
-                .block(
-                    check,
-                    FailureKind::BranchConflict,
-                    &format!("{url} head is {head:?}, expected {revert_sha}"),
+        match self.hub.pr_status(&repo.slug, &url).await?.head_sha {
+            Some(head) if head == revert_sha => {}
+            Some(head) => {
+                return self
+                    .block(
+                        check,
+                        FailureKind::BranchConflict,
+                        &format!("{url} head is {head}, expected {revert_sha}"),
+                    )
+                    .await;
+            }
+            // Not reported yet: retried next tick; `pr_create` finds the same PR.
+            None => {
+                return Err(ForgeError::Parse(
+                    "gh pr view".into(),
+                    format!("{url} has no head yet"),
                 )
-                .await;
+                .into());
+            }
         }
         self.advance(
             check,

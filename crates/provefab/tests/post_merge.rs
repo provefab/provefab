@@ -570,6 +570,31 @@ async fn a_check_that_edits_tracked_files_on_the_revert_is_blocked() {
     );
 }
 
+/// A check that fails on the revert, then passes on its rerun but rewrites a
+/// tracked file, says nothing about the committed revert (final review F3).
+#[tokio::test]
+async fn a_rerun_that_edits_tracked_files_on_the_revert_is_blocked() {
+    let (f, p, id, _) = setup(&["true"], "broken\n").await;
+    // Runs 1-3 (verify, its rerun, revert-check) fail; run 4 (the revert-check rerun)
+    // passes and rewrites README.
+    let count = f.home.join("runs");
+    let cmd = format!(
+        "n=$(($(cat {0} 2>/dev/null || echo 0) + 1)); echo $n > {0}; \
+         if [ $n -ge 4 ]; then echo changed > README.md; else false; fi",
+        count.display()
+    );
+    let mut p = p;
+    p.config.repos[0].post_merge_checks = vec![cmd];
+    let c = drive(&p, id).await;
+    assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "4");
+    assert_eq!(
+        (c.state, c.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::DirtyTree))
+    );
+    let repo = f.config.repos[0].path_in(&f.home);
+    assert_eq!(git(&repo, &["branch", "--list", "provefab/*"]), "");
+}
+
 #[tokio::test]
 async fn a_merge_commit_is_reverted_with_mainline_one() {
     let (f, p, id) = open_pr_task(&["grep -q hello README.md"]).await;
@@ -720,6 +745,8 @@ async fn a_moving_base_restarts_then_blocks_on_the_third_move() {
         (CheckState::Blocked, Some(FailureKind::BaseMoved))
     );
     assert!(p.hub.prs.lock().unwrap().is_empty());
+    // Every attempt's local branch goes, not only the last one.
+    assert_eq!(git(&repo, &["branch", "--list", "provefab/*"]), "");
 }
 
 #[tokio::test]
@@ -755,6 +782,33 @@ async fn a_reused_pr_on_other_work_blocks() {
         (c.state, c.failure_kind),
         (CheckState::Blocked, Some(FailureKind::BranchConflict))
     );
+}
+
+/// GitHub not reporting the new PR's head yet is a transient read, not a conflict.
+#[tokio::test]
+async fn an_unreported_revert_pr_head_is_retried_not_blocked() {
+    let (_f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::RevertReady).await;
+    let mut unreported = merged(None, Some("main"), Some(1));
+    unreported.state = provefab::forge::PrState::Open;
+    unreported.head_sha = None;
+    p.hub
+        .pr_statuses
+        .lock()
+        .unwrap()
+        .insert("https://github.com/o/r/pull/100".into(), unreported);
+    assert!(p.process_post_merge(id).await.is_err());
+    let c = check(&p, id).await;
+    assert_eq!((c.state, c.infra_errors), (CheckState::RevertReady, 1));
+    p.hub
+        .pr_statuses
+        .lock()
+        .unwrap()
+        .get_mut("https://github.com/o/r/pull/100")
+        .unwrap()
+        .head_sha = c.revert_sha.clone();
+    assert_eq!(tick(&p, id).await, CheckState::RevertOpen);
+    assert_eq!(p.hub.prs.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
