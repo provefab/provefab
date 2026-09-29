@@ -931,9 +931,10 @@ async fn status_log_and_stats_show_the_check() {
     );
 }
 
-/// Spec section 12: a replay per non-terminal state. A tick whose result was
-/// lost (crash before the state was persisted) is replayed from the earlier
-/// state and still ends in exactly one revert PR with nothing left behind.
+/// Spec section 12: a replay per non-terminal state. After the tick from each
+/// state, the row is rewound to that state when the tick changed it (as if the
+/// state change was lost in a crash); the replay must still end in exactly one
+/// revert PR with nothing left behind.
 #[tokio::test]
 async fn replaying_any_non_terminal_state_still_ends_in_one_revert_pr() {
     let non_terminal = [
@@ -970,9 +971,18 @@ async fn replaying_any_non_terminal_state_still_ends_in_one_revert_pr() {
 #[tokio::test]
 async fn an_infra_error_path_leaves_no_worktree() {
     use std::sync::atomic::Ordering;
-    let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    let (f, p, id, sha) = setup(&["grep -q hello README.md"], "broken\n").await;
     tick_until(&p, id, CheckState::RevertReady).await;
+    let c = check(&p, id).await;
+    // A residue worktree at the check's revert path, as after a crash.
+    let repo = f.config.repos[0].path_in(&f.home);
+    let wt = f.home.join("post-merge").join(format!("{}-revert", c.id));
+    p.git
+        .worktree_fresh_detached(&repo, &wt, &sha)
+        .await
+        .unwrap();
+    assert!(wt.exists());
     p.hub.pr_create_failures.store(1, Ordering::SeqCst);
     assert!(p.process_post_merge(id).await.is_err());
-    assert!(leftovers(&f, check(&p, id).await.id).is_empty());
+    assert!(leftovers(&f, c.id).is_empty());
 }
