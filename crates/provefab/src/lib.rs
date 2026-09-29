@@ -20,6 +20,7 @@ pub mod ports;
 pub mod prices;
 pub mod prompts;
 pub mod router;
+pub mod routing;
 pub mod scheduler;
 pub mod service;
 pub mod stage;

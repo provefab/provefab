@@ -274,6 +274,19 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
             let _ = writeln!(out, "    {r}");
         }
     }
+    let routes = store.recent_outputs(id, "route", 50).await?;
+    if !routes.is_empty() {
+        out.push_str("\nroutes:\n");
+        for r in routes {
+            let _ = writeln!(
+                out,
+                "  {} -> {}: {}",
+                r["stage"].as_str().unwrap_or("-"),
+                r["model"].as_str().unwrap_or("-"),
+                r["why"].as_str().unwrap_or("-")
+            );
+        }
+    }
     out.push_str("\nstage runs:\n");
     for r in store.stage_runs(id).await? {
         let _ = writeln!(

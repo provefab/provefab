@@ -281,6 +281,19 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             }
             let installed = plugins::install(&paths.plugins())?;
             let exe = std::env::current_exe().context("locating Provefab binary")?;
+            let prices = crate::prices::load(
+                &paths,
+                [
+                    config
+                        .routing
+                        .prices_url
+                        .as_deref()
+                        .unwrap_or(crate::prices::MODELS_DEV_URL),
+                    crate::prices::LITELLM_URL,
+                ],
+                crate::store::now(),
+            )
+            .await;
             let pipeline = Arc::new(Pipeline {
                 store: Store::open(&paths.db()).await?,
                 runner: AgentRunner::new(&paths, &installed, exe),
@@ -292,6 +305,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 paths: paths.clone(),
                 config,
                 cooldowns: Mutex::new(Cooldowns::default()),
+                prices: std::sync::RwLock::new(prices),
                 repo_locks: Mutex::new(std::collections::HashMap::new()),
                 budget: tokio::sync::Mutex::new(()),
                 policy,

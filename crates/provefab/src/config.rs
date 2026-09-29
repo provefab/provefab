@@ -109,6 +109,9 @@ pub struct Config {
     pub repos: Vec<RepoConfig>,
     #[serde(default)]
     pub limits: Limits,
+    /// Order inside a tier (D73).
+    #[serde(default)]
+    pub routing: crate::routing::Routing,
 }
 
 /// One repository Provefab watches (spec §2.3).

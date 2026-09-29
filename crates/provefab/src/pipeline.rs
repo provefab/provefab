@@ -58,6 +58,8 @@ pub struct Pipeline<R, O, H> {
     pub paths: Paths,
     pub config: Config,
     pub cooldowns: Mutex<Cooldowns>,
+    /// Model prices for ordering each tier (D71, D73); refreshed daily.
+    pub prices: std::sync::RwLock<crate::prices::PriceTable>,
     /// One lock per repo slug, so tasks in the same repo that run in parallel
     /// (`max_concurrency`) never fetch or `git worktree add` at once: git's
     /// shared per-repo administrative files aren't safe for concurrent writers.
@@ -1353,12 +1355,36 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Stage::Review => self.review_avoid(task).await?,
             _ => Vec::new(),
         };
+        let catalog = self.ordered_models();
         let avail = self
             .cooldowns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .availability();
-        Ok(select(tier, &self.config.models, &avail, SystemTime::now(), &avoid).cloned())
+        Ok(select(tier, &catalog, &avail, SystemTime::now(), &avoid).cloned())
+    }
+
+    /// The catalog in `[routing] prefer` order, so `select` tries the cheapest
+    /// usable model of the tier first (D73).
+    fn ordered_models(&self) -> Vec<ModelEntry> {
+        let prices = self
+            .prices
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::routing::ordered(&self.config.models, &prices, self.config.routing.prefer)
+    }
+
+    fn route_why(&self, model: &ModelEntry) -> String {
+        let prices = self
+            .prices
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::routing::why(
+            model,
+            &self.config.models,
+            &prices,
+            self.config.routing.prefer,
+        )
     }
 
     /// Picks a model and counts it as running in the same critical section, so
@@ -1372,6 +1398,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Stage::Review => self.review_avoid(task).await?,
             _ => Vec::new(),
         };
+        let catalog = self.ordered_models();
         // Serialises this count+claim with `run_stage`'s record+mark, so the
         // count below can never be undercut by a run that is about to be
         // recorded on another worker (issue #12).
@@ -1385,9 +1412,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return Ok(Claim::OverBudget);
         }
         let avail = cooldowns.availability();
-        let Some(model) =
-            select(tier, &self.config.models, &avail, SystemTime::now(), &avoid).cloned()
-        else {
+        let Some(model) = select(tier, &catalog, &avail, SystemTime::now(), &avoid).cloned() else {
             return Ok(Claim::Busy);
         };
         cooldowns.start(&model.id);
@@ -1457,6 +1482,13 @@ Please reply with what should happen, what happens instead, and how to reproduce
         watch: bool,
         mut slot: Slot<'_>,
     ) -> Result<Option<Result<Outcome, String>>, PipelineError> {
+        self.store
+            .record_output(
+                task.id,
+                "route",
+                &json!({"stage": stage, "model": model.id, "why": self.route_why(model)}),
+            )
+            .await?;
         let started = now();
         let started_at = SystemTime::now();
         let session = req.session_dir.clone();

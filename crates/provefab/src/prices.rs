@@ -287,17 +287,17 @@ pub fn quota_weight(m: &ModelEntry, catalog: &[ModelEntry], table: &PriceTable) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{Auth, ModelEntry, WorkerKind};
     use crate::task::Tier;
 
-    fn md() -> PriceTable {
+    pub(crate) fn md() -> PriceTable {
         PriceTable::from_models_dev(include_str!("../tests/fixtures/prices/models_dev.json"), 1)
             .unwrap()
     }
 
-    fn m(
+    pub(crate) fn m(
         id: &str,
         worker: WorkerKind,
         model: &str,

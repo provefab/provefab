@@ -1127,3 +1127,48 @@ async fn stats_count_prs_and_tell_auto_merges_from_human_ones() {
     assert!(out.contains("merged 2 (auto 1, by hand 1)"), "{out}");
     assert!(out.contains("reviewers:"), "{out}");
 }
+
+/// Cost order applies inside the tier, but review still avoids the implementer's family.
+#[tokio::test]
+async fn cheapest_first_but_cross_review_still_wins() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    // std-claude and std-codex are both Standard; make codex the cheaper subscription.
+    f.config
+        .models
+        .iter_mut()
+        .find(|m| m.id == "std-claude")
+        .unwrap()
+        .quota_weight = Some(5.0);
+    f.config
+        .models
+        .iter_mut()
+        .find(|m| m.id == "std-codex")
+        .unwrap()
+        .quota_weight = Some(1.0);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let stages = p.runner.stages();
+    let implement = stages
+        .iter()
+        .find(|(_, s)| s == "implement")
+        .unwrap()
+        .0
+        .clone();
+    let review = stages
+        .iter()
+        .find(|(_, s)| s == "review")
+        .unwrap()
+        .0
+        .clone();
+    assert_eq!(implement, "std-codex");
+    assert_ne!(review, "std-codex");
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    assert!(log.contains("routes:"), "{log}");
+}

@@ -530,6 +530,13 @@ pub async fn pipeline<O: Oracle>(
         paths,
         config: f.config.clone(),
         cooldowns: Mutex::new(Cooldowns::default()),
+        prices: std::sync::RwLock::new(
+            crate::prices::PriceTable::from_models_dev(
+                include_str!("../tests/fixtures/prices/models_dev.json"),
+                1,
+            )
+            .unwrap(),
+        ),
         repo_locks: Mutex::new(std::collections::HashMap::new()),
         budget: tokio::sync::Mutex::new(()),
         policy: f.policy.clone(),
