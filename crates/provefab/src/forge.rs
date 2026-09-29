@@ -364,7 +364,12 @@ impl Git {
                 &["ls-remote", "origin", &format!("refs/heads/{branch}")],
             )
             .await?;
-        Ok(out.split_whitespace().next().map(str::to_string))
+        // ls-remote patterns tail-match, so accept only the exact ref.
+        let want = format!("refs/heads/{branch}");
+        Ok(out.lines().find_map(|l| {
+            let (sha, name) = l.split_once('\t')?;
+            (name.trim() == want).then(|| sha.trim().to_string())
+        }))
     }
 
     /// Pushes an exact commit to a branch, never forcing.
