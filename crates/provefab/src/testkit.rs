@@ -249,6 +249,16 @@ pub struct FakeHub {
     pub labels_down: std::sync::atomic::AtomicBool,
     /// The repository is public (merge policies refuse by default).
     pub public: std::sync::atomic::AtomicBool,
+    /// When set, `pr_create` behaves like GitHub for revert PRs: it reuses an
+    /// open PR with the same head, answers a new URL per head, and records the
+    /// head commit read from this bare origin.
+    pub revert_origin: Mutex<Option<PathBuf>>,
+    /// Per-URL answers of `pr_status` (falls back to `pr_status`).
+    pub pr_statuses: Mutex<std::collections::HashMap<String, crate::forge::PrStatus>>,
+    /// Reports this head for the next PR `pr_create` returns (a reused PR on other work).
+    pub pr_head_override: Mutex<Option<String>>,
+    /// The next this-many `pr_comment` calls fail (GitHub unreachable).
+    pub pr_comment_failures: std::sync::atomic::AtomicU32,
 }
 
 impl FakeHub {
@@ -287,6 +297,10 @@ impl FakeHub {
             issue_missing: Default::default(),
             labels_down: Default::default(),
             public: Default::default(),
+            revert_origin: Mutex::new(None),
+            pr_statuses: Mutex::new(std::collections::HashMap::new()),
+            pr_head_override: Mutex::new(None),
+            pr_comment_failures: Default::default(),
         }
     }
 
@@ -341,14 +355,24 @@ impl Hub for FakeHub {
         self.add_comment("me", &crate::forge::with_prefix(body));
         Ok(())
     }
-    async fn pr_comment(&self, _: &str, _: &str, body: &str) -> Result<(), ForgeError> {
+    async fn pr_comment(&self, _: &str, url: &str, body: &str) -> Result<(), ForgeError> {
+        use std::sync::atomic::Ordering;
+        let left = self.pr_comment_failures.load(Ordering::SeqCst);
+        if left > 0 {
+            self.pr_comment_failures.store(left - 1, Ordering::SeqCst);
+            return Err(ForgeError::Parse("gh pr comment".into(), "HTTP 502".into()));
+        }
         self.posted.lock().unwrap().push(body.to_string());
-        self.pr_status.lock().unwrap().comments.push(Comment {
+        let comment = Comment {
             author: "me".into(),
             association: "MEMBER".into(),
             body: crate::forge::with_prefix(body),
             created_at: crate::store::rfc3339(crate::store::now()),
-        });
+        };
+        match self.pr_statuses.lock().unwrap().get_mut(url) {
+            Some(s) => s.comments.push(comment),
+            None => self.pr_status.lock().unwrap().comments.push(comment),
+        }
         Ok(())
     }
     async fn edit_labels(
@@ -393,6 +417,31 @@ impl Hub for FakeHub {
                 "HTTP 502 token=ghp_SECRET".into(),
             ));
         }
+        if let Some(origin) = self.revert_origin.lock().unwrap().clone() {
+            let mut prs = self.prs.lock().unwrap();
+            let url = match prs.iter().position(|p| p.0 == head && p.1 == base) {
+                Some(i) => format!("https://github.com/o/r/pull/{}", 100 + i),
+                None => {
+                    prs.push((head.into(), base.into(), title.into(), body.into()));
+                    format!("https://github.com/o/r/pull/{}", 100 + prs.len() - 1)
+                }
+            };
+            let real = git(&origin, &["rev-parse", &format!("refs/heads/{head}")]);
+            let head_sha = self.pr_head_override.lock().unwrap().take().unwrap_or(real);
+            self.pr_statuses
+                .lock()
+                .unwrap()
+                .entry(url.clone())
+                .or_insert(crate::forge::PrStatus {
+                    state: crate::forge::PrState::Open,
+                    comments: Vec::new(),
+                    head_sha: Some(head_sha),
+                    merge_sha: None,
+                    base_ref: Some(base.into()),
+                    commit_count: Some(1),
+                });
+            return Ok(url);
+        }
         self.prs
             .lock()
             .unwrap()
@@ -403,7 +452,10 @@ impl Hub for FakeHub {
         self.ensured.lock().unwrap().push(name.to_string());
         Ok(())
     }
-    async fn pr_status(&self, _: &str, _: &str) -> Result<crate::forge::PrStatus, ForgeError> {
+    async fn pr_status(&self, _: &str, url: &str) -> Result<crate::forge::PrStatus, ForgeError> {
+        if let Some(s) = self.pr_statuses.lock().unwrap().get(url) {
+            return Ok(s.clone());
+        }
         Ok(self.pr_status.lock().unwrap().clone())
     }
     async fn pr_merge(&self, _: &str, url: &str, head: &str) -> Result<(), ForgeError> {

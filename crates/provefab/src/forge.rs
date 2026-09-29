@@ -269,50 +269,122 @@ impl Git {
         Ok(())
     }
 
-    /// Creates an isolated detached worktree at an exact commit. Unlike task
-    /// worktrees this never creates or reuses a branch.
-    pub async fn worktree_detached(
+    /// A fresh detached worktree at `commit`. Anything already at `path` (a
+    /// crashed run's residue) is discarded first, never reused (spec section 9).
+    pub async fn worktree_fresh_detached(
         &self,
         repo: &Path,
         path: &Path,
         commit: &str,
     ) -> Result<(), ForgeError> {
-        let dir = path.display().to_string();
-        self.git(repo, &["worktree", "prune"]).await?;
-        if path.join(".git").exists() {
-            let actual = self.head(path).await?;
-            if actual != commit {
-                return Err(ForgeError::WrongWorktree {
-                    path: dir,
-                    actual,
-                    wanted: commit.to_string(),
-                });
-            }
-            return self.exclude_provefab_dir(path).await;
+        self.worktree_discard(repo, path).await?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ForgeError::Parse(parent.display().to_string(), e.to_string()))?;
         }
+        let dir = path.display().to_string();
         self.git(repo, &["worktree", "add", "--detach", &dir, commit])
             .await?;
         self.exclude_provefab_dir(path).await
     }
 
-    /// Reverts one exact commit without invoking hooks. A conflict is returned
-    /// untouched so the caller can remove the worktree and ask a human.
-    pub async fn revert(&self, worktree: &Path, commit: &str) -> Result<(), ForgeError> {
-        self.git(worktree, &["revert", "--no-edit", commit]).await?;
+    /// Removes a worktree and its directory, registered or not. No-op when absent.
+    pub async fn worktree_discard(&self, repo: &Path, path: &Path) -> Result<(), ForgeError> {
+        if path.exists() {
+            let dir = path.display().to_string();
+            // Not a registered worktree (plain residue): git refuses; the
+            // directory is removed below either way.
+            let _ = self
+                .git(repo, &["worktree", "remove", "--force", &dir])
+                .await;
+            if path.exists() {
+                std::fs::remove_dir_all(path)
+                    .map_err(|e| ForgeError::Parse(dir.clone(), e.to_string()))?;
+            }
+        }
+        self.git(repo, &["worktree", "prune"]).await?;
         Ok(())
     }
 
-    /// A resumed revert must be exactly one git-generated revert commit on
-    /// the base we verified. Never reuse an unrelated branch with this name.
-    pub async fn prepared_revert(
+    /// 1 for an ordinary or squash commit, 2 for a merge commit.
+    pub async fn parent_count(&self, repo: &Path, commit: &str) -> Result<usize, ForgeError> {
+        let line = self
+            .git(repo, &["rev-list", "--parents", "-n", "1", commit])
+            .await?;
+        Ok(line.split_whitespace().count().saturating_sub(1))
+    }
+
+    /// Reverts one commit with hooks off; `mainline` is `Some(1)` for a merge
+    /// commit. A conflict is returned as the git error, never resolved.
+    pub async fn revert(
         &self,
         worktree: &Path,
-        base: &str,
-        original: &str,
-    ) -> Result<bool, ForgeError> {
-        let parent = self.git(worktree, &["rev-parse", "HEAD^"]).await?;
-        let message = self.git(worktree, &["log", "-1", "--format=%B"]).await?;
-        Ok(parent == base && message.contains(&format!("This reverts commit {original}.")))
+        commit: &str,
+        mainline: Option<u8>,
+    ) -> Result<(), ForgeError> {
+        let m = mainline.map(|m| m.to_string());
+        let mut args = vec!["revert", "--no-edit"];
+        if let Some(m) = m.as_deref() {
+            args.extend(["-m", m]);
+        }
+        args.push(commit);
+        self.git(worktree, &args).await?;
+        Ok(())
+    }
+
+    /// Points a local branch at `commit` (keeps the revert commit reachable).
+    pub async fn branch_force(
+        &self,
+        repo: &Path,
+        name: &str,
+        commit: &str,
+    ) -> Result<(), ForgeError> {
+        self.git(repo, &["branch", "-f", name, commit]).await?;
+        Ok(())
+    }
+
+    /// Deletes a local branch; a missing branch is not an error (`git branch
+    /// -D` exits 1 for it, verified on git 2.x macOS).
+    pub async fn branch_delete(&self, repo: &Path, name: &str) -> Result<(), ForgeError> {
+        match self.git(repo, &["branch", "-D", name]).await {
+            Ok(_) | Err(ForgeError::Failed { code: Some(1), .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The commit `origin` holds for `branch`, if the branch exists there.
+    pub async fn remote_branch_sha(
+        &self,
+        repo: &Path,
+        branch: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let out = self
+            .git(
+                repo,
+                &["ls-remote", "origin", &format!("refs/heads/{branch}")],
+            )
+            .await?;
+        Ok(out.split_whitespace().next().map(str::to_string))
+    }
+
+    /// Pushes an exact commit to a branch, never forcing.
+    pub async fn push_sha(
+        &self,
+        repo: &Path,
+        commit: &str,
+        branch: &str,
+    ) -> Result<(), ForgeError> {
+        self.git(
+            repo,
+            &[
+                "push",
+                "--no-verify",
+                "origin",
+                &format!("{commit}:refs/heads/{branch}"),
+            ],
+        )
+        .await?;
+        Ok(())
     }
 
     /// Checks that validation commands have not changed the proposed revert.
