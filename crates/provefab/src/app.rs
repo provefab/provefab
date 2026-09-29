@@ -281,19 +281,9 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             }
             let installed = plugins::install(&paths.plugins())?;
             let exe = std::env::current_exe().context("locating Provefab binary")?;
-            let prices = crate::prices::load(
-                &paths,
-                [
-                    config
-                        .routing
-                        .prices_url
-                        .as_deref()
-                        .unwrap_or(crate::prices::MODELS_DEV_URL),
-                    crate::prices::LITELLM_URL,
-                ],
-                crate::store::now(),
-            )
-            .await;
+            // Up to 2 x 10 s offline before the service starts; then the cache or snapshot.
+            let prices =
+                crate::prices::load(&paths, config.routing.price_urls(), crate::store::now()).await;
             let pipeline = Arc::new(Pipeline {
                 store: Store::open(&paths.db()).await?,
                 runner: AgentRunner::new(&paths, &installed, exe),
@@ -306,6 +296,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 config,
                 cooldowns: Mutex::new(Cooldowns::default()),
                 prices: std::sync::RwLock::new(prices),
+                price_attempt: std::sync::atomic::AtomicI64::new(0),
                 repo_locks: Mutex::new(std::collections::HashMap::new()),
                 budget: tokio::sync::Mutex::new(()),
                 policy,

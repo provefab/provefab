@@ -60,6 +60,9 @@ pub struct Pipeline<R, O, H> {
     pub cooldowns: Mutex<Cooldowns>,
     /// Model prices for ordering each tier (D71, D73); refreshed daily.
     pub prices: std::sync::RwLock<crate::prices::PriceTable>,
+    /// When the loop last tried to refresh prices, so a failure (offline)
+    /// waits `prices::RETRY_AFTER` instead of refetching on every tick.
+    pub price_attempt: std::sync::atomic::AtomicI64,
     /// One lock per repo slug, so tasks in the same repo that run in parallel
     /// (`max_concurrency`) never fetch or `git worktree add` at once: git's
     /// shared per-repo administrative files aren't safe for concurrent writers.
@@ -1372,17 +1375,16 @@ Please reply with what should happen, what happens instead, and how to reproduce
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .fetched_at;
-        if now() - fetched_at < crate::prices::MAX_AGE {
+        let t = now();
+        let last = self
+            .price_attempt
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if t - fetched_at < crate::prices::MAX_AGE || t - last < crate::prices::RETRY_AFTER {
             return;
         }
-        let url = self
-            .config
-            .routing
-            .prices_url
-            .as_deref()
-            .unwrap_or(crate::prices::MODELS_DEV_URL);
-        let fresh =
-            crate::prices::load(&self.paths, [url, crate::prices::LITELLM_URL], now()).await;
+        self.price_attempt
+            .store(t, std::sync::atomic::Ordering::Relaxed);
+        let fresh = crate::prices::load(&self.paths, self.config.routing.price_urls(), now()).await;
         *self
             .prices
             .write()

@@ -56,7 +56,7 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
    - Without a Jev key, every stage runs on `standard`.
 2. **The model inside the tier**, following `[routing] prefer`:
    - subscription models first, the lowest `quota_weight` first, then API-key models, the cheapest first;
-   - a model with no known price comes after the priced ones;
+   - a model with no known price comes after the priced ones (subscription or API key);
    - ties keep file order.
 3. **The rules that come first:**
    - a stage never runs below its tier (an empty tier falls back to the nearest configured one, stronger first);
@@ -72,8 +72,9 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 |---|---|---|
 | `prefer` | `subscription` | `subscription`: your plans first (already paid), API keys when they are paused. `api_key`: API keys first. `cheapest`: one list in which subscriptions count as free. |
 | `prices_url` | models.dev | Where prices are fetched from, for a mirror. |
+| `litellm_url` | LiteLLM's price list | The fallback source, for a mirror. |
 
-**Prices.** Provefab fetches model prices from [models.dev](https://models.dev) at most once a day, with LiteLLM's price list as fallback, and keeps them in `~/.provefab/prices.json`. Offline, it uses that cache, or the prices built into the binary. A price set in `provefab.toml` always wins. Claude Code aliases (`sonnet`, `opus`, `haiku`) match the newest model of that family. `provefab doctor` shows the price each model uses. The request sends no data about you or your code.
+**Prices.** Provefab fetches model prices from [models.dev](https://models.dev) at most once a day, with LiteLLM's price list as fallback, and keeps them in `~/.provefab/prices.json`. Offline, it uses that cache, or the prices built into the binary, and tries again an hour later. A price set in `provefab.toml` always wins. Claude Code aliases (`sonnet`, `opus`, `haiku`) match the newest model of that family. `provefab doctor` shows the price each model uses. The request sends no data about you or your code.
 
 **Tip:** list at least two providers, for example Claude and Codex, so that reviews are cross-checked by a different model family.
 

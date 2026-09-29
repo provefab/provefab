@@ -4,7 +4,7 @@
 use agent_workers::Usage;
 
 use crate::config::ModelEntry;
-use crate::prices::{PriceTable, is_api, price_by_model_id, price_of, quota_weight};
+use crate::prices::{PriceTable, is_api, price_by_actual, price_of, quota_weight};
 use crate::store::StageRunRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -38,7 +38,7 @@ pub fn stage_cost(
         price_of(m, table)
     } else {
         actual_model
-            .and_then(|a| price_by_model_id(a, table))
+            .and_then(|a| price_by_actual(m, a, table))
             .or_else(|| price_of(m, table))
     };
     let usd = price.and_then(|p| {

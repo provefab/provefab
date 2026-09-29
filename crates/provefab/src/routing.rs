@@ -27,6 +27,23 @@ pub struct Routing {
     /// Overrides the models.dev URL (tests, mirrors).
     #[serde(default)]
     pub prices_url: Option<String>,
+    /// Overrides the LiteLLM fallback URL (tests, mirrors).
+    #[serde(default)]
+    pub litellm_url: Option<String>,
+}
+
+impl Routing {
+    /// models.dev, then LiteLLM (D71).
+    pub fn price_urls(&self) -> [&str; 2] {
+        [
+            self.prices_url
+                .as_deref()
+                .unwrap_or(crate::prices::MODELS_DEV_URL),
+            self.litellm_url
+                .as_deref()
+                .unwrap_or(crate::prices::LITELLM_URL),
+        ]
+    }
 }
 
 /// The catalog sorted by `prefer`; ties keep catalog order.
@@ -41,6 +58,8 @@ pub fn ordered(catalog: &[ModelEntry], table: &PriceTable, prefer: Prefer) -> Ve
         let cost = if !api {
             match prefer {
                 Prefer::Cheapest => 0.0,
+                // Unpriced subscriptions rank after every priced one too.
+                _ if m.quota_weight.is_none() && price_of(m, table).is_none() => f64::MAX,
                 _ => quota_weight(m, catalog, table),
             }
         } else {
@@ -66,6 +85,11 @@ pub fn why(m: &ModelEntry, catalog: &[ModelEntry], table: &PriceTable, prefer: P
         Prefer::Cheapest => "prefer cheapest",
     };
     if !is_api(m) {
+        if m.quota_weight.is_none() && price_of(m, table).is_none() {
+            return format!(
+                "subscription, no price (ranked last; set price_id or quota_weight; {policy})"
+            );
+        }
         return format!(
             "subscription, quota weight {:.1} ({policy})",
             quota_weight(m, catalog, table)
@@ -189,5 +213,31 @@ mod tests {
             crate::config::Config::from_toml_str("models = []\n[jev]\nmodel = \"jev-1.13.0\"\n")
                 .unwrap();
         assert_eq!(c.routing.prefer, Prefer::Subscription);
+    }
+
+    /// Review finding 2: an unpriced subscription must not jump the queue.
+    #[test]
+    fn unpriced_subscriptions_rank_after_priced_ones() {
+        let t = table();
+        let cat = vec![
+            m(
+                "mystery",
+                WorkerKind::Codex,
+                "gpt-typo",
+                "",
+                Tier::Standard,
+                Auth::Subscription,
+            ),
+            m(
+                "opus-sub",
+                WorkerKind::ClaudeCode,
+                "opus",
+                "",
+                Tier::Standard,
+                Auth::Subscription,
+            ),
+        ];
+        assert_eq!(ordered(&cat, &t, Prefer::Subscription)[0].id, "opus-sub");
+        assert!(why(&cat[0], &cat, &t, Prefer::Subscription).contains("no price"));
     }
 }

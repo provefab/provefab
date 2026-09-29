@@ -14,6 +14,8 @@ pub const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 /// Prices are refreshed at most once a day (D71).
 pub const MAX_AGE: i64 = 86_400;
+/// After a failed refresh, the service waits this long before trying again.
+pub const RETRY_AFTER: i64 = 3_600;
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// USD per million tokens.
@@ -35,6 +37,25 @@ pub struct PriceTable {
 }
 
 const CLAUDE_ALIASES: [&str; 3] = ["opus", "sonnet", "haiku"];
+/// Model vendors, preferred over resellers when an id is listed several times.
+const VENDORS: [&str; 6] = [
+    "anthropic",
+    "openai",
+    "google",
+    "mistral",
+    "deepseek",
+    "xai",
+];
+/// Pi providers priced under another name.
+const PI_PROVIDERS: [(&str, &str); 1] = [("openai-codex", "openai")];
+
+/// `5-5` -> [5, 5]; an 8-digit date segment is not part of the version.
+fn version(rest: &str) -> Vec<u32> {
+    rest.split('-')
+        .filter(|p| p.len() != 8)
+        .map_while(|p| p.parse().ok())
+        .collect()
+}
 
 impl PriceTable {
     /// `https://models.dev/api.json`: `{provider: {models: {id: {cost: {input, output, cache_read?, cache_write?}, release_date?}}}}`.
@@ -109,14 +130,32 @@ impl PriceTable {
         })
     }
 
-    /// The unique key ending with `/<model>`.
+    /// The key ending with `/<model>`: the only one, or, when resellers list
+    /// the same id too, the model vendor's own.
     fn by_suffix(&self, model: &str) -> Option<String> {
         let suffix = format!("/{model}");
-        let mut hits = self.models.keys().filter(|k| k.ends_with(&suffix));
-        match (hits.next(), hits.next()) {
-            (Some(k), None) => Some(k.clone()),
-            _ => None,
+        let hits: Vec<&String> = self
+            .models
+            .keys()
+            .filter(|k| k.ends_with(&suffix))
+            .collect();
+        match hits.as_slice() {
+            [k] => Some((*k).clone()),
+            _ => VENDORS.iter().find_map(|v| {
+                let key = format!("{v}/{model}");
+                hits.iter().any(|k| **k == key).then_some(key)
+            }),
         }
+    }
+
+    /// `provider/model`, reading a Pi provider under its vendor's name.
+    fn provider_key(&self, provider: &str, model: &str) -> Option<String> {
+        let provider = PI_PROVIDERS
+            .iter()
+            .find(|(pi, _)| *pi == provider)
+            .map_or(provider, |(_, vendor)| vendor);
+        let key = format!("{provider}/{model}");
+        self.models.contains_key(&key).then_some(key)
     }
 
     /// The price-table key for a catalog entry, by worker (spec §2).
@@ -128,9 +167,12 @@ impl PriceTable {
                     .models
                     .iter()
                     .filter(|(k, _)| k.starts_with(&prefix))
+                    // Newest release; without dates (LiteLLM), highest version;
+                    // then the shortest id over a dated snapshot of it.
                     .max_by(|(ka, a), (kb, b)| {
                         a.release_date
                             .cmp(&b.release_date)
+                            .then(version(&ka[prefix.len()..]).cmp(&version(&kb[prefix.len()..])))
                             .then(kb.len().cmp(&ka.len()))
                     })
                     .map(|(k, _)| k.clone());
@@ -138,12 +180,9 @@ impl PriceTable {
             WorkerKind::ClaudeCode => format!("anthropic/{}", m.model),
             WorkerKind::Codex => format!("openai/{}", m.model),
             WorkerKind::Pi => {
-                let direct = format!("{}/{}", m.provider, m.model);
-                if self.models.contains_key(&direct) {
-                    direct
-                } else {
-                    return self.by_suffix(&m.model);
-                }
+                return self
+                    .provider_key(&m.provider, &m.model)
+                    .or_else(|| self.by_suffix(&m.model));
             }
         };
         self.models.contains_key(&key).then_some(key)
@@ -252,12 +291,17 @@ pub fn price_of(m: &ModelEntry, table: &PriceTable) -> Option<Price> {
     table.models.get(&key).cloned()
 }
 
-/// The price of the model a worker reported using (for example
-/// `claude-sonnet-5-5` from Claude Code's init event).
-pub fn price_by_model_id(model: &str, table: &PriceTable) -> Option<Price> {
-    table
-        .by_suffix(model)
-        .and_then(|k| table.models.get(&k).cloned())
+/// The price of the model a CLI reports it ran (`actual`).
+/// Looked up under the worker's vendor first: the live table lists the same
+/// id under many resellers (D74).
+pub fn price_by_actual(m: &ModelEntry, actual: &str, table: &PriceTable) -> Option<Price> {
+    let key = match m.worker {
+        WorkerKind::ClaudeCode => table.provider_key("anthropic", actual),
+        WorkerKind::Codex => table.provider_key("openai", actual),
+        WorkerKind::Pi => table.provider_key(&m.provider, actual),
+    }
+    .or_else(|| table.by_suffix(actual))?;
+    table.models.get(&key).cloned()
 }
 
 /// Runs on an API key (Pi always does), not on a subscription.
@@ -544,5 +588,79 @@ pub(crate) mod tests {
                 .keys()
                 .any(|k| k.starts_with("anthropic/claude-opus-"))
         );
+    }
+
+    fn price(input: f64, output: f64, date: Option<&str>) -> Price {
+        Price {
+            input,
+            output,
+            cache_read: None,
+            cache_write: None,
+            release_date: date.map(str::to_string),
+        }
+    }
+
+    /// LiteLLM has no release dates: the highest version wins, not the shortest id.
+    #[test]
+    fn without_release_dates_the_newest_version_wins() {
+        let mut t = PriceTable::default();
+        t.models
+            .insert("anthropic/claude-opus-5".into(), price(5.0, 25.0, None));
+        t.models
+            .insert("anthropic/claude-opus-5-5".into(), price(4.0, 20.0, None));
+        t.models.insert(
+            "anthropic/claude-opus-5-5-20260922".into(),
+            price(4.0, 20.0, None),
+        );
+        let e = m(
+            "o",
+            WorkerKind::ClaudeCode,
+            "opus",
+            "",
+            Tier::Frontier,
+            Auth::Subscription,
+        );
+        assert_eq!(t.key_for(&e).as_deref(), Some("anthropic/claude-opus-5-5"));
+    }
+
+    /// The live table lists the same model under many providers.
+    #[test]
+    fn ambiguous_ids_resolve_to_the_vendor_first() {
+        let mut t = md();
+        t.models
+            .insert("azure/claude-sonnet-5-5".into(), price(9.0, 9.0, None));
+        t.models
+            .insert("azure/gpt-6-luna".into(), price(9.0, 9.0, None));
+        let claude = m(
+            "o",
+            WorkerKind::ClaudeCode,
+            "opus",
+            "",
+            Tier::Frontier,
+            Auth::ApiKey,
+        );
+        assert_eq!(
+            price_by_actual(&claude, "claude-sonnet-5-5", &t).map(|p| p.input),
+            Some(2.0)
+        );
+        // Pi's `openai-codex` provider is priced as OpenAI.
+        let pi = m(
+            "p",
+            WorkerKind::Pi,
+            "gpt-6-luna",
+            "openai-codex",
+            Tier::Fast,
+            Auth::ApiKey,
+        );
+        assert_eq!(t.key_for(&pi).as_deref(), Some("openai/gpt-6-luna"));
+        let unknown = m(
+            "p",
+            WorkerKind::Pi,
+            "gpt-6-luna",
+            "somewhere",
+            Tier::Fast,
+            Auth::ApiKey,
+        );
+        assert_eq!(t.key_for(&unknown).as_deref(), Some("openai/gpt-6-luna"));
     }
 }

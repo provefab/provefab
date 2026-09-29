@@ -556,6 +556,7 @@ pub async fn pipeline<O: Oracle>(
             )
             .unwrap(),
         ),
+        price_attempt: std::sync::atomic::AtomicI64::new(0),
         repo_locks: Mutex::new(std::collections::HashMap::new()),
         budget: tokio::sync::Mutex::new(()),
         policy: f.policy.clone(),

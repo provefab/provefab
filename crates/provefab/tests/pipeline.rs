@@ -1196,3 +1196,30 @@ async fn stage_costs_reach_the_log_and_the_pr_body() {
     let body = p.hub.prs.lock().unwrap()[0].3.clone();
     assert!(body.contains("Cost: $"), "{body}");
 }
+
+/// Review finding 1: offline, the loop must not refetch prices on every tick.
+#[tokio::test]
+async fn a_failed_price_refresh_waits_before_trying_again() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+    let broken = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>"))
+        .mount(&broken)
+        .await;
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.config.routing.prices_url = Some(broken.uri());
+    f.config.routing.litellm_url = Some(broken.uri());
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    p.prices.write().unwrap().fetched_at = 0;
+    p.refresh_prices().await;
+    p.refresh_prices().await;
+    p.refresh_prices().await;
+    // One attempt: models.dev, then LiteLLM. Later ticks wait.
+    assert_eq!(broken.received_requests().await.unwrap().len(), 2);
+}

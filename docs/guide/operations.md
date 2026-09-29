@@ -79,7 +79,7 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do.
 | the service cannot find `claude` or `cargo` | `PATH` frozen at install time | run `provefab service install` again from a terminal where the tool is found |
 | `another provefab run is already working` | the service already runs | `provefab service uninstall` before a manual pass |
 | `price <id>: no price` in `doctor` | the model matched no known price (a new model, a typo, or a Pi provider models.dev does not list); it still runs, ranked after priced models, and its cost is not counted | set `price_id = "provider/model"`, or `price_in` and `price_out` |
-| `prices: snapshot` or an old cache in `doctor` | the machine could not reach models.dev or LiteLLM | nothing to do: routing uses the cache or the built-in prices; the service tries again the next day |
+| `prices: snapshot` or an old cache in `doctor` | the machine could not reach models.dev or LiteLLM | nothing to do: routing uses the cache or the built-in prices; the service tries again an hour later |
 | `[repos.merge] is read by Provefab Pro` warning | the config asks for auto-merge | expected with this binary: PRs open and wait for you |
 
 To dig into a task:
