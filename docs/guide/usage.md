@@ -14,7 +14,7 @@
    - stops if nothing works.
 7. **Review** by a different model provider than the implementer's. If it asks for changes, the implementer gets all of them, earlier rounds included, and must write a test for each.
 8. **Pull request.** Provefab commits, pushes and opens the PR. Its text lists the checks, the routing, and any deleted or disabled tests. It comments on the issue and sets `provefab:in-pr`. The PR then waits for your review.
-9. **Optional post-merge verification.** If you set `post_merge_checks`, Provefab runs them on the exact commit its PR produced on the base branch. A failing command is rerun once on a fresh checkout; if it passes then, the run counts as passed and the command is reported as flaky. On a confirmed failure, Provefab runs the same checks on the current base: if they pass, a later commit already fixed it and no revert is proposed. Otherwise Provefab prepares a revert on the current base and opens a revert PR only if the reverted tree passes the same checks. Revert conflicts, failing revert checks, multi-commit PRs merged by rebase, and a base branch that keeps moving require a human. Provefab never merges a revert PR. These are repository commands, not production monitoring.
+9. **Optional post-merge verification.** If you set `post_merge_checks`, Provefab runs them on the exact commit its PR produced on the base branch. A failing command is rerun once on a fresh checkout; if it passes then, the run counts as passed and the command is reported as flaky. On a confirmed failure, Provefab runs the same checks on the current base: if they pass, a later commit already fixed it and no revert is proposed. Otherwise Provefab prepares a revert on the current base and opens a revert PR only if the reverted tree passes the same checks. Revert conflicts, failing revert checks, multi-commit PRs merged by a person (Provefab cannot tell a squash from a rebase), and a base branch that keeps moving require a human. Provefab never merges a revert PR. These are repository commands, not production monitoring.
 
 ## Writing issues that land
 
@@ -58,7 +58,7 @@ What works best:
 - **routes:** for each stage, the model it ran on and why, for example `review -> sonnet-sub: subscription, quota weight 1.0 (prefer subscription)`.
 - **stage runs:** every stage, with its model, outcome, turns, tokens (`in/out`, then `(+cache read/write)` when the model cached), cost, check score and session directory (full transcript). The cost is in dollars for a model signed in by API key (`cost $0.0123`) and in quota units for a subscription (`quota 0.42`: millions of tokens times the model's quota weight). A `total:` line sums the task.
 The pull request's **Routing** section lists the model of each stage and ends with the task's cost, for example `Cost: $0.4210 API · 1.20 quota units.` A part that is zero is left out.
-- **post-merge checks:** state, failure kind, merged SHA, base tip, revert commit, revert PR link, failed commands and flaky commands. Session directories for `post-merge` and `revert-check` in **stage runs** contain command results.
+- **post-merge checks:** state, failure kind, merged SHA, base tip, revert commit, revert PR link, failed commands and flaky commands. Session directories for `post-merge`, `post-merge-base` (the same checks on the current base tip) and `revert-check` in **stage runs** contain command results.
 - **last plan / review / failure:** the latest structured answers.
 
 ## Measuring

@@ -142,7 +142,7 @@ pub struct RepoConfig {
     pub trust_pi_project: bool,
     /// Commands run in the worktree after every implement stage. At least one.
     pub gates: Vec<String>,
-    /// Explicit commands run against the squashed base commit after this repo's
+    /// Explicit commands run against the exact merge commit after this repo's
     /// Provefab-created PR is merged. Empty disables post-merge verification.
     #[serde(default)]
     pub post_merge_checks: Vec<String>,

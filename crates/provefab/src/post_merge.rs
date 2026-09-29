@@ -251,7 +251,7 @@ fn blocked_reason(kind: Option<FailureKind>) -> &'static str {
             "The revert branch or pull request on GitHub does not hold the revert Provefab prepared."
         }
         Some(FailureKind::UnsafeMergeStrategy) => {
-            "This merge cannot be undone as one commit (a multi-commit pull request merged by rebase, or an unknown merge shape), so Provefab did not verify it."
+            "This merge cannot be undone as one commit: Provefab cannot tell a squash from a rebase for a multi-commit pull request merged by a person, or the merge shape is unknown. Provefab did not verify it."
         }
         Some(FailureKind::AttributionMissing) => {
             "GitHub did not report the merge commit or its base branch, so Provefab cannot tell what to verify."
@@ -1071,6 +1071,17 @@ mod tests {
             render(&row(CheckState::Blocked, Some(FailureKind::RevertConflict)))
                 .unwrap()
                 .contains("`cargo test` exited with 101")
+        );
+        // Provefab cannot see how a person merged: it never claims a rebase.
+        let unsafe_merge = render(&row(
+            CheckState::Blocked,
+            Some(FailureKind::UnsafeMergeStrategy),
+        ))
+        .unwrap();
+        assert!(!unsafe_merge.contains("merged by rebase"), "{unsafe_merge}");
+        assert!(
+            unsafe_merge.contains("cannot tell a squash from a rebase"),
+            "{unsafe_merge}"
         );
         assert_eq!(render(&row(CheckState::Passed, None)), None);
         assert_eq!(render(&row(CheckState::Verifying, None)), None);

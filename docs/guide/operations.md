@@ -86,7 +86,7 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do.
 | `[repos.merge] is read by Provefab Pro` warning | the config asks for auto-merge | expected with this binary: PRs open and wait for you |
 
 To dig into a task:
-- read `provefab status` for the latest post-merge state (if opted in);
-- read `provefab log <id>` for the merged SHA and any revert PR URL;
+- read `provefab status` for how many post-merge checks are in each state (if opted in);
+- read `provefab log <id>` for a check's detail: state, failure kind, merged SHA and any revert PR URL;
 - read the transcripts in `~/.provefab/sessions/<id>/`;
 - read the check outputs (`gates-N` directories).
