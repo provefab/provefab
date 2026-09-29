@@ -334,6 +334,28 @@ pub fn lock(path: &Path) -> std::io::Result<Option<File>> {
 /// -s provefab-typesafe -a provefab -w <key>`).
 pub const KEYCHAIN_SERVICE: &str = "provefab-typesafe";
 
+/// Keychain service holding the user's Anthropic API key (bring your own key).
+pub const ANTHROPIC_KEYCHAIN_SERVICE: &str = "provefab-anthropic";
+
+/// Writes `apiKeyHelper` into the API-key config dir's `settings.json`, keeping
+/// any other setting: Claude Code then asks the Keychain for the key at each
+/// refresh, and the key never enters the agent's environment.
+pub fn claude_api_settings(config_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(config_dir)?;
+    let path = config_dir.join("settings.json");
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    v["apiKeyHelper"] = serde_json::Value::String(format!(
+        "security find-generic-password -s {ANTHROPIC_KEYCHAIN_SERVICE} -a provefab -w"
+    ));
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default())
+}
+
 /// `TYPESAFE_API_KEY`, else the macOS Keychain (spec §2.3).
 pub async fn typesafe_key() -> Option<String> {
     if let Some(k) = std::env::var("TYPESAFE_API_KEY")
@@ -369,6 +391,8 @@ pub struct Tools {
     pub claude: PathBuf,
     pub codex: PathBuf,
     pub pi: PathBuf,
+    /// macOS `security`, to check the Keychain holds an API key.
+    pub security: PathBuf,
 }
 
 impl Default for Tools {
@@ -379,6 +403,7 @@ impl Default for Tools {
             claude: "claude".into(),
             codex: "codex".into(),
             pi: "pi".into(),
+            security: "security".into(),
         }
     }
 }
@@ -493,8 +518,7 @@ pub async fn jev_check(client: &jev::JevClient) -> Check {
 pub async fn doctor(
     tools: &Tools,
     config: &Config,
-    claude_config: &Path,
-    codex_home: &Path,
+    paths: &Paths,
     jev: Option<&jev::JevClient>,
 ) -> Vec<Check> {
     let mut checks = vec![
@@ -502,43 +526,117 @@ pub async fn doctor(
         check("gh", probe(&tools.gh, &["--version"], &[]).await),
         check("gh login", probe(&tools.gh, &["auth", "status"], &[]).await),
     ];
-    let uses = |w: crate::config::WorkerKind| config.models.iter().any(|m| m.worker == w);
-    if uses(crate::config::WorkerKind::ClaudeCode) {
+    use crate::config::{Auth, WorkerKind};
+    let uses = |w: WorkerKind| config.models.iter().any(|m| m.worker == w);
+    let uses_mode =
+        |w: WorkerKind, a: Auth| config.models.iter().any(|m| m.worker == w && m.auth == a);
+    if uses(WorkerKind::ClaudeCode) {
         checks.push(check(
             "claude",
             probe(&tools.claude, &["--version"], &[]).await,
         ));
+    }
+    if uses_mode(WorkerKind::ClaudeCode, Auth::Subscription) {
+        let claude_config = paths.claude_config();
         checks.push(check(
             "claude login",
             probe_text(
                 &tools.claude,
                 &["auth", "status"],
-                &[("CLAUDE_CONFIG_DIR", claude_config)],
+                &[("CLAUDE_CONFIG_DIR", claude_config.as_path())],
             )
             .await
             .and_then(|t| claude_login(&t)),
         ));
     }
-    if uses(crate::config::WorkerKind::Codex) {
+    if uses_mode(WorkerKind::ClaudeCode, Auth::ApiKey) {
+        let fix = "run `provefab login claude --api-key`";
+        let key = probe(
+            &tools.security,
+            &[
+                "find-generic-password",
+                "-s",
+                ANTHROPIC_KEYCHAIN_SERVICE,
+                "-a",
+                "provefab",
+            ],
+            &[],
+        )
+        .await
+        .map(|_| format!("Keychain item `{ANTHROPIC_KEYCHAIN_SERVICE}`"))
+        .map_err(|_| format!("no Keychain item `{ANTHROPIC_KEYCHAIN_SERVICE}`: {fix}"));
+        let helper = std::fs::read_to_string(paths.claude_config_api().join("settings.json"))
+            .is_ok_and(|t| t.contains(ANTHROPIC_KEYCHAIN_SERVICE));
+        checks.push(check(
+            "claude api key",
+            key.and_then(|k| {
+                if helper {
+                    Ok(k)
+                } else {
+                    Err(format!(
+                        "the API-key config dir does not read the Keychain: {fix}"
+                    ))
+                }
+            }),
+        ));
+    }
+    if uses(WorkerKind::Codex) {
         checks.push(check(
             "codex",
             probe(&tools.codex, &["--version"], &[]).await,
         ));
+    }
+    if uses_mode(WorkerKind::Codex, Auth::Subscription) {
+        let codex_home = paths.codex_home();
         checks.push(check(
             "codex login",
             probe(
                 &tools.codex,
                 &["login", "status"],
-                &[("CODEX_HOME", codex_home)],
+                &[("CODEX_HOME", codex_home.as_path())],
             )
             .await,
         ));
         checks.push(check(
             "codex guard hook",
-            crate::codex_setup::check(&tools.codex, codex_home, codex_home)
+            crate::codex_setup::check(&tools.codex, &codex_home, &codex_home)
                 .await
                 .map(|_| "trusted, and no project is".to_string())
                 .map_err(|e| format!("{e} (run `provefab login codex`)")),
+        ));
+    }
+    if uses_mode(WorkerKind::Codex, Auth::ApiKey) {
+        let home = paths.codex_home_api();
+        let fix = "run `provefab login codex --api-key`";
+        checks.push(check(
+            "codex api login",
+            probe_text(
+                &tools.codex,
+                &["login", "status"],
+                &[("CODEX_HOME", home.as_path())],
+            )
+            .await
+            .and_then(|t| {
+                if t.to_lowercase().contains("api key") {
+                    Ok(t.lines().next().unwrap_or_default().to_string())
+                } else {
+                    Err(format!("not signed in with an API key: {fix}"))
+                }
+            })
+            .map_err(|e| {
+                if e.contains(fix) {
+                    e
+                } else {
+                    format!("{e}: {fix}")
+                }
+            }),
+        ));
+        checks.push(check(
+            "codex api guard hook",
+            crate::codex_setup::check(&tools.codex, &home, &home)
+                .await
+                .map(|_| "trusted, and no project is".to_string())
+                .map_err(|e| format!("{e} ({fix})")),
         ));
     }
     if uses(crate::config::WorkerKind::Pi) {
@@ -621,6 +719,28 @@ fn gate_shares_build_dir(gate: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// BYOK: Claude Code reads the key from the Keychain through `apiKeyHelper`,
+    /// so the key never sits in the agent's environment; other settings stay.
+    #[test]
+    fn claude_api_settings_point_at_the_keychain_and_keep_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        claude_api_settings(dir.path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(
+            v["apiKeyHelper"],
+            "security find-generic-password -s provefab-anthropic -a provefab -w"
+        );
+        // A fresh dir gets the file too.
+        let fresh = tempfile::tempdir().unwrap();
+        claude_api_settings(&fresh.path().join("claude-api")).unwrap();
+        assert!(fresh.path().join("claude-api/settings.json").exists());
+    }
+
     #[test]
     fn issue_urls() {
         assert_eq!(
@@ -690,6 +810,7 @@ mod tests {
             ),
             codex: d.join("missing-codex"),
             pi: d.join("missing-pi"),
+            security: d.join("missing-security"),
         };
         let config = Config::from_toml_str(
             r#"
@@ -703,7 +824,7 @@ tier = "standard"
 "#,
         )
         .unwrap();
-        let checks = doctor(&tools, &config, Path::new("/cfg/claude"), d, None).await;
+        let checks = doctor(&tools, &config, &Paths::new(d), None).await;
         let get = |n: &str| checks.iter().find(|c| c.name == n).cloned().unwrap();
         assert!(get("git").ok && get("gh").ok);
         assert_eq!(
@@ -721,6 +842,68 @@ tier = "standard"
         assert!(!get("jev key").ok);
         // Workers the catalog does not use are not checked.
         assert!(checks.iter().all(|c| c.name != "codex" && c.name != "pi"));
+    }
+
+    /// BYOK: only the sign-in modes the catalog uses are checked, and an
+    /// API-key model is checked for its key, not for a subscription login.
+    #[tokio::test]
+    async fn doctor_checks_the_sign_in_mode_each_model_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tools = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: fake(d, "claude", "echo '2.1.281 (Claude Code)'"),
+            codex: fake(
+                d,
+                "codex",
+                "if [ \"$1\" = login ]; then echo \"Logged in using an API key - sk-***\"; exit 0; fi; echo 'codex-cli 0.156.1'",
+            ),
+            pi: d.join("missing-pi"),
+            security: fake(d, "security", "exit 0"),
+        };
+        let config = Config::from_toml_str(
+            r#"
+[jev]
+model = "jev-1.13.0"
+[[models]]
+id = "c"
+worker = "claude-code"
+model = "sonnet"
+tier = "standard"
+auth = "api_key"
+[[models]]
+id = "x"
+worker = "codex"
+model = "gpt-6"
+tier = "standard"
+auth = "api_key"
+"#,
+        )
+        .unwrap();
+        claude_api_settings(&Paths::new(d).claude_config_api()).unwrap();
+        let checks = doctor(&tools, &config, &Paths::new(d), None).await;
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        let get = |n: &str| checks.iter().find(|c| c.name == n).cloned().unwrap();
+        assert!(get("claude api key").ok, "{:?}", get("claude api key"));
+        assert!(get("codex api login").ok, "{:?}", get("codex api login"));
+        assert!(names.contains(&"codex api guard hook"), "{names:?}");
+        // No subscription is in use, so no subscription login is checked.
+        assert!(
+            !names.contains(&"claude login") && !names.contains(&"codex login"),
+            "{names:?}"
+        );
+        // A missing key fails with the command that fixes it.
+        let tools = Tools {
+            security: fake(d, "security2", "exit 44"),
+            ..tools
+        };
+        let checks = doctor(&tools, &config, &Paths::new(d), None).await;
+        let key = checks.iter().find(|c| c.name == "claude api key").unwrap();
+        assert!(
+            !key.ok && key.detail.contains("provefab login claude --api-key"),
+            "{key:?}"
+        );
     }
 
     /// Seen live 2026-09-25: `jev.model = "jev-1.13"` passed the old key-only

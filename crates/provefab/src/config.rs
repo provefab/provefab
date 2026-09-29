@@ -17,6 +17,17 @@ pub enum WorkerKind {
     Codex,
 }
 
+/// How a Claude Code or Codex model signs in: the user's own subscription
+/// login, or the user's own API key (bring your own key, switchable per model).
+/// Pi reads its own provider credentials and ignores this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Auth {
+    #[default]
+    Subscription,
+    ApiKey,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
@@ -29,6 +40,8 @@ pub struct ModelEntry {
     pub tier: Tier,
     #[serde(default = "one")]
     pub max_concurrency: u32,
+    #[serde(default)]
+    pub auth: Auth,
 }
 
 fn one() -> u32 {
@@ -37,6 +50,15 @@ fn one() -> u32 {
 
 impl ModelEntry {
     /// Rate limits hit an account, not a model, so cooldowns are keyed on this.
+    /// What a rate limit pauses: the family, per sign-in mode. A subscription
+    /// hitting its limit leaves the same vendor's API key usable.
+    pub fn cooldown_key(&self) -> String {
+        match (self.worker, self.auth) {
+            (WorkerKind::Pi, _) | (_, Auth::Subscription) => self.provider_key(),
+            (_, Auth::ApiKey) => format!("{}:api-key", self.provider_key()),
+        }
+    }
+
     pub fn provider_key(&self) -> String {
         match self.worker {
             WorkerKind::ClaudeCode => "claude-code".to_string(),
@@ -447,6 +469,25 @@ review_rounds = 2
     }
 
     const BASE: &str = "models = []\n[jev]\nmodel = \"jev-1.13.0\"\n";
+
+    /// Each model runs on the user's subscription or an API key, and the two
+    /// modes pause separately when a limit hits (BYOK, switchable per model).
+    #[test]
+    fn auth_defaults_to_subscription_and_api_keys_cool_down_separately() {
+        let cfg = Config::from_toml_str("[jev]\nmodel = \"jev-1.13.0\"\n[[models]]\nid=\"sub\"\nworker=\"claude-code\"\nmodel=\"sonnet\"\ntier=\"standard\"\n[[models]]\nid=\"key\"\nworker=\"claude-code\"\nmodel=\"sonnet\"\ntier=\"standard\"\nauth=\"api_key\"\n")
+        .unwrap();
+        let (sub, key) = (&cfg.models[0], &cfg.models[1]);
+        assert_eq!(sub.auth, Auth::Subscription);
+        assert_eq!(key.auth, Auth::ApiKey);
+        // Same family for cross-review...
+        assert_eq!(sub.provider_key(), key.provider_key());
+        // ...but separate cooldowns.
+        assert_ne!(sub.cooldown_key(), key.cooldown_key());
+        assert_eq!(sub.cooldown_key(), "claude-code");
+        assert_eq!(key.cooldown_key(), "claude-code:api-key");
+        assert!(Config::from_toml_str("[jev]\nmodel = \"jev-1.13.0\"\n[[models]]\nid=\"x\"\nworker=\"codex\"\nmodel=\"gpt\"\ntier=\"standard\"\nauth=\"password\"\n")
+        .is_err());
+    }
 
     #[test]
     fn the_merge_table_is_kept_uninterpreted() {

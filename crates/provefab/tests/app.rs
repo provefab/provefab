@@ -26,3 +26,17 @@ fn an_extra_command_is_routed_to_its_handler() {
     let _ = run_from(ext, ["provefab-pro", "hello"]);
     assert!(RAN.load(Ordering::SeqCst));
 }
+
+/// BYOK: `provefab login <worker> --api-key` switches that worker's key login.
+#[test]
+fn login_accepts_an_api_key_flag() {
+    let cmd = cli_command(&Extensions::default());
+    for worker in ["claude", "codex"] {
+        assert!(
+            cmd.clone()
+                .try_get_matches_from(["provefab", "login", worker, "--api-key"])
+                .is_ok(),
+            "{worker}"
+        );
+    }
+}

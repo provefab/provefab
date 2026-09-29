@@ -11,8 +11,10 @@ No secret goes in `provefab.toml`.
 | Secret | Where |
 |---|---|
 | TypeSafe (Jev) key | `TYPESAFE_API_KEY` variable, otherwise the macOS Keychain: `security add-generic-password -s provefab-typesafe -a provefab -w <key>` |
-| Claude login | `provefab login claude` (directory `~/.provefab/claude`) |
-| Codex (ChatGPT) login | `provefab login codex` (directory `~/.provefab/codex`) |
+| Claude subscription login | `provefab login claude` (directory `~/.provefab/claude`) |
+| Anthropic API key | `provefab login claude --api-key`: stored in the Keychain (`provefab-anthropic`), read by Claude Code through `apiKeyHelper` (directory `~/.provefab/claude-api`) |
+| Codex (ChatGPT) subscription login | `provefab login codex` (directory `~/.provefab/codex`) |
+| OpenAI API key | `provefab login codex --api-key` (directory `~/.provefab/codex-api`) |
 | GitHub | `gh auth login` (Provefab uses `gh` and `git` with your permissions) |
 
 **Plans for work.** Provefab runs the official CLIs with whatever login you give them. For professional use, prefer a business plan (Claude Team or Enterprise, ChatGPT Business) or API keys: consumer plans can restrict commercial use (for example, Anthropic's consumer terms for EEA and Swiss residents say "Non-commercial use only"). Check your plan's terms; this is not legal advice.
@@ -37,12 +39,15 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 | `provider` | `""` | Pi only: the `--provider`. |
 | `tier` | required | `fast`, `standard` or `frontier`. |
 | `max_concurrency` | `1` | How many stages this model may run at once. |
+| `auth` | `subscription` | Claude Code and Codex only: `subscription` (your plan's login) or `api_key` (your own API key, set with `provefab login <worker> --api-key`). Pi reads its provider's own credentials. |
 
 How the tier is chosen:
 - Jev estimates the issue's difficulty and scope. Implementation takes the matching tier; planning and review take one tier above.
 - Within a tier, Provefab takes the first free model, in file order.
 - An empty tier falls back to the nearest configured one.
 - Review avoids the implementer's provider when the catalog allows it.
+
+**Subscription or API key, per model.** Each model signs in its own way, so you can switch one line and run `provefab service install`. You can also list the same model twice, subscription first and API key second, in the same tier: when the subscription hits its usage limit, that entry pauses and the API-key entry takes the next stages. Both still count as the same model family for cross-review. The daily budget (`max_stage_runs_per_day`) caps API spend too.
 
 **Tip:** list at least two providers, for example Claude and Codex, so that reviews are cross-checked by a different model family.
 

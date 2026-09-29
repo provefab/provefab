@@ -70,7 +70,7 @@ pub fn fallback_tiers() -> StageTiers {
 
 #[derive(Debug, Clone, Default)]
 pub struct Availability {
-    /// Keyed by `ModelEntry::provider_key()`.
+    /// Keyed by `ModelEntry::cooldown_key()`: family and sign-in mode.
     pub cooling_until: HashMap<String, SystemTime>,
     /// Running stages, keyed by model id.
     pub running: HashMap<String, u32>,
@@ -80,7 +80,7 @@ impl Availability {
     fn usable(&self, m: &ModelEntry, now: SystemTime) -> bool {
         let cooling = self
             .cooling_until
-            .get(&m.provider_key())
+            .get(&m.cooldown_key())
             .is_some_and(|until| *until > now);
         let running = self.running.get(&m.id).copied().unwrap_or(0);
         !cooling && running < m.max_concurrency
@@ -199,7 +199,27 @@ mod tests {
             provider: provider.into(),
             tier,
             max_concurrency: 1,
+            auth: crate::config::Auth::Subscription,
         }
+    }
+
+    /// BYOK: when the subscription is paused by a limit, the same vendor's API
+    /// key model stays usable.
+    #[test]
+    fn a_paused_subscription_leaves_the_api_key_model_usable() {
+        let sub = model("sub", WorkerKind::ClaudeCode, "", Tier::Standard);
+        let key = ModelEntry {
+            auth: crate::config::Auth::ApiKey,
+            ..model("key", WorkerKind::ClaudeCode, "", Tier::Standard)
+        };
+        let now = SystemTime::now();
+        let mut avail = Availability::default();
+        avail
+            .cooling_until
+            .insert(sub.cooldown_key(), now + Duration::from_secs(600));
+        let catalog = vec![sub, key];
+        let picked = select(Tier::Standard, &catalog, &avail, now, &[]).unwrap();
+        assert_eq!(picked.id, "key");
     }
 
     fn catalog() -> Vec<ModelEntry> {

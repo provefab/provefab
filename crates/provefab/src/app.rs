@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use crate::agents::AgentRunner;
 use crate::cli::{GuardFormat, run_guard};
 use crate::commands::{self, Tools};
-use crate::config::{Config, WorkerKind};
+use crate::config::{Auth, Config, WorkerKind};
 use crate::cooldown::Cooldowns;
 use crate::forge::{Gh, Git};
 use crate::intake::GhLabelPoller;
@@ -67,6 +67,10 @@ enum Cmd {
     Login {
         #[arg(value_enum)]
         worker: LoginWorker,
+        /// Sign this worker in with your own API key instead of your subscription
+        /// (used by catalog models with `auth = "api_key"`).
+        #[arg(long)]
+        api_key: bool,
     },
     /// Internal: check one agent tool call (JSON on stdin) against the guard policy.
     Guard {
@@ -235,8 +239,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             let checks = commands::doctor(
                 &Tools::default(),
                 &config,
-                &paths.claude_config(),
-                &paths.codex_home(),
+                &paths,
                 oracle.as_ref().map(|o| &o.client),
             )
             .await;
@@ -247,14 +250,23 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     c.detail
                 );
             }
-            let drop_claude = failed("claude") || failed("claude login");
-            let drop_codex = failed("codex") || failed("codex login") || failed("codex guard hook");
-            let drop_pi = failed("pi");
+            // Each sign-in mode stands alone: a missing subscription login
+            // never removes the same vendor's API-key models (BYOK).
             config.models.retain(|m| {
-                let gone = match m.worker {
-                    WorkerKind::ClaudeCode => drop_claude,
-                    WorkerKind::Codex => drop_codex,
-                    WorkerKind::Pi => drop_pi,
+                let gone = match (m.worker, m.auth) {
+                    (WorkerKind::ClaudeCode, Auth::Subscription) => {
+                        failed("claude") || failed("claude login")
+                    }
+                    (WorkerKind::ClaudeCode, Auth::ApiKey) => {
+                        failed("claude") || failed("claude api key")
+                    }
+                    (WorkerKind::Codex, Auth::Subscription) => {
+                        failed("codex") || failed("codex login") || failed("codex guard hook")
+                    }
+                    (WorkerKind::Codex, Auth::ApiKey) => {
+                        failed("codex") || failed("codex api login") || failed("codex api guard hook")
+                    }
+                    (WorkerKind::Pi, _) => failed("pi"),
                 };
                 if gone {
                     eprintln!(
@@ -332,8 +344,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             let checks = commands::doctor(
                 &Tools::default(),
                 &config,
-                &paths.claude_config(),
-                &paths.codex_home(),
+                &paths,
                 oracle.as_ref().map(|o| &o.client),
             )
             .await;
@@ -379,7 +390,58 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Login { worker } => {
+        Cmd::Login {
+            worker,
+            api_key: true,
+        } => {
+            match worker {
+                LoginWorker::Claude => {
+                    // The key goes to the Keychain (prompted without echo);
+                    // Claude Code reads it there through `apiKeyHelper`.
+                    println!("Enter your Anthropic API key at the Keychain prompt.");
+                    let status = std::process::Command::new("security")
+                        .args([
+                            "add-generic-password",
+                            "-U",
+                            "-s",
+                            commands::ANTHROPIC_KEYCHAIN_SERVICE,
+                            "-a",
+                            "provefab",
+                            "-w",
+                        ])
+                        .status()
+                        .context("running security")?;
+                    if !status.success() {
+                        bail!("could not store the key in the Keychain");
+                    }
+                    commands::claude_api_settings(&paths.claude_config_api())?;
+                    println!(
+                        "stored; Claude Code models with auth = \"api_key\" use it (config dir {})",
+                        paths.claude_config_api().display()
+                    );
+                }
+                LoginWorker::Codex => {
+                    let dir = paths.codex_home_api();
+                    std::fs::create_dir_all(&dir)?;
+                    println!("Paste your OpenAI API key, then press Enter and Ctrl-D.");
+                    let status = std::process::Command::new("codex")
+                        .args(["login", "--with-api-key"])
+                        .env("CODEX_HOME", &dir)
+                        .status()
+                        .context("running codex")?;
+                    if !status.success() {
+                        bail!("codex login --with-api-key failed");
+                    }
+                    codex_setup::setup("codex".as_ref(), &dir, &dir).await?;
+                    println!(
+                        "signed in; Codex models with auth = \"api_key\" use it (CODEX_HOME {}, guard hook trusted)",
+                        dir.display()
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Login { worker, .. } => {
             let (program, var, dir) = match worker {
                 LoginWorker::Claude => ("claude", "CLAUDE_CONFIG_DIR", paths.claude_config()),
                 LoginWorker::Codex => ("codex", "CODEX_HOME", paths.codex_home()),

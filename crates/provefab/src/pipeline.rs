@@ -1495,7 +1495,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 self.cooldowns
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .strike(&model.provider_key(), SystemTime::now());
+                    .strike(&model.cooldown_key(), SystemTime::now());
                 Ok(None)
             }
             Ok(o) => {
@@ -1505,7 +1505,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                     self.cooldowns
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clear(&model.provider_key(), started_at);
+                        .clear(&model.cooldown_key(), started_at);
                 }
                 Ok(Some(Ok(o)))
             }

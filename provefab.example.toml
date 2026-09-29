@@ -16,6 +16,8 @@ worker = "claude-code"           # "claude-code", "codex" or "pi"
 model = "sonnet"
 tier = "standard"                # "fast", "standard" or "frontier"
 max_concurrency = 1
+# auth = "api_key"               # your own API key instead of your subscription
+                                 # (set it once: provefab login claude --api-key)
 
 [[models]]
 id = "codex-gpt"

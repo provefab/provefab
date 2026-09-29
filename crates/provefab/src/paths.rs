@@ -45,6 +45,16 @@ impl Paths {
         self.home.join("codex")
     }
 
+    /// `CLAUDE_CONFIG_DIR` for Claude Code models signed in by API key.
+    pub fn claude_config_api(&self) -> PathBuf {
+        self.home.join("claude-api")
+    }
+
+    /// `CODEX_HOME` for Codex models signed in by API key.
+    pub fn codex_home_api(&self) -> PathBuf {
+        self.home.join("codex-api")
+    }
+
     /// The task's git worktree. Outside the user's checkout, one per task.
     pub fn worktree(&self, task_id: i64) -> PathBuf {
         self.home.join("worktrees").join(task_id.to_string())
