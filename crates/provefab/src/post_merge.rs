@@ -134,6 +134,174 @@ pub fn bounded(s: &str) -> String {
     out
 }
 
+use crate::gates::GateReport;
+use crate::store::PostMergeCheckRow;
+
+/// Commands after at most one rerun (spec section 5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Confirmed {
+    pub failed: Vec<FailedCommand>,
+    pub flaky: Vec<String>,
+    /// A command modified tracked files: its result does not describe the commit.
+    pub dirty: bool,
+}
+
+/// `rerun` holds only the commands that failed in `first`, run again on a
+/// fresh checkout. A command that passes on the rerun is flaky, not failed.
+pub fn confirm(first: &GateReport, rerun: Option<&GateReport>) -> Confirmed {
+    let mut out = Confirmed::default();
+    for r in first.results.iter().filter(|r| !r.passed) {
+        let again = rerun.and_then(|rr| rr.results.iter().find(|x| x.command == r.command));
+        match again {
+            Some(x) if x.passed => out.flaky.push(r.command.clone()),
+            Some(x) => out.failed.push(FailedCommand {
+                command: x.command.clone(),
+                exit: x.exit,
+                timed_out: x.timed_out,
+            }),
+            None => out.failed.push(FailedCommand {
+                command: r.command.clone(),
+                exit: r.exit,
+                timed_out: r.timed_out,
+            }),
+        }
+    }
+    out
+}
+
+/// How to undo a merge as one commit (spec section 6), or `None` when that
+/// cannot be done safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertPlan {
+    Plain,
+    Mainline1,
+}
+
+impl RevertPlan {
+    pub fn mainline(self) -> Option<u8> {
+        match self {
+            Self::Plain => None,
+            Self::Mainline1 => Some(1),
+        }
+    }
+}
+
+pub fn revert_plan(
+    parents: usize,
+    commit_count: Option<i64>,
+    auto_merged: bool,
+) -> Option<RevertPlan> {
+    match (parents, commit_count) {
+        (2, _) => Some(RevertPlan::Mainline1),
+        (1, Some(1)) => Some(RevertPlan::Plain),
+        // Provefab's own merges are always squashes: one commit holds the whole PR.
+        (1, Some(n)) if n > 1 && auto_merged => Some(RevertPlan::Plain),
+        _ => None,
+    }
+}
+
+/// Local summary of confirmed failures (bounded by the store).
+pub fn failure_summary(failed: &[FailedCommand]) -> String {
+    command_lines(failed)
+}
+
+fn command_lines(failed: &[FailedCommand]) -> String {
+    failed
+        .iter()
+        .map(|f| {
+            let how = if f.timed_out {
+                "timed out".to_string()
+            } else {
+                match f.exit {
+                    Some(code) => format!("exited with {code}"),
+                    None => "was killed".to_string(),
+                }
+            };
+            format!("- `{}` {how}", f.command)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn marker(check_id: i64) -> String {
+    format!("<!-- provefab-post-merge:{check_id} -->")
+}
+
+fn blocked_reason(kind: Option<FailureKind>) -> &'static str {
+    match kind {
+        Some(FailureKind::InfraError) => {
+            "Provefab could not finish after repeated infrastructure errors. Details are in the local provefab log."
+        }
+        Some(FailureKind::RevertConflict) => {
+            "The checks failed, and reverting the merge does not apply cleanly on the current base."
+        }
+        Some(FailureKind::RevertChecksFailed) => {
+            "The checks failed, and the proposed revert does not pass them either."
+        }
+        Some(FailureKind::BaseMoved) => {
+            "The base branch kept moving while Provefab prepared the revert."
+        }
+        Some(FailureKind::BaseDiverged) => {
+            "The merged commit is no longer an ancestor of the base branch."
+        }
+        Some(FailureKind::BranchConflict) => {
+            "The revert branch or pull request on GitHub does not hold the revert Provefab prepared."
+        }
+        Some(FailureKind::UnsafeMergeStrategy) => {
+            "This merge cannot be undone as one commit (a multi-commit pull request merged by rebase, or an unknown merge shape), so Provefab did not verify it."
+        }
+        Some(FailureKind::AttributionMissing) => {
+            "GitHub did not report the merge commit or its base branch, so Provefab cannot tell what to verify."
+        }
+        Some(FailureKind::DirtyTree) => {
+            "A check modified tracked files, so its result does not describe the committed tree."
+        }
+        Some(FailureKind::CheckFailed) | None => {
+            "The checks failed and no safe revert could be prepared."
+        }
+    }
+}
+
+/// The comment for a finished check, or `None` when nothing is published
+/// (a pass, or a state that is not terminal). Fixed templates only (spec section 7).
+pub fn render(row: &PostMergeCheckRow) -> Option<String> {
+    let sha = &row.merge_sha;
+    let failed = if row.failed_commands.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nFailed checks:\n{}",
+            command_lines(&row.failed_commands)
+        )
+    };
+    let text = match row.state {
+        CheckState::Superseded => format!(
+            "Provefab post-merge checks failed on the merged commit `{sha}`.{failed}\n\nThe current `{}` tip `{}` passes the same checks, so no revert is proposed.",
+            row.base,
+            row.base_sha.as_deref().unwrap_or("unknown")
+        ),
+        CheckState::RevertOpen => format!(
+            "Provefab post-merge checks failed on the merged commit `{sha}`.{failed}\n\nA revert pull request is open for human review: {}\nProvefab will not merge it automatically.",
+            row.revert_pr_url.as_deref().unwrap_or("unknown")
+        ),
+        CheckState::Blocked => format!(
+            "Provefab post-merge verification of `{sha}` needs a human. {}{failed}",
+            blocked_reason(row.failure_kind)
+        ),
+        _ => return None,
+    };
+    Some(format!("{text}\n\n{}", marker(row.id)))
+}
+
+pub fn revert_pr_body(original_pr: &str, issue_url: &str, row: &PostMergeCheckRow) -> String {
+    format!(
+        "## Provefab post-merge verification failed\n\nOriginal pull request: {original_pr}\nIssue: {issue_url}\nMerged commit: `{}`\nBase tip: `{}`\n\nThese checks failed on the merged commit and still fail on the current base:\n\n{}\n\nThe reverted tree passes the same checks.\n\nProvefab will not merge this revert automatically.\n",
+        row.merge_sha,
+        row.base_sha.as_deref().unwrap_or("unknown"),
+        command_lines(&row.failed_commands)
+    )
+}
+
 impl<R, O, H> Pipeline<R, O, H>
 where
     R: StageRunner + Sync,
@@ -150,6 +318,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gates::{GateReport, GateResult, ProgressScore};
 
     #[test]
     fn states_and_kinds_round_trip_and_reject_unknown_text() {
@@ -174,5 +343,154 @@ mod tests {
                 CheckState::Blocked
             ]
         );
+    }
+
+    fn result(command: &str, passed: bool, exit: Option<i32>, timed_out: bool) -> GateResult {
+        GateResult {
+            command: command.into(),
+            exit,
+            passed,
+            timed_out,
+            output_tail: "SENTINEL_SECRET_42 /Users/someone/.provefab".into(),
+            failing_tests: 0,
+            error_lines: 0,
+        }
+    }
+
+    fn report(results: Vec<GateResult>) -> GateReport {
+        GateReport {
+            results,
+            score: ProgressScore::default(),
+        }
+    }
+
+    #[test]
+    fn a_rerun_rescue_is_flaky_and_a_repeat_failure_is_confirmed() {
+        let first = report(vec![
+            result("a", false, Some(1), false),
+            result("b", true, Some(0), false),
+            result("c", false, None, true),
+        ]);
+        let rerun = report(vec![
+            result("a", true, Some(0), false),
+            result("c", false, None, true),
+        ]);
+        let c = confirm(&first, Some(&rerun));
+        assert_eq!(c.flaky, ["a"]);
+        assert_eq!(
+            c.failed,
+            [FailedCommand {
+                command: "c".into(),
+                exit: None,
+                timed_out: true
+            }]
+        );
+        let clean = confirm(&report(vec![result("b", true, Some(0), false)]), None);
+        assert!(clean.failed.is_empty() && clean.flaky.is_empty());
+    }
+
+    #[test]
+    fn revert_plans_follow_the_merge_shape() {
+        assert_eq!(revert_plan(2, Some(5), false), Some(RevertPlan::Mainline1));
+        assert_eq!(revert_plan(1, Some(1), false), Some(RevertPlan::Plain));
+        assert_eq!(revert_plan(1, Some(4), true), Some(RevertPlan::Plain));
+        assert_eq!(revert_plan(1, Some(4), false), None);
+        assert_eq!(revert_plan(1, None, true), None);
+        assert_eq!(revert_plan(3, Some(1), false), None);
+        assert_eq!(revert_plan(0, Some(1), false), None);
+        assert_eq!(RevertPlan::Mainline1.mainline(), Some(1));
+        assert_eq!(RevertPlan::Plain.mainline(), None);
+    }
+
+    #[test]
+    fn bounded_never_splits_a_character() {
+        let s = "é".repeat(SUMMARY_MAX + 10);
+        let b = bounded(&s);
+        assert_eq!(b.chars().count(), SUMMARY_MAX);
+        assert!(b.ends_with("..."));
+        assert_eq!(bounded("short"), "short");
+    }
+
+    fn row(state: CheckState, kind: Option<FailureKind>) -> crate::store::PostMergeCheckRow {
+        crate::store::PostMergeCheckRow {
+            id: 42,
+            task_id: 7,
+            merge_sha: "abc123".into(),
+            base: "main".into(),
+            commit_count: Some(1),
+            auto_merged: false,
+            state,
+            failure_kind: kind,
+            failure_summary: Some(
+                "SENTINEL_SECRET_42 at /Users/someone/.provefab/post-merge".into(),
+            ),
+            failed_commands: vec![FailedCommand {
+                command: "cargo test".into(),
+                exit: Some(101),
+                timed_out: false,
+            }],
+            flaky: vec![],
+            base_sha: Some("def456".into()),
+            revert_sha: Some("fed789".into()),
+            revert_branch: Some("provefab/revert-42-0".into()),
+            revert_pr_url: Some("https://github.com/o/r/pull/100".into()),
+            base_moves: 0,
+            infra_errors: 0,
+            started_at: None,
+            finished_at: None,
+            issue_notified_at: None,
+            pr_notified_at: None,
+        }
+    }
+
+    #[test]
+    fn every_published_text_is_a_fixed_template_with_its_marker() {
+        let mut outcomes = vec![
+            row(CheckState::Superseded, Some(FailureKind::CheckFailed)),
+            row(CheckState::RevertOpen, Some(FailureKind::CheckFailed)),
+        ];
+        for k in FailureKind::ALL {
+            outcomes.push(row(CheckState::Blocked, Some(k)));
+        }
+        for r in &outcomes {
+            let body = render(r).expect("terminal failure outcomes are published");
+            assert!(body.ends_with(&marker(42)), "{body}");
+            assert!(!body.contains("SENTINEL_SECRET_42"), "{body}");
+            assert!(!body.contains("/Users/"), "{body}");
+            assert!(!body.contains('\u{2014}'), "no em-dash: {body}");
+            assert!(body.contains("abc123"), "{body}");
+        }
+        assert!(
+            render(&row(CheckState::RevertOpen, None))
+                .unwrap()
+                .contains("https://github.com/o/r/pull/100")
+        );
+        assert!(
+            render(&row(CheckState::Blocked, Some(FailureKind::RevertConflict)))
+                .unwrap()
+                .contains("`cargo test` exited with 101")
+        );
+        assert_eq!(render(&row(CheckState::Passed, None)), None);
+        assert_eq!(render(&row(CheckState::Verifying, None)), None);
+    }
+
+    #[test]
+    fn the_revert_pr_body_names_both_commits_and_never_auto_merges() {
+        let body = revert_pr_body(
+            "https://github.com/o/r/pull/8",
+            "https://github.com/o/r/issues/7",
+            &row(CheckState::RevertReady, Some(FailureKind::CheckFailed)),
+        );
+        for needle in [
+            "https://github.com/o/r/pull/8",
+            "https://github.com/o/r/issues/7",
+            "abc123",
+            "def456",
+            "`cargo test` exited with 101",
+            "Provefab will not merge this revert automatically.",
+        ] {
+            assert!(body.contains(needle), "{needle} missing from {body}");
+        }
+        assert!(!body.contains("SENTINEL_SECRET_42") && !body.contains('\u{2014}'));
     }
 }
