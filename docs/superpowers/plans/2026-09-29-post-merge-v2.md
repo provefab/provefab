@@ -1097,7 +1097,7 @@ fn commit_and_push(repo: &Path, file: &str, content: &str, msg: &str) -> String 
 async fn git_helpers_revert_exactly_and_never_reuse_residue() {
     let f = fixture(&["true"]);
     let repo = f.config.repos[0].path_in(&f.home);
-    let g = provefab::forge::Git::default();
+    let g = provefab::forge::Git { program: "git".into() };
     let sha = commit_and_push(&repo, "README.md", "broken\n", "change");
     assert_eq!(g.parent_count(&repo, &sha).await.unwrap(), 1);
 
@@ -1136,7 +1136,7 @@ async fn git_helpers_revert_exactly_and_never_reuse_residue() {
 async fn a_merge_commit_reverts_with_mainline_one() {
     let f = fixture(&["true"]);
     let repo = f.config.repos[0].path_in(&f.home);
-    let g = provefab::forge::Git::default();
+    let g = provefab::forge::Git { program: "git".into() };
     git(&repo, &["switch", "-qc", "feature"]);
     std::fs::write(repo.join("README.md"), "broken\n").unwrap();
     git(&repo, &["commit", "-qam", "feature"]);
@@ -1722,7 +1722,7 @@ async fn a_green_merge_passes_in_two_ticks_and_posts_nothing() {
 
 #[tokio::test]
 async fn a_failure_rescued_by_its_rerun_is_flaky_not_failed() {
-    let (f, p, id, _) = setup(&["true"], "hello\n").await;
+    let (f, p, id, _) = setup(&["true"], "hello world\n").await;
     let mark = f.home.join("flaky-mark");
     let cmd = format!("test -f {0} || {{ touch {0}; false; }}", mark.display());
     let mut p = p;
@@ -1734,7 +1734,7 @@ async fn a_failure_rescued_by_its_rerun_is_flaky_not_failed() {
 
 #[tokio::test]
 async fn a_failure_twice_is_confirmed_and_timeouts_count_as_failures() {
-    let (_f, p, id, _) = setup(&["sleep 5"], "hello\n").await;
+    let (_f, p, id, _) = setup(&["sleep 5"], "hello world\n").await;
     let mut p = p;
     p.config.limits.gate_timeout = std::time::Duration::from_millis(300);
     tick(&p, id).await;
@@ -1772,7 +1772,7 @@ async fn a_human_merged_multi_commit_pr_is_blocked_before_running_anything() {
 
 #[tokio::test]
 async fn a_removed_repo_or_emptied_checks_leave_rows_untouched() {
-    let (_f, p, id, _) = setup(&["true"], "hello\n").await;
+    let (_f, p, id, _) = setup(&["true"], "hello world\n").await;
     let mut p = p;
     p.config.repos[0].post_merge_checks.clear();
     p.process_post_merge(id).await.unwrap();
