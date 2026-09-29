@@ -1,5 +1,58 @@
 # Handoff — Provefab feature 1: post-merge verification
 
+## v2 state machine (2026-09-29)
+
+Branch: `feature/post-merge-v2` (not pushed). Spec: `docs/specs/2026-09-29-post-merge-verification-design.md` (revision 2).
+
+Commits (`git log --oneline main..HEAD`, before this ledger commit):
+
+```
+c553a73 post-merge tests: replay per non-terminal state, no worktree after an infra error
+cda7527 post-merge: status counts, detailed log, stats per outcome; docs for rev 2
+3bb2dbb post-merge: per-target error counts, pending-effect dedupe, marker assertion
+81ebd15 post-merge: per-target notices by check id, marker dedupe, bounded give-up
+cb5acaa post-merge: revert_ready with base-race restart, exact-sha push and PR head check
+df2036c forge: remote_branch_sha matches the exact ref only
+56fb1ba post-merge: create the revert branch only after the revert checks pass
+3a0885c post-merge: current-base check (superseded) and revert preparation per merge shape
+9341b5f post-merge: state driver, verifying with one rerun, bounded infra errors, worktree guard
+8d6a328 post-merge: another base never waits or blocks; unreadable merge_seen counts as expired
+8b468e5 post-merge: attribution from GitHub only (1 h wait, no inferred base), advance every tick
+0910515 post-merge: exact git helpers (fresh worktrees, parent count, mainline revert, sha push) and FakeHub revert PRs
+57733e9 post-merge: rerun confirmation, revert plan per merge shape, fixed GitHub templates
+e55c652 post-merge: explicit check states and compare-and-set store (spec rev 2, section 5 and 10)
+45304e7 plan: fix two test-input defects found in pre-flight
+bee6549 docs: post-merge v2 spec amendments and implementation plan
+7f2f72a wip: post-merge verification v1 (baseline before v2 state machine)
+```
+
+Final checks (run after the last test commit):
+
+- `cargo fmt -- --check`: clean
+- `cargo clippy --all-targets --all-features -- -D warnings`: `Finished` with no warnings
+- `cargo nextest run --all-features`: `Summary [  22.267s] 374 tests run: 374 passed, 11 skipped`
+
+Real run on GitHub: not done, awaiting the owner's explicit go (it creates a repository).
+
+Spec section 12 coverage map (`tests/post_merge.rs` unless noted). Deviation, recorded in the plan's Global Constraints: tests use real git in tempdirs and a fake Hub, not a fake Git.
+
+- Each transition and a replay per non-terminal state: `a_green_merge_passes_in_two_ticks_and_posts_nothing`, `a_broken_base_prepares_a_revert_that_passes`, `a_failing_merge_opens_exactly_one_human_reviewed_revert`, `replaying_any_non_terminal_state_still_ends_in_one_revert_pr` (added in task 10).
+- Rerun rescues / two failures / timeout: `a_failure_rescued_by_its_rerun_is_flaky_not_failed`, `a_failure_twice_is_confirmed_and_timeouts_count_as_failures`.
+- Green current base is `superseded`: `a_fix_already_on_the_base_supersedes_the_revert`.
+- Section 6 rows: `src/post_merge.rs` unit test `revert_plans_follow_the_merge_shape`, `a_merge_commit_is_reverted_with_mainline_one`, `a_merge_commit_reverts_with_mainline_one`, `a_human_merged_multi_commit_pr_is_blocked_before_running_anything`, `an_auto_merge_is_recorded_on_the_check`.
+- Base moves in `revert_ready`, third move blocks: `a_moving_base_restarts_then_blocks_on_the_third_move`.
+- Remote branch on another SHA / reused PR with another head: `a_foreign_commit_on_the_revert_branch_blocks`, `a_reused_pr_on_other_work_blocks`.
+- Notifications (issue ok / PR error / retry, per check id): `a_failed_pr_comment_is_retried_without_a_second_issue_comment`, `each_check_is_announced_by_its_own_id`, `issue_failures_do_not_count_against_the_pr_target`, `a_target_that_keeps_failing_is_given_up_after_the_limit`, `a_superseded_check_is_announced_once`.
+- No stderr or path in published text: `nothing_published_contains_command_output_or_local_paths`.
+- Missing SHA past 1 h / missing base: `missing_attribution_waits_an_hour_then_blocks`, `a_missing_base_is_never_inferred`.
+- 5 infra errors block, success resets: `five_infra_errors_block_the_check`, `a_pr_creation_error_resumes_without_a_second_branch_or_pr` (count back to 0 after success).
+- No worktree after terminal or error paths: `crash_residue_that_looks_green_is_never_reused`, `a_conflicting_revert_is_blocked`, `a_broken_base_prepares_a_revert_that_passes`, `an_infra_error_path_leaves_no_worktree` (added in task 10).
+- Opt-in does not check old merges: `opting_in_later_never_checks_an_old_merge`.
+- Existing merged/reopened/archived behaviour unchanged: pre-existing suites `tests/pipeline.rs`, `tests/autonomy.rs`, `tests/scheduler.rs` pass.
+
+Review concerns below (section "Important unfinished items"): 1-9 and 12 are closed by v2. 10 (docs/landing consistency) and 11 (Pro lock/build) remain release steps.
+
+
 Date: 2026-09-29  
 Status: implementation drafted locally, tests passing, v0.1.1 binaries built and notarized locally; **nothing published or deployed**.
 

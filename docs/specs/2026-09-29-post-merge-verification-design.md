@@ -1,7 +1,7 @@
 # Post-merge verification and safe rollback
 
 - Date: 2026-09-29 (revision 2, same day)
-- Status: revision 2 approved in conversation; awaiting written-spec review. Release v0.1.1 unpublished.
+- Status: revision 2 implemented on feature/post-merge-v2; real GitHub run and release pending the owner's go.
 - Scope: Provefab-created pull requests only
 - Supersedes: revision 1 of this file (single `process_post_merge` function with implicit states). Revision 1 decisions in section 13 still hold unless amended there.
 
