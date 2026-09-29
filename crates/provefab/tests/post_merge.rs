@@ -856,6 +856,8 @@ async fn nothing_published_contains_command_output_or_local_paths() {
     let mut published: Vec<String> = p.hub.posted.lock().unwrap().clone();
     published.extend(p.hub.prs.lock().unwrap().iter().map(|pr| pr.3.clone()));
     assert!(!published.is_empty());
+    let mark = provefab::post_merge::marker(check(&p, id).await.id);
+    assert!(published.iter().any(|b| b.contains(&mark)));
     for body in published {
         assert!(!body.contains("SENTINEL_SECRET_42"), "{body}");
         assert!(!body.contains(&home), "{body}");
@@ -872,5 +874,30 @@ async fn a_superseded_check_is_announced_once() {
     tick(&p, id).await;
     tick(&p, id).await;
     let c = check(&p, id).await;
+    assert_eq!((issue_markers(&p, c.id), pr_markers(&p, c.id)), (1, 1));
+}
+
+#[tokio::test]
+async fn issue_failures_do_not_count_against_the_pr_target() {
+    use std::sync::atomic::Ordering;
+    let (_f, p, id, _) = setup(&["false"], "broken\n").await;
+    // Drive to the terminal state, then fail issue reads N-1 times.
+    p.hub.comments_down.store(true, Ordering::SeqCst);
+    let mut n = 0;
+    while check(&p, id).await.state != CheckState::Blocked && n < 30 {
+        let _ = p.process_post_merge(id).await;
+        n += 1;
+    }
+    while check(&p, id).await.infra_errors < provefab::post_merge::INFRA_ERROR_LIMIT - 1 {
+        let _ = p.process_post_merge(id).await;
+    }
+    assert!(check(&p, id).await.issue_notified_at.is_none());
+    p.hub.comments_down.store(false, Ordering::SeqCst);
+    p.hub.pr_comment_failures.store(1, Ordering::SeqCst);
+    for _ in 0..6 {
+        let _ = p.process_post_merge(id).await;
+    }
+    let c = check(&p, id).await;
+    assert!(c.issue_notified_at.is_some() && c.pr_notified_at.is_some());
     assert_eq!((issue_markers(&p, c.id), pr_markers(&p, c.id)), (1, 1));
 }

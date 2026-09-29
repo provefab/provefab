@@ -815,7 +815,14 @@ where
                     .await?
                     .iter()
                     .any(|c| c.body.contains(&mark));
-                if !seen {
+                // A queued effect from a crashed earlier tick already carries it.
+                let queued = self
+                    .store
+                    .pending_github()
+                    .await?
+                    .iter()
+                    .any(|(_, t, e)| *t == task.id && e.to_string().contains(&mark));
+                if !seen && !queued {
                     self.tell(task.id, &repo.slug, task.issue_number, &body)
                         .await?;
                 }
@@ -861,6 +868,7 @@ where
     ) -> Result<(), PipelineError> {
         match posted {
             Ok(()) => {
+                self.store.reset_post_merge_infra_errors(check.id).await?;
                 self.store
                     .mark_post_merge_notified(check.id, target)
                     .await?;
@@ -873,6 +881,7 @@ where
                         "provefab: gave up notifying {target:?} for post-merge check {}: {e}",
                         check.id
                     );
+                    self.store.reset_post_merge_infra_errors(check.id).await?;
                     self.store
                         .mark_post_merge_notified(check.id, target)
                         .await?;

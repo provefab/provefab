@@ -563,6 +563,14 @@ impl Store {
         Ok(n)
     }
 
+    pub async fn reset_post_merge_infra_errors(&self, id: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE post_merge_checks SET infra_errors = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn mark_post_merge_notified(
         &self,
         id: i64,
