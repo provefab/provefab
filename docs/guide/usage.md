@@ -57,6 +57,10 @@ What works best:
 - **stage runs:** every stage, with its model, outcome, turns, tokens, check score and session directory (full transcript).
 - **last plan / review / failure:** the latest structured answers.
 
+## Measuring
+
+`provefab stats` sums up each repository: how many issues became pull requests, how many were merged (automatically or by a person), closed or reopened after a merge, the median time from issue to pull request, and which reviewers approved the merged ones. Automatic merges are counted from the version that introduced the command on.
+
 ## Trying it safely
 
 `provefab run --dry-run` classifies and routes every open labelled issue and prints one line per issue. It runs no agent, posts nothing and changes no label. Use it to tune Jev's thresholds or to check a new repository.

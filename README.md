@@ -1,8 +1,8 @@
 # Provefab
 
-Provefab turns labelled GitHub issues into tested, reviewed pull requests.
+Provefab turns labelled GitHub issues into pull requests that arrive green, reviewed by a second model, with their evidence.
 
-It runs on your Mac as a service. AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI and your own login), and Jev, TypeSafe's classifier, picks the right model for each stage. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
+It runs on your Mac as a service. AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI, signed in with your own plan or your own API key, chosen per model), and Jev, TypeSafe's classifier, picks the right model for each stage. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
 
 ```
 issue labelled `provefab`
@@ -13,7 +13,7 @@ issue labelled `provefab`
   -> Provefab commits and pushes, opens the PR, comments on the issue
 ```
 
-The pull request then waits for you. Guarded auto-merge (a second reviewer on another model, then deterministic merge conditions) is part of Provefab Pro and is not in this repository.
+The pull request then waits for your click. Provefab Pro adds a second reviewer on another model and merge policies (auto-merge small, tested changes under fail-closed conditions); it is not in this repository.
 
 ## Quick start
 
@@ -24,8 +24,11 @@ Requirements: macOS, Rust 1.96 or newer, `git` and `gh` (signed in with `gh auth
 cargo install --path crates/provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
-provefab login claude        # Claude account (subscription or key), in ~/.provefab/claude
-provefab login codex         # ChatGPT account, in ~/.provefab/codex, and trust for the guard hook
+provefab login claude        # Claude plan login, in ~/.provefab/claude
+provefab login codex         # ChatGPT plan login, in ~/.provefab/codex, and trust for the guard hook
+# ...or your own API keys, for models with auth = "api_key" (see docs/guide/configuration.md):
+provefab login claude --api-key
+provefab login codex --api-key
 
 # 3. Jev (TypeSafe) key, in the macOS Keychain. Without a key, Provefab runs
 #    with cautious defaults.
@@ -53,6 +56,7 @@ Then put the `provefab` label on an issue. Provefab picks it up at its next poll
 | see everything about one task (routing, stages, checks, plan, reviews) | `provefab log <id>` |
 | queue an issue by hand, or restart a stopped task | `provefab add <issue-url>` |
 | check tools, logins, Jev and repositories | `provefab doctor` |
+| measure: PRs opened, merged (automatically or by hand), reviewers | `provefab stats` |
 | see whether the service runs | `provefab service status` |
 | follow the service live | `tail -f ~/.provefab/logs/run.log` |
 | stop the service | `provefab service uninstall` |

@@ -44,7 +44,8 @@ Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume 
 | `~/.provefab/repos/` | the clones Provefab manages |
 | `~/.provefab/worktrees/<id>/` | a task's worktree, removed after the merge |
 | `~/.provefab/sessions/<id>/` | agent transcripts and check outputs, per stage |
-| `~/.provefab/claude/`, `~/.provefab/codex/` | worker logins, kept apart from your own sessions |
+| `~/.provefab/claude/`, `~/.provefab/codex/` | worker plan logins, kept apart from your own sessions |
+| `~/.provefab/claude-api/`, `~/.provefab/codex-api/` | worker API-key sign-ins (the Anthropic key itself stays in the Keychain) |
 | `~/.provefab/bin/provefab` | the binary the service runs |
 
 `PROVEFAB_HOME` moves all of this elsewhere.
@@ -69,6 +70,9 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do.
 | `jev key missing` | no key | `security add-generic-password -s provefab-typesafe -a provefab -w <key>` |
 | `claude login FAIL` | Claude session missing or expired | `provefab login claude` |
 | `codex guard hook FAIL` | the Codex guard hook is not trusted | `provefab login codex` |
+| `claude api key FAIL` | a model has `auth = "api_key"` but no key is stored, or the API-key config dir does not read it | `provefab login claude --api-key` |
+| `codex api login FAIL` or `codex api guard hook FAIL` | Codex is not signed in with an API key in `~/.provefab/codex-api` | `provefab login codex --api-key` |
+| a model's plan keeps hitting its usage limit | the subscription is paused until the limit resets | add the same model with `auth = "api_key"` in the same tier: it takes over while the plan is paused |
 | `model ... removed: its worker is not ready` in the log | its worker is not installed or not signed in; Provefab dropped it from the catalog at startup | fix the matching `doctor` line, then `provefab service install` |
 | every task in `waiting` | every model of the tier is paused, or the daily budget is reached | `provefab status` gives the reason; wait, or widen the catalog or the budget |
 | the service cannot find `claude` or `cargo` | `PATH` frozen at install time | run `provefab service install` again from a terminal where the tool is found |
