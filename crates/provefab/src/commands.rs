@@ -543,6 +543,49 @@ pub async fn jev_check(client: &jev::JevClient) -> Check {
 }
 
 /// `provefab doctor` (spec §2.2, §7): tools, logins, Jev, repos.
+/// Prices doctor reports (D71): the table in use, and each model's price.
+/// Doctor never fetches: the cache, else the built-in snapshot.
+fn price_checks(config: &Config, paths: &Paths) -> Vec<Check> {
+    use crate::prices;
+    let table = prices::cached(paths).unwrap_or_else(prices::snapshot);
+    let age = if table.source == "snapshot" {
+        "built-in snapshot".to_string()
+    } else {
+        format!(
+            "{} h old",
+            (crate::store::now() - table.fetched_at).max(0) / 3600
+        )
+    };
+    let mut checks = vec![Check {
+        name: "prices".into(),
+        ok: true,
+        detail: format!("{}, {age}, {} models", table.source, table.models.len()),
+    }];
+    for m in &config.models {
+        let detail = match prices::price_of(m, &table) {
+            Some(p) => {
+                let key = if m.price_in.is_some() && m.price_out.is_some() {
+                    "set in provefab.toml".to_string()
+                } else {
+                    m.price_id
+                        .clone()
+                        .or_else(|| table.key_for(m))
+                        .unwrap_or_default()
+                };
+                format!("${}/${} per M ({key})", p.input, p.output)
+            }
+            // A warning, not a failure: the model stays usable, ranked last.
+            None => "no price: ranked last; set price_id or price_in/price_out".into(),
+        };
+        checks.push(Check {
+            name: format!("price {}", m.id),
+            ok: true,
+            detail,
+        });
+    }
+    checks
+}
+
 pub async fn doctor(
     tools: &Tools,
     config: &Config,
@@ -680,6 +723,7 @@ pub async fn doctor(
             ),
         }),
     }
+    checks.extend(price_checks(config, paths));
     for repo in &config.repos {
         let path = repo.path();
         if repo.managed() && !path.join(".git").exists() {
@@ -870,6 +914,58 @@ tier = "standard"
         assert!(!get("jev key").ok);
         // Workers the catalog does not use are not checked.
         assert!(checks.iter().all(|c| c.name != "codex" && c.name != "pi"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_prices_and_unpriced_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tools = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: fake(d, "claude", "echo '2.1.281 (Claude Code)'"),
+            codex: fake(d, "codex", "echo 'codex 0.50'"),
+            pi: d.join("missing-pi"),
+            security: d.join("missing-security"),
+        };
+        let paths = Paths::new(d);
+        let mut table = crate::prices::PriceTable::from_models_dev(
+            include_str!("../tests/fixtures/prices/models_dev.json"),
+            crate::store::now() - 7200,
+        )
+        .unwrap();
+        table.source = "models.dev".into();
+        std::fs::write(paths.prices(), serde_json::to_string(&table).unwrap()).unwrap();
+        let config = Config::from_toml_str(
+            r#"
+[jev]
+model = "jev-1.13"
+[[models]]
+id = "c"
+worker = "claude-code"
+model = "sonnet"
+tier = "standard"
+[[models]]
+id = "typo"
+worker = "codex"
+model = "gpt-typo"
+tier = "standard"
+auth = "api_key"
+"#,
+        )
+        .unwrap();
+        let checks = doctor(&tools, &config, &paths, None).await;
+        let get = |n: &str| checks.iter().find(|c| c.name == n).cloned().unwrap();
+        let prices = get("prices");
+        assert!(
+            prices.ok && prices.detail.contains("models.dev"),
+            "{prices:?}"
+        );
+        assert!(prices.detail.contains("2 h"), "{prices:?}");
+        let c = get("price c");
+        assert!(c.ok && c.detail.contains('$'), "{c:?}");
+        let typo = get("price typo");
+        assert!(typo.ok && typo.detail.contains("no price"), "{typo:?}");
     }
 
     /// BYOK: only the sign-in modes the catalog uses are checked, and an

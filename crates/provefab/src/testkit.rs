@@ -551,7 +551,8 @@ pub async fn pipeline<O: Oracle>(
         prices: std::sync::RwLock::new(
             crate::prices::PriceTable::from_models_dev(
                 include_str!("../tests/fixtures/prices/models_dev.json"),
-                1,
+                // Fresh, so the loop never refreshes (fetches) in tests.
+                crate::store::now(),
             )
             .unwrap(),
         ),

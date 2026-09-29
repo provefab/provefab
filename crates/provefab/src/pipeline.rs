@@ -1364,6 +1364,31 @@ Please reply with what should happen, what happens instead, and how to reproduce
         Ok(select(tier, &catalog, &avail, SystemTime::now(), &avoid).cloned())
     }
 
+    /// Swaps in a newer price table once the one held is a day old (D71). Cheap
+    /// when fresh: only the timestamp is compared.
+    pub async fn refresh_prices(&self) {
+        let fetched_at = self
+            .prices
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fetched_at;
+        if now() - fetched_at < crate::prices::MAX_AGE {
+            return;
+        }
+        let url = self
+            .config
+            .routing
+            .prices_url
+            .as_deref()
+            .unwrap_or(crate::prices::MODELS_DEV_URL);
+        let fresh =
+            crate::prices::load(&self.paths, [url, crate::prices::LITELLM_URL], now()).await;
+        *self
+            .prices
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+    }
+
     /// The catalog in `[routing] prefer` order, so `select` tries the cheapest
     /// usable model of the tier first (D73).
     fn ordered_models(&self) -> Vec<ModelEntry> {

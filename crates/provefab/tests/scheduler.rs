@@ -365,3 +365,32 @@ async fn polling_watches_open_prs() {
         1
     );
 }
+
+/// The service swaps in a newer price table once the one it holds is a day old.
+#[tokio::test]
+async fn the_loop_refreshes_stale_prices_from_the_cache() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    // A fresh cache on disk (no fetch), a stale table in memory.
+    let mut cached = p.prices.read().unwrap().clone();
+    cached.source = "seeded".into();
+    cached.fetched_at = provefab::store::now();
+    std::fs::write(p.paths.prices(), serde_json::to_string(&cached).unwrap()).unwrap();
+    p.prices.write().unwrap().fetched_at = 0;
+    let p = std::sync::Arc::new(p);
+    let source = FakeSource(p.hub.issue.clone());
+    let opts = provefab::scheduler::RunOptions {
+        workers: 1,
+        once: true,
+    };
+    provefab::scheduler::run(p.clone(), &source, opts, std::future::pending::<()>())
+        .await
+        .unwrap();
+    assert_eq!(p.prices.read().unwrap().source, "seeded");
+}

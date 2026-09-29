@@ -124,6 +124,7 @@ where
     let mut retry_at: HashMap<i64, Instant> = HashMap::new();
     let mut polled_once = false;
     loop {
+        p.refresh_prices().await;
         if !(opts.once && polled_once) {
             p.retry_pending(&in_flight).await;
             for repo in &p.config.repos {
