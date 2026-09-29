@@ -50,6 +50,22 @@ async fn git_helpers_revert_exactly_and_never_reuse_residue() {
     );
     let revert = g.head(&wt).await.unwrap();
 
+    // Decoy refs that tail-match the branch name are ignored.
+    for decoy in [
+        "refs/heads/decoy/provefab/revert-1-0",
+        "refs/heads/x/refs/heads/provefab/revert-1-0",
+    ] {
+        git(
+            &repo,
+            &["push", "-q", "origin", &format!("{revert}:{decoy}")],
+        );
+    }
+    assert_eq!(
+        g.remote_branch_sha(&repo, "provefab/revert-1-0")
+            .await
+            .unwrap(),
+        None
+    );
     assert_eq!(
         g.remote_branch_sha(&repo, "provefab/revert-1-0")
             .await
@@ -540,4 +556,193 @@ fn commit_and_push_force(repo: &Path, file: &str, content: &str, msg: &str) -> S
     git(repo, &["commit", "-qm", msg]);
     git(repo, &["push", "-qf", "origin", "main"]);
     git(repo, &["rev-parse", "HEAD"])
+}
+
+#[tokio::test]
+async fn a_failing_merge_opens_exactly_one_human_reviewed_revert() {
+    let (f, p, id, sha) = setup(&["grep -q hello README.md"], "broken\n").await;
+    let c = drive(&p, id).await;
+    assert_eq!(c.state, CheckState::RevertOpen);
+    assert_eq!(
+        c.revert_pr_url.as_deref(),
+        Some("https://github.com/o/r/pull/100")
+    );
+    let prs = p.hub.prs.lock().unwrap().clone();
+    assert_eq!(prs.len(), 1);
+    assert_eq!(prs[0].0, format!("provefab/revert-{}-0", c.id));
+    assert_eq!(prs[0].1, "main");
+    assert!(
+        prs[0].3.contains(&sha)
+            && prs[0]
+                .3
+                .contains("Provefab will not merge this revert automatically.")
+    );
+    assert_eq!(
+        git(
+            &f.origin,
+            &["rev-parse", &format!("refs/heads/{}", prs[0].0)]
+        ),
+        c.revert_sha.clone().unwrap()
+    );
+    // Local branch cleaned up; nothing merged.
+    let repo = f.config.repos[0].path_in(&f.home);
+    assert_eq!(git(&repo, &["branch", "--list", "provefab/revert-*"]), "");
+    assert!(p.hub.merged.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_pr_creation_error_resumes_without_a_second_branch_or_pr() {
+    use std::sync::atomic::Ordering;
+    let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::RevertReady).await;
+    p.hub.pr_create_failures.store(2, Ordering::SeqCst);
+    assert!(p.process_post_merge(id).await.is_err());
+    assert!(p.process_post_merge(id).await.is_err());
+    let c = check(&p, id).await;
+    assert_eq!((c.state, c.infra_errors), (CheckState::RevertReady, 2));
+    let pushed = git(
+        &f.origin,
+        &[
+            "rev-parse",
+            &format!("refs/heads/provefab/revert-{}-0", c.id),
+        ],
+    );
+    assert_eq!(tick(&p, id).await, CheckState::RevertOpen);
+    assert_eq!(check(&p, id).await.infra_errors, 0);
+    assert_eq!(p.hub.prs.lock().unwrap().len(), 1);
+    assert_eq!(
+        git(
+            &f.origin,
+            &[
+                "rev-parse",
+                &format!("refs/heads/provefab/revert-{}-0", c.id)
+            ]
+        ),
+        pushed
+    );
+}
+
+#[tokio::test]
+async fn five_infra_errors_block_the_check() {
+    use std::sync::atomic::Ordering;
+    let (_f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::RevertReady).await;
+    p.hub.pr_create_failures.store(10, Ordering::SeqCst);
+    for _ in 0..4 {
+        assert!(p.process_post_merge(id).await.is_err());
+    }
+    p.process_post_merge(id).await.unwrap();
+    let c = check(&p, id).await;
+    assert_eq!(
+        (c.state, c.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::InfraError))
+    );
+}
+
+#[tokio::test]
+async fn a_moving_base_restarts_then_blocks_on_the_third_move() {
+    let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    for n in 0..2 {
+        tick_until(&p, id, CheckState::RevertReady).await;
+        commit_and_push(&repo, &format!("OTHER{n}.md"), "x\n", "unrelated");
+        assert_eq!(tick(&p, id).await, CheckState::VerificationFailed);
+        assert_eq!(check(&p, id).await.base_moves, n + 1);
+    }
+    tick_until(&p, id, CheckState::RevertReady).await;
+    assert_eq!(
+        check(&p, id).await.revert_branch.unwrap(),
+        format!("provefab/revert-{}-2", check(&p, id).await.id)
+    );
+    commit_and_push(&repo, "OTHER2.md", "x\n", "unrelated");
+    let c = drive(&p, id).await;
+    assert_eq!(
+        (c.state, c.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::BaseMoved))
+    );
+    assert!(p.hub.prs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_foreign_commit_on_the_revert_branch_blocks() {
+    let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::RevertReady).await;
+    let c = check(&p, id).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    git(
+        &repo,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD~1:refs/heads/{}", c.revert_branch.clone().unwrap()),
+        ],
+    );
+    let c = drive(&p, id).await;
+    assert_eq!(
+        (c.state, c.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::BranchConflict))
+    );
+    assert!(p.hub.prs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_reused_pr_on_other_work_blocks() {
+    let (_f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::RevertReady).await;
+    *p.hub.pr_head_override.lock().unwrap() = Some("0".repeat(40));
+    let c = drive(&p, id).await;
+    assert_eq!(
+        (c.state, c.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::BranchConflict))
+    );
+}
+
+#[tokio::test]
+async fn a_crash_after_the_push_reuses_the_pushed_branch() {
+    let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::RevertReady).await;
+    let c = check(&p, id).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    p.git
+        .push_sha(
+            &repo,
+            c.revert_sha.as_deref().unwrap(),
+            c.revert_branch.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drive(&p, id).await.state, CheckState::RevertOpen);
+    assert_eq!(p.hub.prs.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_innocent_later_merge_is_never_reverted() {
+    // Merge A breaks README; its check opens a revert PR (not merged).
+    let (f, p, a, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    assert_eq!(drive(&p, a).await.state, CheckState::RevertOpen);
+    // Merge B only adds a file; the base is still broken by A.
+    let b = provefab::testkit::queue_n(&p, 9, "Second change").await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    let sha_b = commit_and_push(&repo, "B.md", "b\n", "innocent");
+    p.store
+        .set_pr(b, "https://github.com/o/r/pull/9", "open")
+        .await
+        .unwrap();
+    p.store
+        .transition(b, TaskState::PrOpen, "pr")
+        .await
+        .unwrap();
+    *p.hub.pr_status.lock().unwrap() = merged(Some(&sha_b), Some("main"), Some(1));
+    p.watch_pr(b).await.unwrap();
+    let cb = drive(&p, b).await;
+    assert_eq!(
+        (cb.state, cb.failure_kind),
+        (CheckState::Blocked, Some(FailureKind::RevertChecksFailed))
+    );
+    assert_eq!(
+        p.hub.prs.lock().unwrap().len(),
+        1,
+        "only the culprit has a revert PR"
+    );
 }

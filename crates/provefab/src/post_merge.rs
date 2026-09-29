@@ -707,14 +707,92 @@ where
         )
         .await
     }
-    // Implemented in Task 7.
     async fn pm_revert_ready(
         &self,
-        _: &TaskRow,
-        _: &RepoConfig,
-        _: &PostMergeCheckRow,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
     ) -> Result<(), PipelineError> {
-        Ok(())
+        let corrupt = |what: &str| StoreError::Corrupt(format!("check {} has no {what}", check.id));
+        let base_sha = check.base_sha.clone().ok_or_else(|| corrupt("base_sha"))?;
+        let revert_sha = check
+            .revert_sha
+            .clone()
+            .ok_or_else(|| corrupt("revert_sha"))?;
+        let branch = check
+            .revert_branch
+            .clone()
+            .ok_or_else(|| corrupt("revert_branch"))?;
+        let repo_path = self.checkout(repo);
+        self.git.fetch(&repo_path).await?;
+        let base_ref = self.git.base_ref(&repo_path, &repo.base).await;
+        let tip = self.git.rev_parse(&repo_path, &base_ref).await?;
+        if tip != base_sha {
+            if check.base_moves + 1 >= BASE_MOVE_LIMIT {
+                return self
+                    .block(
+                        check,
+                        FailureKind::BaseMoved,
+                        &format!("base moved {} times", check.base_moves + 1),
+                    )
+                    .await;
+            }
+            return self
+                .advance(
+                    check,
+                    CheckState::VerificationFailed,
+                    CheckPatch {
+                        bump_base_moves: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+        match self.git.remote_branch_sha(&repo_path, &branch).await? {
+            None => self.git.push_sha(&repo_path, &revert_sha, &branch).await?,
+            Some(s) if s == revert_sha => {}
+            Some(s) => {
+                return self
+                    .block(
+                        check,
+                        FailureKind::BranchConflict,
+                        &format!("origin/{branch} is {s}, expected {revert_sha}"),
+                    )
+                    .await;
+            }
+        }
+        let body = revert_pr_body(
+            task.pr_url.as_deref().unwrap_or("unknown"),
+            &task.issue_url,
+            check,
+        );
+        let title = format!(
+            "Revert Provefab change {}",
+            &check.merge_sha[..check.merge_sha.len().min(12)]
+        );
+        let url = self
+            .hub
+            .pr_create(&repo.slug, &branch, &repo.base, &title, &body)
+            .await?;
+        let head = self.hub.pr_status(&repo.slug, &url).await?.head_sha;
+        if head.as_deref() != Some(revert_sha.as_str()) {
+            return self
+                .block(
+                    check,
+                    FailureKind::BranchConflict,
+                    &format!("{url} head is {head:?}, expected {revert_sha}"),
+                )
+                .await;
+        }
+        self.advance(
+            check,
+            CheckState::RevertOpen,
+            CheckPatch {
+                revert_pr_url: Some(url),
+                ..Default::default()
+            },
+        )
+        .await
     }
     // Implemented in Task 8.
     async fn notify_post_merge(
