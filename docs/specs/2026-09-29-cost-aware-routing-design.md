@@ -182,7 +182,7 @@ All new fields are optional. A config without them keeps working and gets fetche
 
 The same change updates what people read, so docs never describe old behaviour.
 
-- **Core docs** (`README.md`, `docs/guide/`, rendered at `provefab.dev/docs/` by the landing site):
+- **Core docs** (`README.md`, `docs/guide/`, rendered at `provefab.com/docs/` by the landing site):
   - **`configuration.md`:** `[routing] prefer`, the price fields, `quota_weight`, and how prices are fetched, cached and overridden.
   - **`usage.md`:** reading the cost lines in `provefab log` and in PRs, and what the two new Jev answers change.
   - **`operations.md`:** where `prices.json` lives, what `doctor` reports about prices, and troubleshooting a model with no price.
