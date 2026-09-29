@@ -930,3 +930,49 @@ async fn status_log_and_stats_show_the_check() {
         "{stats}"
     );
 }
+
+/// Spec section 12: a replay per non-terminal state. A tick whose result was
+/// lost (crash before the state was persisted) is replayed from the earlier
+/// state and still ends in exactly one revert PR with nothing left behind.
+#[tokio::test]
+async fn replaying_any_non_terminal_state_still_ends_in_one_revert_pr() {
+    let non_terminal = [
+        CheckState::Queued,
+        CheckState::Verifying,
+        CheckState::VerificationFailed,
+        CheckState::PreparingRevert,
+        CheckState::RevertReady,
+    ];
+    for state in non_terminal {
+        let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+        if state != CheckState::Queued {
+            tick_until(&p, id, state).await;
+        }
+        let c = check(&p, id).await;
+        assert_eq!(c.state, state);
+        let after = tick(&p, id).await;
+        if after != state {
+            // The tick's effects happened, but its state change is "lost".
+            let rewound = p
+                .store
+                .advance_post_merge(id, after, state, &Default::default())
+                .await
+                .unwrap();
+            assert!(rewound, "{state:?}");
+        }
+        let c = drive(&p, id).await;
+        assert_eq!(c.state, CheckState::RevertOpen, "replay from {state:?}");
+        assert_eq!(p.hub.prs.lock().unwrap().len(), 1, "replay from {state:?}");
+        assert!(leftovers(&f, c.id).is_empty(), "replay from {state:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_infra_error_path_leaves_no_worktree() {
+    use std::sync::atomic::Ordering;
+    let (f, p, id, _) = setup(&["grep -q hello README.md"], "broken\n").await;
+    tick_until(&p, id, CheckState::RevertReady).await;
+    p.hub.pr_create_failures.store(1, Ordering::SeqCst);
+    assert!(p.process_post_merge(id).await.is_err());
+    assert!(leftovers(&f, check(&p, id).await.id).is_empty());
+}
