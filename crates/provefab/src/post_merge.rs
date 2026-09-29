@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::StageRunner;
 use crate::config::RepoConfig;
+use crate::forge::ForgeError;
 use crate::pipeline::{Pipeline, PipelineError};
 use crate::ports::{Hub, Oracle};
 use crate::store::{CheckPatch, PostMergeCheckRow, StoreError, TaskRow};
@@ -570,22 +571,138 @@ where
         .await
     }
 
-    // Implemented in Task 6.
     async fn pm_verification_failed(
         &self,
-        _: &TaskRow,
-        _: &RepoConfig,
-        _: &PostMergeCheckRow,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
     ) -> Result<(), PipelineError> {
-        Ok(())
+        let repo_path = self.checkout(repo);
+        self.git.fetch(&repo_path).await?;
+        let base_ref = self.git.base_ref(&repo_path, &repo.base).await;
+        let tip = self.git.rev_parse(&repo_path, &base_ref).await?;
+        if !self
+            .git
+            .is_ancestor(&repo_path, &check.merge_sha, &tip)
+            .await?
+        {
+            return self
+                .block(
+                    check,
+                    FailureKind::BaseDiverged,
+                    &format!("{} is not an ancestor of {tip}", check.merge_sha),
+                )
+                .await;
+        }
+        let patch = CheckPatch {
+            base_sha: Some(tip.clone()),
+            ..Default::default()
+        };
+        // Nothing landed since the merge: the base is the commit that already failed twice.
+        if tip == check.merge_sha {
+            return self
+                .advance(check, CheckState::PreparingRevert, patch)
+                .await;
+        }
+        let r = self
+            .pm_run(task, repo, check, &tip, "base", "post-merge-base", false)
+            .await?;
+        let to = if r.failed.is_empty() {
+            CheckState::Superseded
+        } else {
+            CheckState::PreparingRevert
+        };
+        self.advance(check, to, patch).await
     }
+
     async fn pm_preparing_revert(
         &self,
-        _: &TaskRow,
-        _: &RepoConfig,
-        _: &PostMergeCheckRow,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        check: &PostMergeCheckRow,
     ) -> Result<(), PipelineError> {
-        Ok(())
+        let base_sha = check
+            .base_sha
+            .clone()
+            .ok_or_else(|| StoreError::Corrupt(format!("check {} has no base_sha", check.id)))?;
+        let repo_path = self.checkout(repo);
+        let parents = self.git.parent_count(&repo_path, &check.merge_sha).await?;
+        let Some(plan) = revert_plan(parents, check.commit_count, check.auto_merged) else {
+            return self
+                .block(
+                    check,
+                    FailureKind::UnsafeMergeStrategy,
+                    "merge shape changed",
+                )
+                .await;
+        };
+        let wt = self.pm_dir(check.id, "revert");
+        self.git
+            .worktree_fresh_detached(&repo_path, &wt, &base_sha)
+            .await?;
+        match self
+            .git
+            .revert(&wt, &check.merge_sha, plan.mainline())
+            .await
+        {
+            Ok(()) => {}
+            // git exits 1 on a conflict; anything else is infrastructure.
+            Err(ForgeError::Failed {
+                code: Some(1),
+                stderr,
+                ..
+            }) => {
+                return self
+                    .block(check, FailureKind::RevertConflict, &stderr)
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let revert_sha = self.git.head(&wt).await?;
+        self.git.worktree_discard(&repo_path, &wt).await?;
+        let branch = format!("provefab/revert-{}-{}", check.id, check.base_moves);
+        self.git
+            .branch_force(&repo_path, &branch, &revert_sha)
+            .await?;
+        let r = self
+            .pm_run(
+                task,
+                repo,
+                check,
+                &revert_sha,
+                "revert-check",
+                "revert-check",
+                true,
+            )
+            .await?;
+        if r.dirty {
+            return self
+                .block(
+                    check,
+                    FailureKind::DirtyTree,
+                    "a check modified tracked files on the revert",
+                )
+                .await;
+        }
+        if !r.failed.is_empty() {
+            return self
+                .block(
+                    check,
+                    FailureKind::RevertChecksFailed,
+                    &failure_summary(&r.failed),
+                )
+                .await;
+        }
+        self.advance(
+            check,
+            CheckState::RevertReady,
+            CheckPatch {
+                revert_sha: Some(revert_sha),
+                revert_branch: Some(branch),
+                ..Default::default()
+            },
+        )
+        .await
     }
     // Implemented in Task 7.
     async fn pm_revert_ready(
