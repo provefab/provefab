@@ -992,8 +992,9 @@ impl Store {
         rows.iter().map(stored_event).collect()
     }
 
-    /// Every task's events (from `since`, unix seconds) and findings with their
-    /// current disposition, optionally for one repo. Ordered by task, then seq.
+    /// Every task's events and findings (from `since`, unix seconds, a finding
+    /// dated by its review event) with their current disposition, optionally
+    /// for one repo (any case). Ordered by task, then seq.
     #[allow(clippy::type_complexity)]
     pub async fn export_rows(
         &self,
@@ -1008,7 +1009,7 @@ impl Store {
     > {
         let rows = match repo {
             Some(r) => {
-                sqlx::query("SELECT * FROM tasks WHERE repo = ? ORDER BY id")
+                sqlx::query("SELECT * FROM tasks WHERE LOWER(repo) = LOWER(?) ORDER BY id")
                     .bind(r)
                     .fetch_all(&self.pool)
                     .await?
@@ -1022,15 +1023,20 @@ impl Store {
         let (mut events, mut findings) = (Vec::new(), Vec::new());
         for r in rows {
             let task = task_row(&r)?;
+            // A finding is as old as the review event that recorded it.
+            let mut kept = HashSet::new();
             for e in self.events(task.id).await? {
                 if since.is_none_or(|s| e.at >= s) {
+                    kept.insert(e.id);
                     events.push((task.clone(), e));
                 }
             }
             let disp = self.current_dispositions(task.id).await?;
             for f in self.findings(task.id).await? {
-                let d = disp.get(&f.key).copied();
-                findings.push((task.clone(), f, d));
+                if kept.contains(&f.event_id) {
+                    let d = disp.get(&f.key).copied();
+                    findings.push((task.clone(), f, d));
+                }
             }
         }
         Ok((events, findings))

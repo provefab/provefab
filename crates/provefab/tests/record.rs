@@ -565,6 +565,24 @@ async fn export_redacts_free_text_unless_asked_and_every_line_is_json() {
 }
 
 #[tokio::test]
+async fn export_filters_findings_by_since_and_repo_case_insensitively() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let repo = p.store.task(id).await.unwrap().unwrap().repo.to_uppercase();
+    let all = provefab::commands::export(&p.store, Some(&repo), None, false)
+        .await
+        .unwrap();
+    assert!(all.contains("\"type\":\"finding\""), "{all}");
+    let past = provefab::commands::export(&p.store, None, Some("2000-01-01"), false)
+        .await
+        .unwrap();
+    assert!(past.contains("\"type\":\"finding\""), "{past}");
+    let future = provefab::commands::export(&p.store, None, Some("2999-01-01"), false)
+        .await
+        .unwrap();
+    assert_eq!(future, "");
+}
+
+#[tokio::test]
 async fn export_of_an_empty_record_prints_nothing() {
     let f = fixture(&["true"]);
     let p = pipeline(
