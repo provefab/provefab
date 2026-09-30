@@ -622,6 +622,33 @@ async fn prune_deletes_only_with_yes_and_only_finished_tasks() {
 }
 
 #[tokio::test]
+async fn prune_keeps_an_open_pr() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let task = p.store.task(id).await.unwrap().unwrap();
+    assert_eq!(task.pr_state.as_deref(), Some("open"));
+    let out = provefab::commands::prune(&p.store, "2999-01-01", true)
+        .await
+        .unwrap();
+    assert!(!out.contains(&format!("task {id}")), "{out}");
+    assert!(!p.store.events(id).await.unwrap().is_empty());
+    assert!(!p.store.findings(id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn prune_keeps_a_task_whose_post_merge_check_is_still_running() {
+    let (_f, p, id) = merged_task(&["grep -q hello README.md"]).await;
+    p.store.set_pr_state(id, "archived").await.unwrap();
+    let checks = p.store.post_merge_checks(id).await.unwrap();
+    assert_eq!(checks.len(), 1);
+    assert!(!checks[0].state.is_terminal(), "{:?}", checks[0].state);
+    let out = provefab::commands::prune(&p.store, "2999-01-01", true)
+        .await
+        .unwrap();
+    assert!(!out.contains(&format!("task {id}")), "{out}");
+    assert!(!p.store.events(id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn log_shows_the_record_with_sources_and_current_dispositions() {
     let (_f, p, id) = open_task_with_findings().await;
     let task = p.store.task(id).await.unwrap().unwrap();
