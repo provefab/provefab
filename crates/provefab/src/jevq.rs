@@ -392,10 +392,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, JevError::Timeout), "{err:?}");
-        // Generous bound: proves the deadline (not retry exhaustion or the
-        // request's own timeout) fired, without flaking under machine load.
+        // `Timeout` (not a 529 status) proves retries were not exhausted; the
+        // bound only has to stay under the 5 s per-request timeout of
+        // `client()`. 1 s flaked under a loaded full suite (1.094 s seen).
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(4),
             "{:?}",
             started.elapsed()
         );
