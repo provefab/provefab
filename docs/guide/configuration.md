@@ -121,7 +121,7 @@ Provefab classifies each round's changed files by path into risk categories. A r
 | `disable` | `[]` | Built-in categories to turn off, by name. |
 | `[repos.risk.categories.<name>]` | none | Adds a category, or extends a built-in of the same name. |
 | `paths` | required for a new category | Patterns of the category. For a built-in, they are added to its patterns. |
-| `checks` | `[]` | Commands run in the worktree, after your `gates`, when the category is detected. For a built-in, they replace its checks. A command already in `gates` runs once. Same timeout and rerun rules as gates; a failure sends the task back to implementation. |
+| `checks` | `[]` | Commands run in the worktree, after your `gates`, when the category is detected. For a built-in, they replace its checks. A command already in `gates` runs once. Same timeout and rerun rules as gates; a failing check is an ordinary gate failure: the round goes back to implementation and counts toward the same attempt limit as other gates. |
 | `reviewer_tier` | `frontier` | `frontier` or `standard`: the tier of the review when the category is detected. |
 
 ```toml
@@ -143,7 +143,7 @@ checks = ["./scripts/check-migration.sh"]
 
 Category names use lowercase letters, digits and `-`. `unknown` is reserved: Provefab uses it when the changed files cannot be computed.
 
-**Validation errors** (a task on a repository with an invalid `[repos.risk]` stops in `needs_you` with the message):
+**Validation errors** (an invalid `[repos.risk]` is refused when the configuration loads, so Provefab does not start; `provefab doctor` and `provefab run` report `<slug>: [repos.risk]: <message>`):
 
 - `unknown category in disable: <name>`: `disable` names something that is not built-in.
 - `invalid category name: <name>`: empty, `unknown`, or not lowercase letters, digits and `-`.
@@ -151,7 +151,7 @@ Category names use lowercase letters, digits and `-`. `unknown` is reserved: Pro
 - `<name>: no paths`: a new category without `paths`.
 - `<name>: reviewer_tier must be standard or frontier`.
 - `<name> is disabled`: the same built-in is in `disable` and in `categories`.
-- An unknown key under `[repos.risk]` is refused when the file loads.
+- An unknown key under `[repos.risk]` or a category table is refused too.
 
 `provefab doctor` prints one `risk <slug>` line per repository: the category count and names, and how many checks were added. See [Usage](usage.md#risk-aware-changes) for what happens to a risky change.
 
