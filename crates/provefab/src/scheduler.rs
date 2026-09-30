@@ -112,6 +112,28 @@ where
                 );
             }
         }
+        // Risk labels up front too, so a round's label edit rarely meets one
+        // that does not exist yet (the pipeline still ensures each on use).
+        let risk: Vec<String> = crate::risk::resolve(repo.risk.as_ref())
+            .map(|policy| policy.categories.into_iter().map(|c| c.name).collect())
+            .unwrap_or_default();
+        for category in risk
+            .iter()
+            .map(String::as_str)
+            .chain([crate::risk::UNKNOWN])
+        {
+            let (name, text) = crate::risk::label(&repo.label, category);
+            if let Err(e) = p
+                .hub
+                .ensure_label(&repo.slug, &name, crate::risk::LABEL_COLOR, &text)
+                .await
+            {
+                eprintln!(
+                    "provefab: could not create label {name} on {}: {e}",
+                    repo.slug
+                );
+            }
+        }
     }
     let workers = opts.workers.max(1);
     let mut next_poll: HashMap<String, Instant> = HashMap::new();

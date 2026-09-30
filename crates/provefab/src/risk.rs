@@ -222,6 +222,18 @@ pub fn classify(policy: &Policy, paths: &[String]) -> Vec<Detected> {
         .collect()
 }
 
+/// The issue label of a category and its description, under the repository's
+/// label prefix (`provefab:risk-migrations`).
+pub fn label(prefix: &str, category: &str) -> (String, String) {
+    (
+        format!("{prefix}:risk-{category}"),
+        format!("Provefab: change touches {category}"),
+    )
+}
+
+/// Color of every risk label.
+pub const LABEL_COLOR: &str = "b60205";
+
 /// Fail-closed result when the changed paths cannot be computed.
 pub fn unknown() -> Vec<Detected> {
     vec![Detected {

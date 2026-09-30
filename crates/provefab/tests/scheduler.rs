@@ -53,7 +53,13 @@ async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
             "provefab:in-pr",
             "provefab:needs-info",
             "provefab:failed",
-            "provefab:merged"
+            "provefab:merged",
+            "provefab:risk-ci",
+            "provefab:risk-dependencies",
+            "provefab:risk-migrations",
+            "provefab:risk-infrastructure",
+            "provefab:risk-secrets-config",
+            "provefab:risk-unknown"
         ]
     );
     // A second run finds nothing new to do.

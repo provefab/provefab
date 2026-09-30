@@ -232,6 +232,8 @@ pub struct FakeHub {
     /// The next this-many `edit_labels` calls fail (GitHub unreachable).
     pub label_failures: std::sync::atomic::AtomicU32,
     pub ensured: Mutex<Vec<String>>,
+    /// Labels `ensure_label` fails for (GitHub refused to create them).
+    pub ensure_fails: Mutex<Vec<String>>,
     /// Where `repo_clone` clones from (a local path standing in for GitHub).
     pub clone_from: Mutex<Option<PathBuf>>,
     /// What `pr_status` answers (open, no comments, until a test changes it).
@@ -280,6 +282,7 @@ impl FakeHub {
             comment_failures: Default::default(),
             label_failures: Default::default(),
             ensured: Mutex::new(Vec::new()),
+            ensure_fails: Mutex::new(Vec::new()),
             comments_down: Default::default(),
             clone_from: Mutex::new(None),
             pr_status: Mutex::new(crate::forge::PrStatus {
@@ -449,6 +452,9 @@ impl Hub for FakeHub {
         Ok("https://github.com/o/r/pull/8".into())
     }
     async fn ensure_label(&self, _: &str, name: &str, _: &str, _: &str) -> Result<(), ForgeError> {
+        if self.ensure_fails.lock().unwrap().iter().any(|l| l == name) {
+            return Err(ForgeError::Parse("gh label".into(), "HTTP 422".into()));
+        }
         self.ensured.lock().unwrap().push(name.to_string());
         Ok(())
     }

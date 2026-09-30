@@ -2602,6 +2602,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             None => risk::unknown(),
         };
         let previous = self.latest_risk(task.id, |_, _| true).await?;
+        let same_round = self.risk_of_round(task).await?;
         self.store
             .write_with_events(
                 task.id,
@@ -2613,8 +2614,14 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 }],
             )
             .await?;
-        self.risk_labels(task, repo, &detected, previous.as_deref())
-            .await?;
+        self.risk_labels(
+            task,
+            repo,
+            &detected,
+            previous.as_deref(),
+            same_round.as_deref(),
+        )
+        .await?;
         // A check that is already a gate ran above: once, not twice (Review Focus 2).
         let extra: Vec<String> = policy
             .checks(&detected)
@@ -2632,38 +2639,43 @@ Please reply with what should happen, what happens instead, and how to reproduce
 
     /// `<label>:risk-<category>` on the issue for each detected category; the
     /// ones of the previous classification that no longer apply are removed
-    /// (Review Focus 3). Labelled before the extra checks run, so every
-    /// recorded category was also ensured and added: a later removal never
-    /// names a label that was never created.
+    /// (Review Focus 3). Labelled before the extra checks run. A label
+    /// `ensure_label` could not create is left out of the edit, so the queued
+    /// edit never names a label that may not exist (it would fail on every
+    /// retry and hold the task's later GitHub effects). No edit when this
+    /// round was already classified with the same labels and none is removed.
     async fn risk_labels(
         &self,
         task: &TaskRow,
         repo: &RepoConfig,
         detected: &[Detected],
         previous: Option<&[Detected]>,
+        same_round: Option<&[Detected]>,
     ) -> Result<(), PipelineError> {
-        let name = |d: &Detected| format!("{}:risk-{}", repo.label, d.name);
-        let add: Vec<String> = detected.iter().map(name).collect();
+        let name = |d: &Detected| risk::label(&repo.label, &d.name).0;
         let remove: Vec<String> = previous
             .unwrap_or_default()
             .iter()
             .map(name)
-            .filter(|l| !add.contains(l))
+            .filter(|l| !detected.iter().map(name).any(|a| &a == l))
             .collect();
-        for (label, d) in add.iter().zip(detected) {
-            let description = format!("Provefab: change touches {}", d.name);
-            if let Err(e) = self
+        let mut add: Vec<String> = Vec::new();
+        for d in detected {
+            let (label, description) = risk::label(&repo.label, &d.name);
+            match self
                 .hub
-                .ensure_label(&repo.slug, label, "b60205", &description)
+                .ensure_label(&repo.slug, &label, risk::LABEL_COLOR, &description)
                 .await
             {
-                eprintln!(
-                    "provefab: could not create label {label} on {}: {e}",
+                Ok(()) => add.push(label),
+                Err(e) => eprintln!(
+                    "provefab: could not create label {label} on {}, not adding it: {e}",
                     repo.slug
-                );
+                ),
             }
         }
-        if add.is_empty() && remove.is_empty() {
+        let already = same_round.is_some_and(|s| s.iter().map(name).eq(add.iter().cloned()));
+        if (add.is_empty() || already) && remove.is_empty() {
             return Ok(());
         }
         let add: Vec<&str> = add.iter().map(String::as_str).collect();
