@@ -146,6 +146,9 @@ pub struct RepoConfig {
     /// Provefab-created PR is merged. Empty disables post-merge verification.
     #[serde(default)]
     pub post_merge_checks: Vec<String>,
+    /// `[repos.risk]`: risk categories and their consequences. Absent: built-ins.
+    #[serde(default)]
+    pub risk: Option<crate::risk::RiskConfig>,
 }
 
 impl RepoConfig {
@@ -308,6 +311,8 @@ pub enum ConfigError {
     MissingProvider(String),
     #[error("provefab.toml: model `{0}` has max_concurrency = 0, so it could never run")]
     ZeroConcurrency(String),
+    #[error("{0}: [repos.risk]: {1}")]
+    Risk(String, String),
     #[error("provefab.toml: repo `{0}` is not `owner/name`")]
     BadSlug(String),
     #[error("provefab.toml: repo `{0}` is listed twice")]
@@ -370,6 +375,8 @@ impl Config {
             if r.post_merge_checks.iter().any(|g| g.trim().is_empty()) {
                 return Err(ConfigError::EmptyField(r.slug.clone(), "post_merge_checks"));
             }
+            crate::risk::resolve(r.risk.as_ref())
+                .map_err(|e| ConfigError::Risk(r.slug.clone(), e))?;
             // An empty label could match every open issue (the label is the authorization).
             if r.label.trim().is_empty() {
                 return Err(ConfigError::EmptyField(r.slug.clone(), "label"));
@@ -530,6 +537,16 @@ review_rounds = 2
         assert!(matches!(
             Config::from_toml_str(&format!("{base}post_merge_checks = [\"   \"]\n")),
             Err(ConfigError::EmptyField(_, "post_merge_checks"))
+        ));
+    }
+
+    #[test]
+    fn risk_table_is_optional_and_validated() {
+        let base = format!("{BASE}[[repos]]\nslug = \"o/r\"\ngates = [\"make\"]\n");
+        assert_eq!(Config::from_toml_str(&base).unwrap().repos[0].risk, None);
+        assert!(matches!(
+            Config::from_toml_str(&format!("{base}[repos.risk]\ndisable = [\"nope\"]\n")),
+            Err(ConfigError::Risk(_, _))
         ));
     }
 

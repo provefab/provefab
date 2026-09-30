@@ -22,6 +22,7 @@ pub mod post_merge;
 pub mod prices;
 pub mod prompts;
 pub mod record;
+pub mod risk;
 pub mod router;
 pub mod routing;
 pub mod scheduler;

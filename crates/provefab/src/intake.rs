@@ -115,6 +115,7 @@ mod tests {
             trust_pi_project: false,
             gates: vec!["make test".into()],
             post_merge_checks: Vec::new(),
+            risk: None,
         }
     }
 
