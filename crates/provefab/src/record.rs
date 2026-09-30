@@ -352,8 +352,13 @@ pub fn parse_commands(body: &str) -> Vec<Result<Command, String>> {
         let mut parts = rest.splitn(2, char::is_whitespace);
         let key = parts.next().unwrap_or_default().to_ascii_uppercase();
         let tail = parts.next().unwrap_or_default().trim();
-        let (word, reason) = match tail.find(|c: char| c == ':' || c.is_whitespace()) {
-            Some(i) => (&tail[..i], tail[i + 1..].trim()),
+        // Advance by the separator's own width: `c.is_whitespace()` matches
+        // multi-byte spaces (NBSP, em space) that a `+ 1` would slice inside.
+        let (word, reason) = match tail
+            .char_indices()
+            .find(|&(_, c)| c == ':' || c.is_whitespace())
+        {
+            Some((i, c)) => (&tail[..i], tail[i + c.len_utf8()..].trim()),
             None => (tail, ""),
         };
         let valid_key =
@@ -530,6 +535,29 @@ mod tests {
                 reason: None
             })
         );
+    }
+
+    #[test]
+    fn multi_byte_whitespace_never_panics() {
+        assert_eq!(
+            parse_commands("/provefab F1 rejected\u{a0}because"),
+            vec![Ok(Command {
+                key: "F1".into(),
+                disposition: Disposition::Rejected,
+                reason: Some("because".into())
+            })]
+        );
+        assert_eq!(
+            parse_commands("/provefab F1\u{2003}rejected"),
+            vec![Ok(Command {
+                key: "F1".into(),
+                disposition: Disposition::Rejected,
+                reason: None
+            })]
+        );
+        let _ = parse_commands("/provefab \u{a0}");
+        let _ = parse_commands("/provefab\u{a0}F1 rejected");
+        let _ = strip_commands("/provefab \u{a0}\n\u{2003}/provefab F1 fixed");
     }
 
     #[test]
