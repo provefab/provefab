@@ -1978,9 +1978,17 @@ mod tests {
             text: "t".into(),
         };
         for pass in [1, 2] {
-            s.record_review(id, &json!({}), "m", pass, 0, "approve", &[finding.clone()])
-                .await
-                .unwrap();
+            s.record_review(
+                id,
+                &json!({}),
+                "m",
+                pass,
+                0,
+                "approve",
+                std::slice::from_ref(&finding),
+            )
+            .await
+            .unwrap();
         }
         for (sha, pass) in [("abc", 1), ("def", 2)] {
             s.write_with_events(
