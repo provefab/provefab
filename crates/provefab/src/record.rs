@@ -5,6 +5,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agents::StageRunner;
+use crate::forge::{Comment, is_bot_comment};
+use crate::pipeline::{Pipeline, PipelineError};
+use crate::ports::{Hub, Oracle};
+use crate::store::TaskRow;
+
 /// Inference rules carry their version so a changed rule never mixes with old results.
 pub const RULE_VERSION: u32 = 1;
 
@@ -245,6 +251,104 @@ impl StoredEvent {
     }
 }
 
+/// A `/provefab <key> <disposition>[:| ]<reason>` line (spec section 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub key: String,
+    pub disposition: Disposition,
+    pub reason: Option<String>,
+}
+
+/// Commands of a comment body: only lines that start with `/provefab`
+/// (after trimming) outside code fences. `Err(line)` for one that does not parse.
+pub fn parse_commands(body: &str) -> Vec<Result<Command, String>> {
+    const PREFIX: &str = "/provefab ";
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || !line.to_ascii_lowercase().starts_with(PREFIX) {
+            continue;
+        }
+        let rest = line[PREFIX.len()..].trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let key = parts.next().unwrap_or_default().to_ascii_uppercase();
+        let tail = parts.next().unwrap_or_default().trim();
+        let (word, reason) = match tail.find(|c: char| c == ':' || c.is_whitespace()) {
+            Some(i) => (&tail[..i], tail[i + 1..].trim()),
+            None => (tail, ""),
+        };
+        let valid_key =
+            key.len() > 1 && key.starts_with('F') && key[1..].chars().all(|c| c.is_ascii_digit());
+        match (valid_key, Disposition::parse(word)) {
+            (true, Some(d)) => out.push(Ok(Command {
+                key,
+                disposition: d,
+                reason: (!reason.is_empty()).then(|| reason.to_string()),
+            })),
+            _ => out.push(Err(line.to_string())),
+        }
+    }
+    out
+}
+
+fn line_of(p: &Result<Command, String>) -> String {
+    match p {
+        Err(l) => l.clone(),
+        Ok(c) => format!("/provefab {} {}", c.key, c.disposition.as_str()),
+    }
+}
+
+impl<R, O, H> Pipeline<R, O, H>
+where
+    R: StageRunner + Sync,
+    O: Oracle + Sync,
+    H: Hub + Sync,
+{
+    /// Records the `/provefab` commands of a PR's comments as human events.
+    /// Idempotent: a command already recorded (same comment, same finding or
+    /// line) is not recorded again, so every poll may pass the full list.
+    pub async fn apply_finding_commands(
+        &self,
+        task: &TaskRow,
+        comments: &[Comment],
+    ) -> Result<(), PipelineError> {
+        let keys = self.store.finding_keys(task.id).await?;
+        for c in comments.iter().filter(|c| !is_bot_comment(&c.body)) {
+            let comment = format!("{}@{}", c.author, c.created_at);
+            let authorized = c.author == task.author
+                || matches!(c.association.as_str(), "OWNER" | "MEMBER" | "COLLABORATOR");
+            for parsed in parse_commands(&c.body) {
+                let ignored = |why: &str| Event::CommandIgnored {
+                    comment: comment.clone(),
+                    login: c.author.clone(),
+                    line: line_of(&parsed),
+                    why: why.into(),
+                };
+                let event = match (&parsed, authorized) {
+                    (_, false) => ignored("not authorized"),
+                    (Err(_), true) => ignored("not a command"),
+                    (Ok(cmd), true) if !keys.contains(&cmd.key) => ignored("unknown finding"),
+                    (Ok(cmd), true) => Event::FindingDisposition {
+                        finding: cmd.key.clone(),
+                        disposition: cmd.disposition,
+                        reason: cmd.reason.clone(),
+                        login: c.author.clone(),
+                        association: c.association.clone(),
+                        comment: comment.clone(),
+                    },
+                };
+                self.store.record_human(task.id, &event).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +401,38 @@ mod tests {
             assert_eq!(back.typed().as_ref(), Some(e));
         }
         assert_eq!(events[2].kind(), "finding_followed_by_revert");
+    }
+
+    #[test]
+    fn commands_are_whole_lines_outside_code_fences() {
+        let body = "Thanks!\n/provefab F2 rejected: the value is bounded above\n/PROVEFAB f3 Fixed\nsee /provefab F9 accepted inline\n```\n/provefab F4 waived\n```\n/provefab F5 maybe\n/provefab F6 accepted   \n";
+        let got = parse_commands(body);
+        assert_eq!(got.len(), 4);
+        assert_eq!(
+            got[0],
+            Ok(Command {
+                key: "F2".into(),
+                disposition: Disposition::Rejected,
+                reason: Some("the value is bounded above".into())
+            })
+        );
+        assert_eq!(
+            got[1],
+            Ok(Command {
+                key: "F3".into(),
+                disposition: Disposition::Fixed,
+                reason: None
+            })
+        );
+        assert_eq!(got[2], Err("/provefab F5 maybe".into()));
+        assert_eq!(
+            got[3],
+            Ok(Command {
+                key: "F6".into(),
+                disposition: Disposition::Accepted,
+                reason: None
+            })
+        );
     }
 
     #[test]

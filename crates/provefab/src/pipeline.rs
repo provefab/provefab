@@ -1092,7 +1092,10 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
         };
         match status.state {
-            PrState::Open => Ok(task.state),
+            PrState::Open => {
+                self.apply_finding_commands(&task, &status.comments).await?;
+                Ok(task.state)
+            }
             PrState::Merged => {
                 self.record_merge(
                     &task,
@@ -1106,12 +1109,19 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 Ok(task.state)
             }
             PrState::Closed => {
+                self.apply_finding_commands(&task, &status.comments).await?;
                 // Only the issue author and people with write access steer the
                 // provefab (the label rule, spec §3.3); never its own comments.
                 let findings: Vec<Finding> = status
                     .comments
                     .iter()
                     .filter(|c| !is_bot_comment(&c.body) && !c.body.trim().is_empty())
+                    .filter(|c| {
+                        !c.body
+                            .trim_start()
+                            .to_ascii_lowercase()
+                            .starts_with("/provefab ")
+                    })
                     .filter(|c| {
                         c.author == task.author
                             || matches!(c.association.as_str(), "OWNER" | "MEMBER" | "COLLABORATOR")
@@ -1306,6 +1316,12 @@ Please reply with what should happen, what happens instead, and how to reproduce
         if now() - merged_at > WATCH_FOR {
             self.store.set_pr_state(task.id, "archived").await?;
             return Ok(task.state);
+        }
+        if let Some(url) = &task.pr_url {
+            match self.hub.pr_status(&repo.slug, url).await {
+                Ok(status) => self.apply_finding_commands(task, &status.comments).await?,
+                Err(e) => eprintln!("provefab: could not read {url}: {e}"),
+            }
         }
         match self.hub.issue_open(&repo.slug, task.issue_number).await {
             Ok(false) if pr_state == "merged" => {

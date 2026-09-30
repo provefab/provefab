@@ -104,7 +104,6 @@ fn approve_with_findings(
 }
 
 /// A task driven to PrOpen with findings F1 and F2 (pass 1).
-#[allow(dead_code)]
 async fn open_task_with_findings() -> (Fixture, P, i64) {
     let f = fixture(&["test -f feature.txt"]);
     let p = pipeline(
@@ -330,5 +329,129 @@ async fn a_reopened_issue_marks_the_previous_pass_findings() {
             .filter(|e| e.kind == "finding_followed_by_reopen")
             .count(),
         2
+    );
+}
+
+fn comment(author: &str, association: &str, body: &str, at: &str) -> provefab::forge::Comment {
+    provefab::forge::Comment {
+        author: author.into(),
+        association: association.into(),
+        body: body.into(),
+        created_at: at.into(),
+    }
+}
+
+#[tokio::test]
+async fn authorized_commands_record_dispositions_once_and_the_latest_wins() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let task = p.store.task(id).await.unwrap().unwrap();
+    let cs = vec![
+        comment(
+            "alice",
+            "NONE",
+            "/provefab F1 rejected: false positive",
+            "2026-09-30T10:00:00Z",
+        ),
+        comment(
+            "mallory",
+            "NONE",
+            "/provefab F2 accepted",
+            "2026-09-30T10:01:00Z",
+        ),
+        comment(
+            "bob",
+            "MEMBER",
+            "/provefab F9 fixed\n/provefab F2 fixed",
+            "2026-09-30T10:02:00Z",
+        ),
+        comment(
+            "bob",
+            "MEMBER",
+            "/provefab F1 accepted",
+            "2026-09-30T10:03:00Z",
+        ),
+    ];
+    p.apply_finding_commands(&task, &cs).await.unwrap();
+    p.apply_finding_commands(&task, &cs).await.unwrap();
+    let ev = p.store.events(id).await.unwrap();
+    assert_eq!(
+        ev.iter()
+            .filter(|e| e.kind == "finding_disposition")
+            .count(),
+        3
+    );
+    let ignored: Vec<_> = ev
+        .iter()
+        .filter(|e| e.kind == "command_ignored")
+        .map(|e| e.payload["why"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ignored, ["not authorized", "unknown finding"]);
+    let current = p.store.current_dispositions(id).await.unwrap();
+    assert_eq!(current["F1"], provefab::record::Disposition::Accepted);
+    assert_eq!(current["F2"], provefab::record::Disposition::Fixed);
+}
+
+#[tokio::test]
+async fn open_prs_are_read_every_tick() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let mut status = p.hub.pr_status.lock().unwrap().clone();
+    status.comments = vec![comment(
+        "alice",
+        "NONE",
+        "/provefab F1 waived",
+        "2026-09-30T10:00:00Z",
+    )];
+    *p.hub.pr_status.lock().unwrap() = status;
+    p.watch_pr(id).await.unwrap();
+    assert_eq!(
+        p.store.current_dispositions(id).await.unwrap()["F1"],
+        provefab::record::Disposition::Waived
+    );
+}
+
+#[tokio::test]
+async fn merged_prs_are_still_read_after_the_merge() {
+    let (_f, p, id) = merged_task(&[]).await;
+    let url = p.store.task(id).await.unwrap().unwrap().pr_url.unwrap();
+    // The fake hub reads the per-URL entry first (merged_task filled it).
+    p.hub
+        .pr_statuses
+        .lock()
+        .unwrap()
+        .get_mut(&url)
+        .unwrap()
+        .comments = vec![comment(
+        "alice",
+        "NONE",
+        "/provefab F2 accepted",
+        "2026-09-30T11:00:00Z",
+    )];
+    p.watch_pr(id).await.unwrap();
+    assert_eq!(
+        p.store.current_dispositions(id).await.unwrap()["F2"],
+        provefab::record::Disposition::Accepted
+    );
+}
+
+#[tokio::test]
+async fn a_command_on_a_closed_pr_is_not_a_change_request() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let mut status = p.hub.pr_status.lock().unwrap().clone();
+    status.state = provefab::forge::PrState::Closed;
+    status.comments = vec![comment(
+        "alice",
+        "NONE",
+        "/provefab F1 rejected",
+        "2026-09-30T10:00:00Z",
+    )];
+    *p.hub.pr_status.lock().unwrap() = status;
+    let state = p.watch_pr(id).await.unwrap();
+    assert_eq!(state, Failed);
+    assert!(
+        p.store
+            .current_dispositions(id)
+            .await
+            .unwrap()
+            .contains_key("F1")
     );
 }

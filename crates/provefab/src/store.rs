@@ -1,6 +1,7 @@
 //! Durable task state in SQLite (spec §3.5). Every state change is written,
 //! with its reason, before the side effect it leads to (spec §3.2).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,7 +12,7 @@ use sqlx::sqlite::{
 use sqlx::{Row, SqliteConnection};
 
 use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
-use crate::record::{Event, FindingRow, RULE_VERSION, Rule, StoredEvent};
+use crate::record::{Disposition, Event, FindingRow, RULE_VERSION, Rule, StoredEvent};
 use crate::task::{TaskKind, TaskState};
 
 #[derive(Debug, thiserror::Error)]
@@ -926,6 +927,57 @@ impl Store {
                 text: r.get("text"),
                 event_id: r.get("event_id"),
             })
+            .collect())
+    }
+
+    /// Appends a human event unless the same comment already recorded the same
+    /// finding (dispositions) or line (ignored commands). False when it was.
+    pub async fn record_human(&self, task_id: i64, event: &Event) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let payload =
+            serde_json::to_value(event).map_err(|x| StoreError::Corrupt(x.to_string()))?;
+        let seen: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM change_events WHERE task_id = ? AND kind = ? \
+             AND json_extract(payload,'$.comment') = ? \
+             AND COALESCE(json_extract(payload,'$.finding'), json_extract(payload,'$.line')) = ?",
+        )
+        .bind(task_id)
+        .bind(event.kind())
+        .bind(payload["comment"].as_str())
+        .bind(payload["finding"].as_str().or(payload["line"].as_str()))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if seen.is_some() {
+            return Ok(false);
+        }
+        append_event(&mut tx, task_id, event).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn finding_keys(&self, task_id: i64) -> Result<HashSet<String>, StoreError> {
+        let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM findings WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(keys.into_iter().collect())
+    }
+
+    /// The latest recorded disposition per finding (event `seq` order).
+    pub async fn current_dispositions(
+        &self,
+        task_id: i64,
+    ) -> Result<HashMap<String, Disposition>, StoreError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT json_extract(payload,'$.finding'), json_extract(payload,'$.disposition') \
+             FROM change_events WHERE task_id = ? AND kind = 'finding_disposition' ORDER BY seq",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(k, d)| Disposition::parse(&d).map(|d| (k, d)))
             .collect())
     }
 
