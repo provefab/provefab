@@ -574,11 +574,14 @@ impl Store {
             )
             .await?;
             if to == CheckState::RevertOpen {
+                // The pass of the merge this check covers; the latest merge when
+                // none recorded its sha (GitHub never reported it).
                 let pass: Option<i64> = sqlx::query_scalar(
-                    "SELECT json_extract(payload, '$.pass') FROM change_events \
-                     WHERE task_id = ? AND kind = 'merged' ORDER BY seq DESC LIMIT 1",
+                    "SELECT json_extract(e.payload, '$.pass') FROM change_events e, post_merge_checks c \
+                     WHERE c.id = ? AND e.task_id = c.task_id AND e.kind = 'merged' \
+                     ORDER BY json_extract(e.payload, '$.sha') IS c.merge_sha DESC, e.seq DESC LIMIT 1",
                 )
-                .bind(task_id)
+                .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?
                 .flatten();
@@ -1956,6 +1959,59 @@ mod tests {
         assert_eq!(a.commit_count, Some(1));
         assert_eq!(a.pr_url.as_deref(), Some("https://github.com/o/r/pull/8"));
         assert_eq!(s.post_merge_checks(id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_revert_marks_the_findings_of_the_merge_its_check_covers() {
+        let (_d, s) = store().await;
+        let id = merged_task(&s).await;
+        let finding = crate::stage::Finding {
+            file: "a.rs".into(),
+            line: None,
+            severity: crate::stage::Severity::Minor,
+            text: "t".into(),
+        };
+        for pass in [1, 2] {
+            s.record_review(id, &json!({}), "m", pass, 0, "approve", &[finding.clone()])
+                .await
+                .unwrap();
+        }
+        for (sha, pass) in [("abc", 1), ("def", 2)] {
+            s.write_with_events(
+                id,
+                Write::Nothing,
+                &[Event::Merged {
+                    sha: Some(sha.into()),
+                    base: Some("main".into()),
+                    by: MergedBy::Human,
+                    pass,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        // The check of the first merge fails after the second was recorded.
+        let c = s
+            .ensure_post_merge_check(&new_check(id, "abc"))
+            .await
+            .unwrap();
+        s.advance_post_merge(
+            c.id,
+            CheckState::Queued,
+            CheckState::RevertOpen,
+            &CheckPatch::default(),
+        )
+        .await
+        .unwrap();
+        let reverted: Vec<_> = s
+            .events(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "finding_followed_by_revert")
+            .map(|e| e.payload["finding"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(reverted, ["F1"]);
     }
 
     #[tokio::test]
