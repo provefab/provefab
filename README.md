@@ -30,7 +30,7 @@ Requirements: macOS, `git` and `gh` (signed in with `gh auth login`), and at lea
 #       provefab-<version>-macos-universal.zip from the Releases page, unzip, then
 sudo install -m 755 provefab /usr/local/bin/provefab
 #    b. from source, with Rust 1.96 or newer:
-cargo install --git https://github.com/provefab/provefab --tag v0.1.0 --locked provefab
+cargo install --git https://github.com/provefab/provefab --tag v0.2.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
 provefab login claude        # Claude plan login, in ~/.provefab/claude
