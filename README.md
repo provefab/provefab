@@ -66,6 +66,8 @@ Then put the `provefab` label on an issue. Provefab picks it up at its next poll
 | queue an issue by hand, or restart a stopped task | `provefab add <issue-url>` |
 | check tools, logins, Jev and repositories | `provefab doctor` |
 | measure: PRs opened, merged (automatically or by hand), reviewers | `provefab stats` |
+| export the record as JSON Lines | `provefab export` |
+| delete old records | `provefab prune --before YYYY-MM-DD --yes` |
 | see whether the service runs | `provefab service status` |
 | follow the service live | `tail -f ~/.provefab/logs/run.log` |
 | stop the service | `provefab service uninstall` |
@@ -79,6 +81,7 @@ Provefab talks to you on GitHub, in issue comments that always start with *Poste
 | `provefab:in-pr` | a pull request is open |
 | `provefab:merged` | the pull request was merged |
 | `provefab:failed` | Provefab stopped; its comment says why |
+| `provefab:risk-<category>` | the change touches that risk category |
 
 ## Documentation
 

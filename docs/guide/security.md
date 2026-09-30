@@ -38,7 +38,7 @@ Jev classifies issues and routes stages. It can stop an agent going in circles, 
 
 This binary never merges. Every pull request waits for a person, and its text lists the checks that ran and any test the change deletes or disables.
 
-Provefab Pro adds merge policies. Ready to merge is the default; auto-merge is opt-in, needs a second reviewer on a different model, and conditions that all fail closed: checks passed, reproduction really failed for a bugfix, no test weakened, a test added or changed, no excluded path touched (`.github/**` by default), a size cap, an unchanged base, and a merge pinned to the checked commit. **Public repositories are never auto-merged by default**, since anyone can write their issues; a second model is not a defence against a crafted issue.
+Provefab Pro adds merge policies. Ready to merge is the default; auto-merge is opt-in, needs a second reviewer on a different model, and conditions that all fail closed: checks passed, reproduction really failed for a bugfix, no test weakened, a test added or changed, no excluded path touched (`.github/**` by default), no detected risk category unless `allow_risk` lists it (never `unknown`), a size cap, an unchanged base, and a merge pinned to the checked commit. **Public repositories are never auto-merged by default**, since anyone can write their issues; a second model is not a defence against a crafted issue.
 
 **Limits to know:**
 - An AI reviewer can be wrong. Keep your own review for anything that matters.

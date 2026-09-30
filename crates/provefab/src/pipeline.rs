@@ -1232,7 +1232,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
             PrState::Closed => {
                 self.apply_finding_commands(&task, &status.comments).await?;
-                // Only the issue author and people with write access steer the
+                // Only the issue author, and repository owners, organization members and collaborators, steer the
                 // provefab (the label rule, spec §3.3); never its own comments.
                 let findings: Vec<Finding> = status
                     .comments
