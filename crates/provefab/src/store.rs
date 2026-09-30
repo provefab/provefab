@@ -1410,11 +1410,16 @@ async fn infer_findings(
     }
     .kind();
     let keys: Vec<String> = match rule {
+        // Only the findings of the pass's last review: those the PR showed.
+        // Earlier rounds' findings were never in front of the person who merged.
         Rule::UnaddressedAtMerge => {
             sqlx::query_scalar(
-                "SELECT key FROM findings f WHERE task_id = ? AND pass = ? AND NOT EXISTS (\
-                   SELECT 1 FROM change_events e WHERE e.task_id = f.task_id AND e.kind = 'finding_disposition' \
-                   AND json_extract(e.payload, '$.finding') = f.key) ORDER BY id",
+                "SELECT j.value FROM change_events r, json_each(r.payload, '$.findings') j \
+                 WHERE r.id = (SELECT id FROM change_events WHERE task_id = ? AND kind = 'review' \
+                   AND json_extract(payload, '$.pass') = ? ORDER BY seq DESC LIMIT 1) \
+                 AND NOT EXISTS (SELECT 1 FROM change_events e WHERE e.task_id = r.task_id \
+                   AND e.kind = 'finding_disposition' AND json_extract(e.payload, '$.finding') = j.value) \
+                 ORDER BY j.key",
             )
             .bind(task_id)
             .bind(pass)

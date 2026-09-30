@@ -129,15 +129,17 @@ async fn merged_task_with(
     checks: &[&str],
     comments: Vec<provefab::forge::Comment>,
 ) -> (Fixture, P, i64) {
+    merged_task_scripted(checks, comments, Box::new(approve_with_findings)).await
+}
+
+async fn merged_task_scripted(
+    checks: &[&str],
+    comments: Vec<provefab::forge::Comment>,
+    script: Box<Script>,
+) -> (Fixture, P, i64) {
     let mut f = fixture(&["test -f feature.txt"]);
     f.config.repos[0].post_merge_checks = checks.iter().map(|c| c.to_string()).collect();
-    let p = pipeline(
-        &f,
-        Box::new(approve_with_findings),
-        FakeOracle::default(),
-        FakeHub::new("x"),
-    )
-    .await;
+    let p = pipeline(&f, script, FakeOracle::default(), FakeHub::new("x")).await;
     *p.hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
     let id = queue(&p).await;
     assert_eq!(p.drive(id).await.unwrap(), PrOpen);
@@ -167,12 +169,10 @@ fn review_with(findings: serde_json::Value, verdict: &str) -> serde_json::Value 
     serde_json::json!({"verdict": verdict, "findings": findings})
 }
 
-#[tokio::test]
-async fn review_findings_get_stable_keys_across_rounds() {
-    // Round 1 asks for changes with two findings, round 2 approves with one minor note.
-    let f = fixture(&["test -f feature.txt"]);
+/// Round 0 asks for changes with F1 and F2, round 1 approves with F3.
+fn two_rounds() -> Box<Script> {
     let rounds = std::sync::Mutex::new(0);
-    let script =
+    Box::new(
         move |m: &provefab::config::ModelEntry,
               req: &agent_workers::StageRequest,
               tx: &tokio::sync::mpsc::UnboundedSender<agent_workers::WorkerEvent>| {
@@ -199,14 +199,14 @@ async fn review_findings_get_stable_keys_across_rounds() {
                 }
                 _ => happy(m, req, tx),
             }
-        };
-    let p = pipeline(
-        &f,
-        Box::new(script),
-        FakeOracle::default(),
-        FakeHub::new("x"),
+        },
     )
-    .await;
+}
+
+#[tokio::test]
+async fn review_findings_get_stable_keys_across_rounds() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(&f, two_rounds(), FakeOracle::default(), FakeHub::new("x")).await;
     let id = queue(&p).await;
     assert_eq!(p.drive(id).await.unwrap(), PrOpen);
     let fs = p.store.findings(id).await.unwrap();
@@ -298,6 +298,31 @@ async fn opening_and_merging_a_pr_are_facts_and_open_findings_are_inferred_unadd
             .filter(|e| e.kind == "finding_unaddressed_at_merge")
             .count(),
         2
+    );
+}
+
+fn inferred(ev: &[provefab::record::StoredEvent], kind: &str) -> Vec<String> {
+    ev.iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| e.payload["finding"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn only_the_findings_shown_in_the_merged_pr_are_inferred_unaddressed() {
+    let (_f, p, id) = merged_task_scripted(&[], vec![], two_rounds()).await;
+    let ev = p.store.events(id).await.unwrap();
+    assert_eq!(inferred(&ev, "finding_unaddressed_at_merge"), ["F3"]);
+    // A reopen still names every finding of the pass.
+    p.store.set_pr_state(id, "done").await.unwrap();
+    p.hub
+        .issue_is_open
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    p.watch_pr(id).await.unwrap();
+    let ev = p.store.events(id).await.unwrap();
+    assert_eq!(
+        inferred(&ev, "finding_followed_by_reopen"),
+        ["F1", "F2", "F3"]
     );
 }
 
