@@ -2630,6 +2630,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
             .collect();
         if !extra.is_empty() {
             let report = self.gates_rerun(task, wt, &extra, "risk-gates").await?;
+            // Its score may be compared with a regular gates score of the previous
+            // attempt; a wrong "improved" only costs a retry the attempt ladder bounds.
             if let Some(state) = self.gate_failed(task, repo, &report).await? {
                 return Ok(Some(state));
             }

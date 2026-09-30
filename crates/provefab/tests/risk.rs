@@ -343,6 +343,73 @@ async fn a_same_round_reclassification_does_not_relabel() {
     assert_eq!(risk_edits, 1, "{edits:?}");
 }
 
+/// I4: the agent commits its own work, then the base commit object goes
+/// missing, so `changed_files(base...HEAD)` fails right after the round's
+/// commit. The review's own diff then fails too (the task waits); the
+/// object is put back and the task retried at once.
+#[tokio::test]
+async fn changed_files_that_cannot_be_computed_are_unknown() {
+    for (codex_frontier, reviewer, line) in [
+        (false, "std-codex", NO_FRONTIER),
+        (true, "top-codex", "reviewer: frontier"),
+    ] {
+        let mut f = fixture(&["test -f feature.txt"]);
+        if codex_frontier {
+            with_codex_frontier(&mut f);
+        }
+        let hidden: std::sync::Arc<Mutex<Option<(PathBuf, PathBuf)>>> = Default::default();
+        let aside = hidden.clone();
+        let script =
+            move |m: &ModelEntry, req: &StageRequest, tx: &UnboundedSender<WorkerEvent>| {
+                if stage_of(&req.prompt) != "implement" {
+                    return happy(m, req, tx);
+                }
+                let base = git(&req.cwd, &["rev-parse", "HEAD"]);
+                let common = req
+                    .cwd
+                    .join(git(&req.cwd, &["rev-parse", "--git-common-dir"]));
+                std::fs::write(req.cwd.join("feature.txt"), "done\n").unwrap();
+                git(&req.cwd, &["add", "-A"]);
+                git(&req.cwd, &["commit", "-qm", "agent"]);
+                let object = common.join("objects").join(&base[..2]).join(&base[2..]);
+                let moved = common.join("base-object");
+                std::fs::rename(&object, &moved).unwrap();
+                *aside.lock().unwrap() = Some((moved, object));
+                done(None)
+            };
+        let p = pipeline(
+            &f,
+            Box::new(script),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await;
+        let id = queue(&p).await;
+        let mut state = p.drive(id).await.unwrap();
+        assert_eq!(classified(&p, id).await, vec![provefab::risk::unknown()]);
+        if let Some((moved, object)) = hidden.lock().unwrap().take() {
+            std::fs::rename(moved, object).unwrap();
+        }
+        if state == Waiting {
+            // The review's diff failed on the missing object: retry now.
+            p.store
+                .record_output(id, "transient", &json!({"pass": 1, "at": 0}))
+                .await
+                .unwrap();
+            state = p.drive(id).await.unwrap();
+        }
+        assert_eq!(state, PrOpen);
+        assert_eq!(reviewers(&p), [reviewer]);
+        let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+        assert!(
+            body.contains(&format!(
+                "- unknown: the changed files could not be computed · {line}\n"
+            )),
+            "{body}"
+        );
+    }
+}
+
 fn headers(body: &str) -> Vec<&str> {
     body.lines().filter(|l| l.starts_with("## ")).collect()
 }
