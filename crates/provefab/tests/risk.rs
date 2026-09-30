@@ -40,6 +40,28 @@ async fn classified(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>, id: i64) -> V
         .collect()
 }
 
+/// A frontier model from another provider than the implementer (`std-claude`).
+fn with_codex_frontier(f: &mut Fixture) {
+    f.config.models.push(
+        toml::from_str(
+            "id = \"top-codex\"\nworker = \"codex\"\nmodel = \"gpt-5.5-pro\"\ntier = \"frontier\"",
+        )
+        .unwrap(),
+    );
+}
+
+fn reviewers(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>) -> Vec<String> {
+    p.runner
+        .stages()
+        .into_iter()
+        .filter(|(_, s)| s == "review")
+        .map(|(m, _)| m)
+        .collect()
+}
+
+const NO_FRONTIER: &str =
+    "reviewer: standard (no frontier reviewer from another provider is configured)";
+
 fn gate_stages(stages: &[provefab::store::StageRunRecord]) -> Vec<String> {
     stages.iter().map(|r| r.stage.clone()).collect()
 }
@@ -47,6 +69,7 @@ fn gate_stages(stages: &[provefab::store::StageRunRecord]) -> Vec<String> {
 #[tokio::test]
 async fn a_migration_is_classified_checked_reviewed_on_frontier_and_labelled() {
     let mut f = fixture(&["test -f feature.txt"]);
+    with_codex_frontier(&mut f);
     f.config.repos[0].risk = migration_checks(r#"["test -f migrations/0005.sql"]"#);
     let label = format!("{}:risk-migrations", f.config.repos[0].label);
     let p = pipeline(
@@ -68,13 +91,7 @@ async fn a_migration_is_classified_checked_reviewed_on_frontier_and_labelled() {
     );
     let stages = gate_stages(&p.store.stage_runs(id).await.unwrap());
     assert!(stages.contains(&"risk-gates".to_string()), "{stages:?}");
-    assert!(
-        p.runner
-            .stages()
-            .contains(&("top-claude".to_string(), "review".to_string())),
-        "{:?}",
-        p.runner.stages()
-    );
+    assert_eq!(reviewers(&p), ["top-codex"], "{:?}", p.runner.stages());
     assert!(p.hub.ensured.lock().unwrap().contains(&label));
     let edits = p.hub.labels.lock().unwrap().clone();
     assert!(
@@ -106,8 +123,40 @@ async fn a_failing_risk_check_goes_back_to_implementation() {
     assert!(prompts[2].contains("gate `false` failed"), "{}", prompts[2]);
 }
 
+/// O1 (owner decision 2026-09-30): the only frontier model shares the
+/// implementer's provider, so the review keeps its standard cross-provider
+/// reviewer and the PR says so.
 #[tokio::test]
-async fn no_frontier_model_parks_the_task() {
+async fn a_same_provider_frontier_keeps_the_cross_provider_reviewer() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(risky),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let implementers: Vec<_> = p
+        .runner
+        .stages()
+        .into_iter()
+        .filter(|(_, s)| s == "implement")
+        .collect();
+    assert_eq!(implementers[0].0, "std-claude", "{implementers:?}");
+    assert_eq!(reviewers(&p), ["std-codex"]);
+    let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+    assert!(
+        body.contains(&format!(
+            "- migrations: `migrations/0005.sql` · {NO_FRONTIER}\n"
+        )),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn no_frontier_model_keeps_the_cross_provider_reviewer() {
     let mut f = fixture(&["test -f feature.txt"]);
     f.config
         .models
@@ -120,16 +169,10 @@ async fn no_frontier_model_parks_the_task() {
     )
     .await;
     let id = queue(&p).await;
-    assert_eq!(p.drive(id).await.unwrap(), NeedsYou);
-    let posted = p.hub.posted.lock().unwrap().clone();
-    assert!(
-        posted
-            .last()
-            .unwrap()
-            .contains("requires a frontier reviewer"),
-        "{posted:?}"
-    );
-    assert!(!p.runner.stages().iter().any(|(_, s)| s == "review"));
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    assert_eq!(reviewers(&p), ["std-codex"]);
+    let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+    assert!(body.contains(NO_FRONTIER), "{body}");
 }
 
 #[tokio::test]
@@ -199,7 +242,8 @@ async fn a_risk_check_already_in_gates_runs_once() {
 
 #[tokio::test]
 async fn a_later_round_without_the_category_removes_its_label() {
-    let f = fixture(&["test -f feature.txt"]);
+    let mut f = fixture(&["test -f feature.txt"]);
+    with_codex_frontier(&mut f);
     let label = format!("{}:risk-migrations", f.config.repos[0].label);
     let implements = Mutex::new(0);
     let reviews = Mutex::new(0);
@@ -246,16 +290,10 @@ async fn a_later_round_without_the_category_removes_its_label() {
         .filter(|(a, r)| a.contains(&label) || r.contains(&label))
         .collect();
     assert!(risk_edits.last().unwrap().1.contains(&label), "{edits:?}");
-    let reviewers: Vec<String> = p
-        .runner
-        .stages()
-        .into_iter()
-        .filter(|(_, s)| s == "review")
-        .map(|(m, _)| m)
-        .collect();
+    let reviewers = reviewers(&p);
     assert_eq!(reviewers.len(), 2, "{reviewers:?}");
-    assert_eq!(reviewers[0], "top-claude");
-    assert_ne!(reviewers[1], "top-claude");
+    assert_eq!(reviewers[0], "top-codex");
+    assert_ne!(reviewers[1], "top-codex");
 }
 
 fn headers(body: &str) -> Vec<&str> {
@@ -265,6 +303,7 @@ fn headers(body: &str) -> Vec<&str> {
 #[tokio::test]
 async fn the_pr_body_lists_the_risk_after_the_checks() {
     let mut f = fixture(&["test -f feature.txt"]);
+    with_codex_frontier(&mut f);
     f.config.repos[0].risk = migration_checks(r#"["test -f migrations/0005.sql"]"#);
     let p = pipeline(
         &f,

@@ -982,14 +982,20 @@ pub async fn doctor(
         if let Ok(policy) = crate::risk::resolve(repo.risk.as_ref()) {
             let names: Vec<&str> = policy.categories.iter().map(|c| c.name.as_str()).collect();
             let checks_n: usize = policy.categories.iter().map(|c| c.checks.len()).sum();
+            let mut detail = format!(
+                "{} categories: {}; checks: {checks_n}",
+                names.len(),
+                names.join(", ")
+            );
+            // Risk policy §7 (option 1): a same-provider frontier model never
+            // reviews its own provider's work, so it does not count.
+            if !crate::risk::cross_provider_frontier(&config.models) {
+                detail.push_str("; warning: no frontier model from a second provider, risky changes keep a standard cross-provider reviewer");
+            }
             checks.push(Check {
                 name: format!("risk {}", repo.slug),
                 ok: true,
-                detail: format!(
-                    "{} categories: {}; checks: {checks_n}",
-                    names.len(),
-                    names.join(", ")
-                ),
+                detail,
             });
         }
         checks.push(Check {
@@ -1212,9 +1218,20 @@ checks = ["./scripts/check-migration.sh"]
         let risk = checks.iter().find(|c| c.name == "risk o/r").unwrap();
         assert!(risk.ok, "{risk:?}");
         assert!(
-            risk.detail.starts_with("5 categories: ") && risk.detail.ends_with("; checks: 1"),
+            risk.detail.starts_with("5 categories: ")
+                && risk.detail.ends_with(
+                    "; checks: 1; warning: no frontier model from a second provider, risky changes keep a standard cross-provider reviewer"
+                ),
             "{risk:?}"
         );
+        let mut two = config.clone();
+        two.models.push(
+            toml::from_str("id = \"x\"\nworker = \"codex\"\nmodel = \"gpt\"\ntier = \"frontier\"")
+                .unwrap(),
+        );
+        let checks = doctor(&tools, &two, &Paths::new(d), None).await;
+        let risk = checks.iter().find(|c| c.name == "risk o/r").unwrap();
+        assert!(risk.detail.ends_with("; checks: 1"), "{risk:?}");
     }
 
     #[tokio::test]

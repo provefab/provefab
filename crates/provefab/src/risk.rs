@@ -3,6 +3,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::ModelEntry;
+use crate::task::Tier;
+
 /// Reserved category: the changed paths could not be computed (fail closed).
 pub const UNKNOWN: &str = "unknown";
 
@@ -255,6 +258,31 @@ impl Policy {
     }
 }
 
+/// The review tier the risk policy asks for (spec §7, amended 2026-09-30):
+/// frontier when a detected category needs it and the catalog has a
+/// frontier model from a provider other than the implementer's; `None`
+/// otherwise, so the usual tier and cross-provider choice apply. The PR's
+/// Risk section reads the same answer, so it states what ran.
+pub fn risky_review_tier(
+    catalog: &[ModelEntry],
+    implementer: Option<&str>,
+    needs_frontier: bool,
+) -> Option<Tier> {
+    (needs_frontier
+        && catalog
+            .iter()
+            .any(|m| m.tier == Tier::Frontier && Some(m.provider_key().as_str()) != implementer))
+    .then_some(Tier::Frontier)
+}
+
+/// Some frontier model differs in provider from some standard model: a
+/// risky change implemented on standard can get a frontier reviewer from
+/// another provider (`provefab doctor`).
+pub fn cross_provider_frontier(catalog: &[ModelEntry]) -> bool {
+    let of = |t: Tier| catalog.iter().filter(move |m| m.tier == t);
+    of(Tier::Frontier).any(|f| of(Tier::Standard).any(|s| s.provider_key() != f.provider_key()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +422,41 @@ mod tests {
         // Extending a built-in is validated the same way.
         let c: RiskConfig = toml::from_str("[categories.ci]\npaths = [\"ci/\"]").unwrap();
         assert!(resolve(Some(&c)).is_err());
+    }
+
+    fn model(id: &str, worker: &str, tier: &str) -> ModelEntry {
+        toml::from_str(&format!(
+            "id = \"{id}\"\nworker = \"{worker}\"\nmodel = \"m\"\ntier = \"{tier}\""
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_risky_review_is_frontier_only_from_another_provider() {
+        let std_claude = model("s", "claude-code", "standard");
+        let std_codex = model("c", "codex", "standard");
+        let top_claude = model("t", "claude-code", "frontier");
+        let top_codex = model("x", "codex", "frontier");
+        let same = [std_claude.clone(), std_codex.clone(), top_claude.clone()];
+        let other = [std_claude.clone(), std_codex.clone(), top_codex.clone()];
+        let none = [std_claude.clone(), std_codex.clone()];
+        let claude = Some("claude-code");
+        assert_eq!(risky_review_tier(&same, claude, true), None);
+        assert_eq!(
+            risky_review_tier(&other, claude, true),
+            Some(Tier::Frontier)
+        );
+        assert_eq!(risky_review_tier(&none, claude, true), None);
+        assert_eq!(risky_review_tier(&other, claude, false), None);
+        // No implement run recorded: any frontier model differs from it.
+        assert_eq!(risky_review_tier(&same, None, true), Some(Tier::Frontier));
+        assert!(!cross_provider_frontier(&same[..2]));
+        assert!(!cross_provider_frontier(&[
+            std_claude.clone(),
+            top_claude.clone()
+        ]));
+        assert!(cross_provider_frontier(&same));
+        assert!(cross_provider_frontier(&other));
     }
 
     #[test]

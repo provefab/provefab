@@ -253,15 +253,24 @@ fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
 
 /// The PR body's "Risk" section, `None` when nothing was detected: one line
 /// per category with its paths, the checks it added and the reviewer tier.
-fn risk_section(policy: &risk::Policy, detected: &[Detected]) -> Option<String> {
+/// `frontier_ok`: `risk::risky_review_tier` found a frontier reviewer from
+/// another provider, so a category wanting frontier got one.
+fn risk_section(policy: &risk::Policy, detected: &[Detected], frontier_ok: bool) -> Option<String> {
     const SHOWN: usize = 5;
     if detected.is_empty() {
         return None;
     }
+    let wanted = if frontier_ok {
+        "frontier"
+    } else {
+        "standard (no frontier reviewer from another provider is configured)"
+    };
     let mut s = String::from("## Risk\n\n");
     for d in detected {
         if d.name == risk::UNKNOWN {
-            s.push_str("- unknown: the changed files could not be computed · reviewer: frontier\n");
+            s.push_str(&format!(
+                "- unknown: the changed files could not be computed · reviewer: {wanted}\n"
+            ));
             continue;
         }
         let cat = policy.categories.iter().find(|c| c.name == d.name);
@@ -280,7 +289,7 @@ fn risk_section(policy: &risk::Policy, detected: &[Detected]) -> Option<String> 
             s.push_str(&format!(" · checks added: {}", checks.join(", ")));
         }
         let tier = if cat.is_none_or(|c| c.frontier) {
-            "frontier"
+            wanted
         } else {
             "standard"
         };
@@ -1134,15 +1143,22 @@ Please reply with what should happen, what happens instead, and how to reproduce
         {
             tier = resolve(Tier::Frontier);
         }
-        // A risky change is reviewed on the frontier tier (risk policy §7).
+        // A risky change is reviewed on the frontier tier when a frontier model
+        // from another provider than the implementer's exists; otherwise the
+        // usual cross-provider reviewer stays (risk policy §7, owner decision
+        // 2026-09-30, option 1).
         if stage == Stage::Review
             && let Some(detected) = self.risk_of_round(task).await?
             && let Some(repo) = self.repo(task)
-            && risk::resolve(repo.risk.as_ref())
-                .map(|p| p.needs_frontier(&detected))
-                .unwrap_or(true)
+            && let Some(t) = risk::risky_review_tier(
+                &self.config.models,
+                self.implementer_provider(task.id).await?.as_deref(),
+                risk::resolve(repo.risk.as_ref())
+                    .map(|p| p.needs_frontier(&detected))
+                    .unwrap_or(true),
+            )
         {
-            tier = resolve(Tier::Frontier);
+            tier = resolve(t);
         }
         Ok(tier)
     }
@@ -2554,8 +2570,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
 
     /// Risk policy §6-§7 for this round: classify the changed paths (`None`:
     /// they could not be computed, fail closed as `unknown`), record it, label
-    /// the issue, run the categories' extra checks, and require a frontier
-    /// reviewer when a category asks for one. `Some` ends the round.
+    /// the issue and run the categories' extra checks (`tier_for` picks the
+    /// reviewer). `Some` ends the round.
     async fn risk_round(
         &self,
         task: &TaskRow,
@@ -2610,21 +2626,6 @@ Please reply with what should happen, what happens instead, and how to reproduce
             if let Some(state) = self.gate_failed(task, repo, &report).await? {
                 return Ok(Some(state));
             }
-        }
-        if policy.needs_frontier(&detected)
-            && !self.config.models.iter().any(|m| m.tier == Tier::Frontier)
-        {
-            let names: Vec<&str> = detected.iter().map(|d| d.name.as_str()).collect();
-            return self
-                .give_up(
-                    task,
-                    Some(repo),
-                    TaskState::NeedsYou,
-                    "a risk category requires a frontier reviewer and none is configured",
-                    &format!("detected: {}", names.join(", ")),
-                )
-                .await
-                .map(Some);
         }
         Ok(None)
     }
@@ -3033,10 +3034,15 @@ Please reply with what should happen, what happens instead, and how to reproduce
         // the task's current (pass, round) is the change being proposed.
         if let Some(detected) = self.risk_of_round(task).await?
             && let Ok(policy) = risk::resolve(repo.risk.as_ref())
-            && let Some(section) = risk_section(&policy, &detected)
         {
-            b.push('\n');
-            b.push_str(&section);
+            let implementer = self.implementer_provider(task.id).await?;
+            let frontier_ok =
+                risk::risky_review_tier(&self.config.models, implementer.as_deref(), true)
+                    .is_some();
+            if let Some(section) = risk_section(&policy, &detected, frontier_ok) {
+                b.push('\n');
+                b.push_str(&section);
+            }
         }
         let base = self.pass_base(task, repo).await?;
         let changed = self.git.changed_files(wt, &base).await.unwrap_or_default();
@@ -3287,11 +3293,22 @@ mod tests {
         let s = risk_section(
             &policy,
             &[det("migrations", &["a", "b"]), det("ci", &["x.yml"])],
+            true,
         )
         .unwrap();
         assert_eq!(
             s,
             "## Risk\n\n- migrations: `a`, `b` · checks added: `./c.sh` · reviewer: frontier\n- ci: `x.yml` · reviewer: standard\n\n"
+        );
+        let s = risk_section(
+            &policy,
+            &[det("migrations", &["a"]), det("ci", &["x.yml"])],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            "## Risk\n\n- migrations: `a` · checks added: `./c.sh` · reviewer: standard (no frontier reviewer from another provider is configured)\n- ci: `x.yml` · reviewer: standard\n\n"
         );
     }
 
@@ -3301,12 +3318,12 @@ mod tests {
             categories: vec![cat("ci", &[], true)],
         };
         let paths = ["1", "2", "3", "4", "5", "6", "7"];
-        let s = risk_section(&policy, &[det("ci", &paths)]).unwrap();
+        let s = risk_section(&policy, &[det("ci", &paths)], true).unwrap();
         assert!(
             s.contains("- ci: `1`, `2`, `3`, `4`, `5`, and 2 more · reviewer: frontier\n"),
             "{s}"
         );
-        let five = risk_section(&policy, &[det("ci", &paths[..5])]).unwrap();
+        let five = risk_section(&policy, &[det("ci", &paths[..5])], true).unwrap();
         assert!(!five.contains("more"), "{five}");
     }
 
@@ -3314,10 +3331,14 @@ mod tests {
     fn risk_section_unknown_and_empty() {
         let policy = risk::Policy::default();
         assert_eq!(
-            risk_section(&policy, &risk::unknown()).unwrap(),
+            risk_section(&policy, &risk::unknown(), true).unwrap(),
             "## Risk\n\n- unknown: the changed files could not be computed · reviewer: frontier\n\n"
         );
-        assert_eq!(risk_section(&policy, &[]), None);
+        assert_eq!(
+            risk_section(&policy, &risk::unknown(), false).unwrap(),
+            "## Risk\n\n- unknown: the changed files could not be computed · reviewer: standard (no frontier reviewer from another provider is configured)\n\n"
+        );
+        assert_eq!(risk_section(&policy, &[], true), None);
     }
 
     #[test]
