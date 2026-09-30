@@ -100,6 +100,61 @@ For gates that work well:
 - If the repository has slow tests, keep a representative subset and let your GitHub CI do the rest.
 - **Never share a build directory between tasks** (for example one `CARGO_TARGET_DIR` for every worktree). Cargo can then reuse binaries built from another task's code, and the checks pass or fail on the wrong code. Each worktree builds in its own `target/`, which the agent already warmed during implementation. To go faster safely, use a content-addressed cache such as `sccache` (`RUSTC_WRAPPER=sccache`).
 
+## `[repos.risk]`: risk-aware policy
+
+Provefab classifies each round's changed files by path into risk categories. A risky change gets stricter handling: extra checks, a frontier reviewer, a visible Risk section in the PR and a label on the issue. The policy raises scrutiny; it does not prove a change is harmless. It works with no configuration, and `[repos.risk]` is optional. Path matching only: file contents are not read.
+
+**Built-in categories** (a path matching any pattern puts the change in the category):
+
+| Category | Patterns |
+|---|---|
+| `ci` | `.github/**`, `.gitlab-ci.yml`, `.circleci/**` |
+| `dependencies` | `**/Cargo.toml`, `**/Cargo.lock`, `**/package.json`, `**/*lock*.json`, `**/pnpm-lock.yaml`, `**/yarn.lock`, `**/go.mod`, `**/go.sum`, `**/requirements*.txt`, `**/pyproject.toml`, `**/Gemfile*` |
+| `migrations` | `**/migrations/**`, `**/*.sql` |
+| `infrastructure` | `**/Dockerfile*`, `**/*.tf`, `k8s/**`, `helm/**`, `**/docker-compose*.yml` |
+| `secrets-config` | `**/.env*`, `**/*.pem`, `**/*.key`, `**/*secret*` |
+
+**Patterns.** `/`-separated, anchored at the repository root, case-sensitive. `**` matches any number of segments (including none), `*` any run of characters inside one segment, everything else literally. `.gitlab-ci.yml` matches only the root file; write `**/<name>` for any directory. For a rename, both the old and the new path count.
+
+| Field | Default | Role |
+|---|---|---|
+| `disable` | `[]` | Built-in categories to turn off, by name. |
+| `[repos.risk.categories.<name>]` | none | Adds a category, or extends a built-in of the same name. |
+| `paths` | required for a new category | Patterns of the category. For a built-in, they are added to its patterns. |
+| `checks` | `[]` | Commands run in the worktree, after your `gates`, when the category is detected. For a built-in, they replace its checks. A command already in `gates` runs once. Same timeout and rerun rules as gates; a failure sends the task back to implementation. |
+| `reviewer_tier` | `frontier` | `frontier` or `standard`: the tier of the review when the category is detected. |
+
+```toml
+[[repos]]
+slug = "acme/api"
+gates = ["cargo test"]
+
+[repos.risk]
+disable = ["secrets-config"]
+
+[repos.risk.categories.auth]
+paths = ["src/auth/**", "src/billing/**"]
+checks = ["cargo test --test auth"]
+
+[repos.risk.categories.migrations]
+paths = ["db/schema/**"]
+checks = ["./scripts/check-migration.sh"]
+```
+
+Category names use lowercase letters, digits and `-`. `unknown` is reserved: Provefab uses it when the changed files cannot be computed.
+
+**Validation errors** (a task on a repository with an invalid `[repos.risk]` stops in `needs_you` with the message):
+
+- `unknown category in disable: <name>`: `disable` names something that is not built-in.
+- `invalid category name: <name>`: empty, `unknown`, or not lowercase letters, digits and `-`.
+- `<name>: empty path`, `<name>: empty check`: a blank entry.
+- `<name>: no paths`: a new category without `paths`.
+- `<name>: reviewer_tier must be standard or frontier`.
+- `<name> is disabled`: the same built-in is in `disable` and in `categories`.
+- An unknown key under `[repos.risk]` is refused when the file loads.
+
+`provefab doctor` prints one `risk <slug>` line per repository: the category count and names, and how many checks were added. See [Usage](usage.md#risk-aware-changes) for what happens to a risky change.
+
 ## `[limits]`
 
 | Field | Default | Role |

@@ -1,7 +1,7 @@
 # Risk-aware policy
 
 - Date: 2026-09-30
-- Status: approved in conversation; awaiting written-spec review
+- Status: implemented on feature/risk-policy; release pending
 - Feature: #5 of the product direction. Core part (this repo) plus a Pro part (`provefab-pro`), described together because the core carries the policy and Pro only reads it at merge time.
 
 ## 1. Intent
@@ -56,7 +56,7 @@ A small matcher in the core, no new dependency: patterns are `/`-separated; `**`
 
 - `risk::classify(policy, paths) -> Vec<Detected>` is pure: for each category (in a stable order: built-ins in table order, then repository categories by name), the list of paths that matched. Categories with no match are absent.
 - Input paths: every path `Git::changed_files(base...HEAD)` reports, including both sides of a rename.
-- Run after each implementation round, on the actual diff, before the gates. If the changed paths cannot be computed, the result is the single category `unknown` (fail closed: frontier reviewer; Pro never auto-merges it).
+- Run after each implementation round, on the actual diff. (amended 2026-09-30 in the plan) Classification runs in the gate step right after the round is committed, because the diff exists only then; the categories' extra checks run as a second gates pass named `risk-gates`, after the repository's own gates. If the changed paths cannot be computed, the result is the single category `unknown` (fail closed: frontier reviewer; Pro never auto-merges it) and the round continues.
 - Each classification is recorded as a `risk_classified` event (source `fact`, schema_version 1): `{ pass, round, categories: [{ name, paths }] }`. The record's export treats `paths` as identity (not free text).
 
 ## 7. Consequences in the core
@@ -64,7 +64,7 @@ A small matcher in the core, no new dependency: patterns are `/`-separated; `**`
 1. Gates: the union of the detected categories' `checks` is appended to the repository's gates for that round, deduplicated, in category order; same timeout and rerun rules; a failure is an ordinary gate failure (back to implementation). The stage run and `gates_run` event record them like other gates.
 2. Review: when any detected category (or `unknown`) has `reviewer_tier = "frontier"`, the review stage runs on the frontier tier (a new rule in `review_tier`, after the existing ones). If no frontier model is configured, the task goes to `needs_you` with the reason "a risk category requires a frontier reviewer and none is configured".
 3. PR body: a "Risk" section, one line per category: `- migrations: \`migrations/0005.sql\`, \`db/schema/users.sql\` · checks added: \`./scripts/check-migration.sh\` · reviewer: frontier` (paths listed up to 5, then "and N more"). No section when nothing is detected.
-4. Labels: `<label>:risk-<category>` for each detected category, created like the other Provefab labels; stale risk labels from an earlier round are removed.
+4. Labels: `<label>:risk-<category>` for each detected category, created like the other Provefab labels; stale risk labels from an earlier round are removed. (amended 2026-09-30 in the plan) The labels go on the issue like every Provefab label, created on demand with `ensure_label`, and are applied right after classification, before the extra checks run.
 5. `provefab log` shows the risk classification of each round.
 
 ## 8. Provefab Pro

@@ -59,6 +59,16 @@ gates = ["cargo fmt -- --check", "cargo clippy --all-targets -- -D warnings", "c
 # auto = true
 # max_lines = 400
 
+# Risk-aware policy (optional): changed paths in ci, dependencies, migrations,
+# infrastructure or secrets-config get a frontier reviewer, a Risk section in the PR
+# and a provefab:risk-<category> label. Add your own sensitive paths:
+# [repos.risk]
+# disable = ["infrastructure"]                # turn a built-in category off
+# [repos.risk.categories.auth]
+# paths = ["src/auth/**", "src/billing/**"]   # anchored at the repository root
+# checks = ["cargo test --test auth"]         # extra commands after gates, when touched
+# reviewer_tier = "frontier"                  # or "standard"
+
 [limits]
 stage_timeout = "30m"
 gate_timeout = "20m"

@@ -16,6 +16,19 @@
 8. **Pull request.** Provefab commits, pushes and opens the PR. Its text lists the checks, the routing, and any deleted or disabled tests. It comments on the issue and sets `provefab:in-pr`. The PR then waits for your review.
 9. **Optional post-merge verification.** If you set `post_merge_checks`, Provefab runs them on the exact commit its PR produced on the base branch. A failing command is rerun once on a fresh checkout; if it passes then, the run counts as passed and the command is reported as flaky. On a confirmed failure, Provefab runs the same checks on the current base: if they pass, a later commit already fixed it and no revert is proposed. Otherwise Provefab prepares a revert on the current base and opens a revert PR only if the reverted tree passes the same checks. Every merge is verified. A revert is never proposed for a multi-commit PR merged by a person (Provefab cannot tell a squash from a rebase): its failure is reported and a human decides. Revert conflicts, failing revert checks, and a base branch that keeps moving also require a human. Provefab never merges a revert PR. These are repository commands, not production monitoring.
 
+## Risk-aware changes
+
+After each implementation round is committed, Provefab classifies the changed files by path (see `[repos.risk]` in [Configuration](configuration.md#reposrisk-risk-aware-policy)). Nothing changes when no category is detected. When one is:
+
+- **Extra checks.** The `checks` of the detected categories run after your `gates`, as a second pass named `risk-gates`. A failure counts like a failing gate: the task goes back to implementation.
+- **Frontier reviewer.** The review runs on the `frontier` tier, unless every detected category says `reviewer_tier = "standard"`. With no frontier model in the catalog, the task stops in `needs_you` with "a risk category requires a frontier reviewer and none is configured": add a frontier model, or set `reviewer_tier = "standard"` for that category.
+- **Risk section.** The PR body lists each category with its paths (five, then "and N more"), the checks it added and the reviewer tier.
+- **Issue labels.** `<label>:risk-<category>` (for example `provefab:risk-migrations`) goes on the issue right after classification, created on demand. A later round that no longer touches a category removes its label.
+- **`unknown`.** If the changed files cannot be computed, the round is classified `unknown`: frontier reviewer, and the round continues.
+- **Provefab Pro.** Provefab Pro does not auto-merge a risky change unless you allow its category. Risky changes are reviewed on the frontier tier: with only one frontier model, both Pro approvals come from the same model, so Pro does not auto-merge them even when you allow the category. Configure a second frontier model on another provider to allow it.
+
+`provefab log <id>` shows a `risk_classified` line for each round: the categories and how many paths matched each, or `none`.
+
 ## Writing issues that land
 
 What works best:
