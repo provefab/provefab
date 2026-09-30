@@ -39,6 +39,27 @@ What works best:
 
 `provefab add <url>` on a stopped task starts a **new pass** on a fresh branch from the base. Provefab keeps every blocking finding from earlier passes and puts the `provefab` label back.
 
+## Recording decisions on review findings
+
+Each finding in the PR's **Review notes** has a key (`F1`, `F2`...). To record what you decided about one, comment on the PR:
+
+```
+/provefab F1 rejected: the null case cannot happen here
+/provefab F2 fixed
+```
+
+- Syntax: `/provefab F<n> accepted|rejected|fixed|waived`, then an optional reason after a colon or a space. One command per line, several per comment. Keys and dispositions are case-insensitive. Lines inside code fences are ignored.
+- Only the issue author and people with write access count. Other commands, unknown keys and invalid dispositions are ignored, and `provefab log` shows them.
+- Commands are read while the PR is open, before a merge is recorded, and every hour after the merge until the task is archived (two weeks). Provefab never replies.
+- A later command for the same finding replaces the earlier one as current. All stay in the record.
+- On a PR closed with a comment, command lines are left out of your change request. The rest of the comment still counts.
+
+`provefab log <id>` ends with a **record** section: a numbered timeline, each line tagged `[fact]` (observed by Provefab), `[claim]` (stated by a model), `[human]` (your commands) or `[inferred]` (with its rule name and version), then the findings with their current disposition (`open` until you decide).
+
+`provefab export [--repo <owner/name>] [--since YYYY-MM-DD] [--with-text]` prints the record as JSON Lines, one line per event and one per finding. By default free text (plans, finding text, your reasons, ignored command lines) is replaced by its length and SHA-256. `--with-text` includes it. Command output is never exported.
+
+`provefab prune --before YYYY-MM-DD [--yes]` deletes the record of finished tasks last updated before that date. Without `--yes` it lists the tasks and deletes nothing.
+
 ## Task states
 
 | State | Meaning | Next |

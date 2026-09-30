@@ -1,7 +1,7 @@
 # Evidence and decision record
 
 - Date: 2026-09-30
-- Status: approved in conversation; awaiting written-spec review
+- Status: implemented on feature/evidence-record; real sandbox run pending the owner's go
 - Feature: #2 of the product direction (handoff `docs/handoff-2026-09-29-feature1-post-merge.md`). Foundation for #3 (reviewer calibration) and #5 (risk policy).
 
 ## 1. Intent
@@ -44,6 +44,7 @@ Rows are never updated. They are deleted only by `provefab prune` (section 6).
 | `id` | primary key |
 | `task_id` | the change |
 | `key` | `F1`, `F2`... unique per task, never reused, `UNIQUE(task_id, key)` |
+| `pass` | pass (fresh branch) that raised it (amended 2026-09-30 during implementation) |
 | `round` | review round that raised it |
 | `reviewer_model` | model id of the reviewer |
 | `severity` | `blocking` or `minor` |
@@ -73,13 +74,16 @@ claim (stated by a model; never shown as evidence):
 
 human:
 
-- `finding_disposition`: finding key, disposition (`accepted`, `rejected`, `fixed`, `waived`), reason (optional), GitHub login, association, comment URL.
+- `finding_disposition`: finding key, disposition (`accepted`, `rejected`, `fixed`, `waived`), reason (optional), GitHub login, association, comment identity (`author@created_at`, see section 5).
+- `command_ignored` (amended 2026-09-30 during implementation): a `/provefab` line that was not applied (unauthorized author, unknown key, invalid disposition): comment identity, login, line, why. Source `human`.
 
 inferred (each names its rule and rule version):
 
 - `finding_unaddressed_at_merge`: the PR merged while the finding had no human disposition.
 - `finding_followed_by_revert`: the finding's PR got a post-merge revert PR (`post_merge` reached `revert_open`).
 - `finding_followed_by_reopen`: the finding's issue was reopened after the merge.
+
+Storage (amended 2026-09-30 during implementation): the three inferred kinds share one payload tag, `finding_inferred` `{finding, rule, rule_version}`; the `kind` column carries the rule's name above.
 
 ## 4. Capture
 
@@ -94,8 +98,9 @@ inferred (each names its rule and rule version):
 - Commands are read from PR comments. While the PR is open, `watch_pr` already reads them every tick. After the merge, PR comments are read at most hourly with the existing reopen watch, until the task is archived (two weeks). That is one more `gh` call per hour per merged task.
 - Grammar: one or more commands per comment, each `/provefab <key> <disposition>[: reason]` on its own line. Keys are case-insensitive.
 - Only the issue author and people with write access count (the existing authorization rule). Others are ignored and logged locally.
-- Idempotent per comment URL. A later disposition for the same finding becomes current; all stay in the log.
-- `/provefab` comments are excluded from the human findings the pipeline reads from a closed PR, so a command never becomes a change request.
+- Idempotent per comment identity, `author@created_at` instead of the comment URL (amended 2026-09-30 during implementation) (the forge's comment type carries no URL). A later disposition for the same finding becomes current; all stay in the log.
+- On a closed PR, `/provefab` command lines are stripped from human change requests, so a command never becomes a change request; the remaining prose of the comment still counts (amended 2026-09-30 during implementation).
+- Commands are applied before a merge is recorded, so a disposition given just before the merge is not inferred as unaddressed (amended 2026-09-30 during implementation).
 - No automatic reply. An unknown key or an invalid disposition is ignored, logged locally and shown by `provefab log`.
 - Reactions are not used in v1: findings live in the PR body, and a reaction on the body cannot name a finding. Re-open: commands turn out rarely used.
 
@@ -105,7 +110,7 @@ inferred (each names its rule and rule version):
 - `provefab export [--repo <slug>] [--since <date>] [--with-text]`: JSON Lines, one line per event and one per finding with its current disposition.
   - Default: identities, states, verdicts, severities, dispositions, costs, exit codes, SHAs. Free text (plan, finding text, human reasons) is replaced by its length and SHA-256.
   - `--with-text` includes the free text. Command output is never exported; it stays in local session directories.
-- `provefab prune --before <date> [--yes]`: deletes events and findings of finished tasks last updated before the date. Finished means state `failed`, or state `pr_open` with `pr_state` `done` or `archived`; any other task is kept whatever its age, and so is any task with a non-terminal post-merge check. Without `--yes` it prints what it would delete and deletes nothing.
+- `provefab prune --before <date> [--yes]`: deletes the record rows (events and findings) of finished tasks; the tasks themselves are kept (amended 2026-09-30 during implementation), last updated before the date. Finished means state `failed`, or state `pr_open` with `pr_state` `done` or `archived`; any other task is kept whatever its age, and so is any task with a non-terminal post-merge check. Without `--yes` it prints what it would delete and deletes nothing.
 - Retention: kept locally without limit (owner decision 3). The database is the user's.
 
 ## 7. Schema evolution

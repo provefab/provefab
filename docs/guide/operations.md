@@ -39,7 +39,7 @@ Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume 
 | Path | Contents |
 |---|---|
 | `~/.provefab/provefab.toml` | the configuration |
-| `~/.provefab/provefab.db` | the state (SQLite): tasks, transitions, routing, stages, outputs |
+| `~/.provefab/provefab.db` | the state (SQLite): tasks, transitions, routing, stages, outputs, and the record of each change (`change_events`, `findings`) |
 | `~/.provefab/logs/run.log` | the service log; `provefab service install` rotates it to `run.log.1` once it passes 10 MB |
 | `~/.provefab/repos/` | the clones Provefab manages |
 | `~/.provefab/worktrees/<id>/` | a task's worktree, removed after the merge |
@@ -51,6 +51,8 @@ Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume 
 | `~/.provefab/bin/provefab` | the binary the service runs |
 
 Provefab never deletes remote `provefab/revert-*` branches.
+
+The record (`change_events`, `findings`) is kept without limit. `provefab prune --before YYYY-MM-DD --yes` removes the record rows of finished tasks; the tasks themselves stay. `provefab export` never contains command output, which stays in `~/.provefab/sessions/`.
 
 `PROVEFAB_HOME` moves all of this elsewhere.
 
