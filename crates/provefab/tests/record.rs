@@ -334,6 +334,55 @@ async fn only_the_findings_shown_in_the_merged_pr_are_inferred_unaddressed() {
     );
 }
 
+/// Round 0 asks for changes with F1; round 1 approves without findings.
+fn changes_then_clean_approval() -> Box<Script> {
+    let reviews = std::sync::Mutex::new(0);
+    Box::new(
+        move |m: &provefab::config::ModelEntry,
+              req: &agent_workers::StageRequest,
+              tx: &tokio::sync::mpsc::UnboundedSender<agent_workers::WorkerEvent>| {
+            match stage_of(&req.prompt) {
+                "review" => {
+                    let mut n = reviews.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        done(Some(review_with(
+                            serde_json::json!([
+                                {"file": "src/a.rs", "line": 3, "severity": "blocking", "text": "off by one"}
+                            ]),
+                            "changes",
+                        )))
+                    } else {
+                        done(Some(review_with(serde_json::json!([]), "approve")))
+                    }
+                }
+                _ => happy(m, req, tx),
+            }
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_final_round_without_findings_shows_and_infers_none() {
+    let (_f, p, id) = merged_task_scripted(&[], vec![], changes_then_clean_approval()).await;
+    let fs = p.store.findings(id).await.unwrap();
+    assert_eq!(
+        fs.iter()
+            .map(|x| (x.key.as_str(), x.round))
+            .collect::<Vec<_>>(),
+        [("F1", 0)]
+    );
+    let body = p.hub.prs.lock().unwrap()[0].3.clone();
+    assert!(!body.contains("Review notes"), "{body}");
+    let ev = p.store.events(id).await.unwrap();
+    assert!(ev.iter().any(|e| e.kind == "merged"));
+    assert!(
+        inferred(&ev, "finding_unaddressed_at_merge").is_empty(),
+        "{:?}",
+        kinds(&ev)
+    );
+}
+
 /// Pro's second reviewer: two approvals before the PR opens.
 struct TwoApprovals;
 
