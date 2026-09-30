@@ -364,18 +364,10 @@ pub struct Command {
 /// Commands of a comment body: only lines that start with `/provefab`
 /// (after trimming) outside code fences. `Err(line)` for one that does not parse.
 pub fn parse_commands(body: &str) -> Vec<Result<Command, String>> {
-    const PREFIX: &str = "/provefab ";
     let mut out = Vec::new();
-    let mut fenced = false;
-    for raw in body.lines() {
+    for (_, raw) in command_lines(body).filter(|(command, _)| *command) {
         let line = raw.trim();
-        if line.starts_with("```") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced || !line.to_ascii_lowercase().starts_with(PREFIX) {
-            continue;
-        }
+        // ASCII prefix, checked by `command_lines`: slicing after it is safe.
         let rest = line[PREFIX.len()..].trim();
         let mut parts = rest.splitn(2, char::is_whitespace);
         let key = parts.next().unwrap_or_default().to_ascii_uppercase();
@@ -405,18 +397,33 @@ pub fn parse_commands(body: &str) -> Vec<Result<Command, String>> {
 
 /// `body` without the lines `parse_commands` treats as commands, trimmed.
 pub fn strip_commands(body: &str) -> String {
+    command_lines(body)
+        .filter(|(command, _)| !command)
+        .map(|(_, raw)| raw)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+const PREFIX: &str = "/provefab ";
+
+/// Each line of `body`, untrimmed, with whether it is a command line: it starts
+/// with `/provefab ` (any case, after trimming) outside a code fence. The one
+/// rule `parse_commands` and `strip_commands` share.
+fn command_lines(body: &str) -> impl Iterator<Item = (bool, &str)> {
     let mut fenced = false;
-    let mut kept = Vec::new();
-    for raw in body.lines() {
+    body.lines().map(move |raw| {
         let line = raw.trim();
         if line.starts_with("```") {
             fenced = !fenced;
-        } else if !fenced && line.to_ascii_lowercase().starts_with("/provefab ") {
-            continue;
+            return (false, raw);
         }
-        kept.push(raw);
-    }
-    kept.join("\n").trim().to_string()
+        (
+            !fenced && line.to_ascii_lowercase().starts_with(PREFIX),
+            raw,
+        )
+    })
 }
 
 fn line_of(p: &Result<Command, String>) -> String {
@@ -586,6 +593,18 @@ mod tests {
         let _ = parse_commands("/provefab \u{a0}");
         let _ = parse_commands("/provefab\u{a0}F1 rejected");
         let _ = strip_commands("/provefab \u{a0}\n\u{2003}/provefab F1 fixed");
+    }
+
+    #[test]
+    fn strip_commands_removes_exactly_the_lines_parse_commands_reads() {
+        let body = "a\n /PROVEFAB F1 fixed \n```\n/provefab F2 waived\n```\n/provefab F3 maybe\nsee /provefab F4 fixed\n/provefabF5 fixed";
+        let stripped = strip_commands(body);
+        assert_eq!(parse_commands(body).len(), 2);
+        assert_eq!(
+            body.lines().count() - stripped.lines().count(),
+            parse_commands(body).len()
+        );
+        assert!(parse_commands(&stripped).is_empty());
     }
 
     #[test]
