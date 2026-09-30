@@ -268,7 +268,9 @@ async fn an_auto_merge_is_recorded_on_the_check() {
 /// nothing about how the second one was merged (final review F1).
 #[tokio::test]
 async fn an_auto_merge_of_an_earlier_pr_does_not_mark_a_later_human_merge() {
-    let (f, p, id) = open_pr_task(&["touch ran; true"]).await;
+    // Red checks: the merge is verified, and only the revert step can tell it
+    // apart from a Provefab squash.
+    let (f, p, id) = open_pr_task(&["false"]).await;
     p.store
         .record_output(id, "auto_merged", &json!({"head": "old-head"}))
         .await
@@ -446,11 +448,31 @@ async fn crash_residue_that_looks_green_is_never_reused() {
     assert!(leftovers(&f, c.id).is_empty());
 }
 
+/// A multi-commit PR merged by a person may be a squash or a rebase: Provefab
+/// still verifies it, but never proposes a revert for it (owner ruling
+/// 2026-09-30, spec decision 7 amended).
 #[tokio::test]
-async fn a_human_merged_multi_commit_pr_is_blocked_before_running_anything() {
-    let (f, p, id) = open_pr_task(&["touch ran; true"]).await;
+async fn a_human_merged_multi_commit_pr_is_verified_but_never_reverted() {
+    // Green: verified and passed.
+    let (f, p, id) = open_pr_task(&["grep -q hello README.md"]).await;
     let repo = f.config.repos[0].path_in(&f.home);
-    let sha = commit_and_push(&repo, "README.md", "x\n", "change");
+    let sha = commit_and_push(&repo, "README.md", "hello world\n", "change");
+    *p.hub.pr_status.lock().unwrap() = merged(Some(&sha), Some("main"), Some(3));
+    p.watch_pr(id).await.unwrap();
+    assert_eq!(drive(&p, id).await.state, CheckState::Passed);
+    assert!(
+        p.store
+            .stage_runs(id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.stage == "post-merge")
+    );
+
+    // Red: the team learns the merge is broken, and no revert PR is opened.
+    let (f, p, id) = open_pr_task(&["grep -q hello README.md"]).await;
+    let repo = f.config.repos[0].path_in(&f.home);
+    let sha = commit_and_push(&repo, "README.md", "broken\n", "change");
     *p.hub.pr_status.lock().unwrap() = merged(Some(&sha), Some("main"), Some(3));
     p.watch_pr(id).await.unwrap();
     let c = drive(&p, id).await;
@@ -458,14 +480,16 @@ async fn a_human_merged_multi_commit_pr_is_blocked_before_running_anything() {
         (c.state, c.failure_kind),
         (CheckState::Blocked, Some(FailureKind::UnsafeMergeStrategy))
     );
+    assert_eq!(c.failed_commands[0].command, "grep -q hello README.md");
+    assert!(p.hub.prs.lock().unwrap().is_empty());
+    assert_eq!(git(&repo, &["branch", "--list", "provefab/*"]), "");
+    tick(&p, id).await;
+    let body = p.hub.posted.lock().unwrap().join("\n");
     assert!(
-        p.store
-            .stage_runs(id)
-            .await
-            .unwrap()
-            .iter()
-            .all(|r| r.stage != "post-merge")
+        body.contains("`grep -q hello README.md` exited with 1"),
+        "{body}"
     );
+    assert!(body.contains("did not propose a revert"), "{body}");
 }
 
 #[tokio::test]

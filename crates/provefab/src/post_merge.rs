@@ -251,7 +251,7 @@ fn blocked_reason(kind: Option<FailureKind>) -> &'static str {
             "The revert branch or pull request on GitHub does not hold the revert Provefab prepared."
         }
         Some(FailureKind::UnsafeMergeStrategy) => {
-            "This merge cannot be undone as one commit: Provefab cannot tell a squash from a rebase for a multi-commit pull request merged by a person, or the merge shape is unknown. Provefab did not verify it."
+            "This merge cannot be undone as one commit: Provefab cannot tell a squash from a rebase for a multi-commit pull request merged by a person, or the merge shape is unknown. The checks failed, and Provefab did not propose a revert."
         }
         Some(FailureKind::AttributionMissing) => {
             "GitHub did not report the merge commit or its base branch, so Provefab cannot tell what to verify."
@@ -517,31 +517,16 @@ where
         })
     }
 
+    /// Every attributed merge is verified, whatever its shape: a merge that
+    /// cannot be reverted safely is still checked and reported, and is only
+    /// refused at `preparing_revert` (owner ruling 2026-09-30, decision 7).
     async fn pm_queued(
         &self,
-        repo: &RepoConfig,
+        _repo: &RepoConfig,
         check: &PostMergeCheckRow,
     ) -> Result<(), PipelineError> {
-        let repo_path = self.checkout(repo);
-        self.git.fetch(&repo_path).await?;
-        let parents = self.git.parent_count(&repo_path, &check.merge_sha).await?;
-        match revert_plan(parents, check.commit_count, check.auto_merged) {
-            Some(_) => {
-                self.advance(check, CheckState::Verifying, CheckPatch::default())
-                    .await
-            }
-            None => {
-                self.block(
-                    check,
-                    FailureKind::UnsafeMergeStrategy,
-                    &format!(
-                        "{parents} parent(s), {:?} PR commit(s), auto-merged: {}",
-                        check.commit_count, check.auto_merged
-                    ),
-                )
-                .await
-            }
-        }
+        self.advance(check, CheckState::Verifying, CheckPatch::default())
+            .await
     }
 
     async fn pm_verifying(
@@ -650,7 +635,10 @@ where
                 .block(
                     check,
                     FailureKind::UnsafeMergeStrategy,
-                    "merge shape changed",
+                    &format!(
+                        "{parents} parent(s), {:?} PR commit(s), auto-merged: {}",
+                        check.commit_count, check.auto_merged
+                    ),
                 )
                 .await;
         };
@@ -1083,6 +1071,12 @@ mod tests {
             unsafe_merge.contains("cannot tell a squash from a rebase"),
             "{unsafe_merge}"
         );
+        // Verified, but no revert proposed (owner ruling 2026-09-30).
+        assert!(
+            unsafe_merge.contains("did not propose a revert"),
+            "{unsafe_merge}"
+        );
+        assert!(!unsafe_merge.contains("did not verify"), "{unsafe_merge}");
         assert_eq!(render(&row(CheckState::Passed, None)), None);
         assert_eq!(render(&row(CheckState::Verifying, None)), None);
     }

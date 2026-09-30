@@ -65,10 +65,10 @@ One row per merged commit. Each scheduler tick performs **at most one transition
 
 | State | Tick action | Next |
 |---|---|---|
-| `queued` | Fetch. Decide merge strategy (section 6). | `verifying`, or `blocked` (`unsafe_merge_strategy`) |
+| `queued` | Nothing to run: every attributed merge is verified, whatever its shape (decision 7, amended 2026-09-30). | `verifying` |
 | `verifying` | Remove `<id>-verify` if present, create a fresh detached worktree at `merge_sha`, run all checks. Rerun each failing or timed-out command **once** in a new fresh worktree. | all pass first time: `passed`; pass after rerun: `passed` with `flaky` set; any command fails twice: `verification_failed` |
 | `verification_failed` | Fetch. `merge_sha` must be an ancestor of the base tip, else `blocked` (`base_diverged`). Record `base_sha` = base tip. Run checks in a fresh detached worktree `<id>-base` at `base_sha` (same one-rerun rule). | base passes: `superseded`; base fails: `preparing_revert` |
-| `preparing_revert` | Create a fresh detached worktree `<id>-revert` at `base_sha`. Apply the revert (section 6). Run checks on the reverted tree (one-rerun rule). Require a clean worktree afterwards. Record `revert_sha` = HEAD and point local branch `provefab/revert-<id>-<base_moves>` at it (`revert_branch`). | `revert_ready`; or `blocked` (`revert_conflict`, `revert_checks_failed`, `dirty_tree`) |
+| `preparing_revert` | Decide the merge strategy (section 6); an unsafe shape is `blocked` (`unsafe_merge_strategy`) with the failed checks reported and no revert. Create a fresh detached worktree `<id>-revert` at `base_sha`. Apply the revert (section 6). Run checks on the reverted tree (one-rerun rule). Require a clean worktree afterwards. Record `revert_sha` = HEAD and point local branch `provefab/revert-<id>-<base_moves>` at it (`revert_branch`). | `revert_ready`; or `blocked` (`revert_conflict`, `revert_checks_failed`, `dirty_tree`) |
 | `revert_ready` | Fetch. If the base tip is not `base_sha`: increment `base_moves`, go to `verification_failed`; on the 3rd move, `blocked` (`base_moved`). Else push `revert_sha` to `revert_branch`. If the remote branch already exists it must equal `revert_sha`, else `blocked` (`branch_conflict`). Create the PR; a reused PR must be same-repo, target `repo.base`, and have head `revert_sha`, else `blocked` (`branch_conflict`). Record `revert_pr_url`. | `revert_open` |
 | `passed`, `superseded`, `revert_open`, `blocked` | Terminal. Only pending notifications (section 7) and cleanup (section 9). | |
 
@@ -83,14 +83,14 @@ Rules:
 
 ## 6. Merge strategies and revert construction
 
-Decided at `queued` from git (parent count of `merge_sha`) and the row's `commit_count` / `auto_merged`:
+Decided at `preparing_revert` (after the checks failed on the merge and on the current base) from git (parent count of `merge_sha`) and the row's `commit_count` / `auto_merged`:
 
 | Case | Revert |
 |---|---|
 | `merge_sha` has 2 parents (merge commit) | `git revert --no-edit -m 1 <merge_sha>` |
 | 1 parent, `commit_count == 1` | `git revert --no-edit <merge_sha>` |
 | 1 parent, `commit_count > 1`, `auto_merged` by Provefab (always squash) | `git revert --no-edit <merge_sha>` |
-| 1 parent, `commit_count > 1`, merged by a human | `blocked` (`unsafe_merge_strategy`): squash and rebase cannot be told apart, and reverting the last rebased commit alone would be partial |
+| 1 parent, `commit_count > 1`, merged by a human | `blocked` (`unsafe_merge_strategy`), no revert: squash and rebase cannot be told apart, and reverting the last rebased commit alone would be partial. The merge is still verified and the failure reported. |
 | more than 2 parents or missing `commit_count` | `blocked` (`unsafe_merge_strategy`) |
 
 Reverts run with Provefab's git identity and hooks disabled. A conflict is never resolved automatically. `git revert` commits by itself; Provefab never calls `commit_all` on a revert worktree.
@@ -203,7 +203,7 @@ Added in revision 2 (conversation of 2026-09-29):
 4. Explicit state machine, one transition per tick, rather than patching the single function. Why: every crash window becomes a named, replayable, testable state. Cost accepted: rewrite of `process_post_merge` and its tests.
 5. A failing or timed-out command is rerun once on a fresh checkout before counting as a failure; a rescue is recorded as flaky. Why: one flake must not open a revert PR and erode trust.
 6. Before any revert, the checks run on the current base tip; green means `superseded`, no revert. Why: never propose reverting a change whose breakage was already fixed.
-7. Merge-strategy rules of section 6. Why: squash is always safe, merge commits need `-m 1`, and only human-merged multi-commit PRs are ambiguous (squash vs rebase). This replaces revision 1's "exactly one commit" rule, which blocked safe squashes.
+7. Merge-strategy rules of section 6. Why: squash is always safe, merge commits need `-m 1`, and only human-merged multi-commit PRs are ambiguous (squash vs rebase). This replaces revision 1's "exactly one commit" rule, which blocked safe squashes. Amended 2026-09-30 (owner ruling): an unsafe shape no longer skips verification; it only forbids the revert. Why: the core never auto-merges and each review round adds a commit, so most human merges are multi-commit; skipping them left the feature inert. Re-open (detecting a squash to allow its revert): a pilot asks for revert PRs on these merges.
 8. Missing merge SHA: wait at most 1 hour, then `blocked`. Missing base: never inferred. Why: spec rule "captured from GitHub, not inferred".
 9. GitHub receives fixed templates only. Why: command output and git errors may contain secrets or local paths.
 10. Infra errors: 5 consecutive then `blocked`. Why: bounded retries, no silent infinite loop.
