@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::agents::StageRunner;
 use crate::forge::{Comment, is_bot_comment};
@@ -251,6 +252,79 @@ impl StoredEvent {
     }
 }
 
+/// A free-text field as length and digest, so an export can be compared
+/// without carrying the text.
+pub fn redact_text(s: &str) -> Value {
+    let hash = Sha256::digest(s.as_bytes());
+    serde_json::json!({
+        "redacted": true,
+        "len": s.chars().count(),
+        "sha256": hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+    })
+}
+
+/// The payload with its free-text fields (per kind) replaced by `redact_text`.
+pub fn redact_event(e: &StoredEvent) -> Value {
+    let mut p = e.payload.clone();
+    let fields: &[&str] = match e.kind.as_str() {
+        "plan" => &["summary", "steps", "risks"],
+        "finding_disposition" => &["reason"],
+        "command_ignored" => &["line"],
+        _ => &[],
+    };
+    for f in fields {
+        if let Some(v) = p.get_mut(*f)
+            && !v.is_null()
+        {
+            let text = match &*v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            *v = redact_text(&text);
+        }
+    }
+    p
+}
+
+/// `YYYY-MM-DD` at 00:00 UTC, or `None` for anything else or an impossible date.
+pub fn parse_date(s: &str) -> Option<i64> {
+    let mut it = s.split('-');
+    let (y, m, d) = (
+        it.next()?.parse::<i64>().ok()?,
+        it.next()?.parse::<i64>().ok()?,
+        it.next()?.parse::<i64>().ok()?,
+    );
+    if it.next().is_some() || s.len() != 10 || !(1..=12).contains(&m) {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(m - 1) as usize];
+    if !(1..=dim).contains(&d) {
+        return None;
+    }
+    // Days from civil (Howard Hinnant).
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86400)
+}
+
 /// A `/provefab <key> <disposition>[:| ]<reason>` line (spec section 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -368,6 +442,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_date_is_utc_midnight_and_rejects_impossible_dates() {
+        assert_eq!(parse_date("2026-09-30"), Some(1790726400));
+        assert_eq!(parse_date("2026-02-30"), None);
+        assert_eq!(parse_date("x"), None);
+    }
 
     #[test]
     fn every_kind_round_trips_with_its_source() {

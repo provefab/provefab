@@ -14,6 +14,7 @@ use crate::forge::{ForgeError, Git};
 use crate::paths::Paths;
 use crate::ports::Hub;
 use crate::post_merge::CheckState;
+use crate::record::{Event, MergedBy, StoredEvent, parse_date, redact_event, redact_text};
 use crate::store::{NewIssue, Store, StoreError};
 use crate::task::TaskState;
 
@@ -25,6 +26,8 @@ pub enum CommandError {
     UnknownRepo(String),
     #[error("no task {0}")]
     UnknownTask(i64),
+    #[error("{0}")]
+    BadDate(&'static str),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -397,6 +400,33 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
             }
         }
     }
+    let events = store.events(id).await?;
+    if !events.is_empty() {
+        out.push_str("\nrecord:\n");
+        for e in &events {
+            let _ = writeln!(out, "  {} [{}] {}", e.seq, e.source, event_summary(e));
+        }
+    }
+    let findings = store.findings(id).await?;
+    if !findings.is_empty() {
+        let disp = store.current_dispositions(id).await?;
+        out.push_str("findings:\n");
+        for f in findings {
+            let place = match (&f.file, f.line) {
+                (file, Some(l)) => format!("{file}:{l}"),
+                (file, None) if !file.is_empty() => file.clone(),
+                _ => "-".to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "  {} · {} · {place} · round {} · {}",
+                f.key,
+                f.severity,
+                f.round,
+                disp.get(&f.key).map(|d| d.as_str()).unwrap_or("open")
+            );
+        }
+    }
     for kind in ["plan", "review", "failure"] {
         if let Some(v) = store.last_output(id, kind).await? {
             let _ = writeln!(
@@ -405,6 +435,116 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
                 serde_json::to_string_pretty(&v).unwrap_or_default()
             );
         }
+    }
+    Ok(out)
+}
+
+/// The kind and its identifying fields; free text never appears here.
+fn event_summary(e: &StoredEvent) -> String {
+    use Event::*;
+    let Some(ev) = e.typed() else {
+        return format!("{} (unknown to this version)", e.kind);
+    };
+    match ev {
+        StageRun {
+            stage, model_id, ..
+        } => format!("{} {stage} {model_id}", e.kind),
+        GatesRun { stage, round, .. } => format!("{} {stage} round {round}", e.kind),
+        Reproduction {
+            failed_before_fix, ..
+        } => format!("{} failed_before_fix {failed_before_fix}", e.kind),
+        PrOpened { url, pass, .. } => format!("{} {url} pass {pass}", e.kind),
+        Merged { by, pass, .. } => {
+            let by = match by {
+                MergedBy::Auto => "auto",
+                MergedBy::Human => "human",
+            };
+            format!("{} by {by} pass {pass}", e.kind)
+        }
+        PostMerge {
+            check_id, state, ..
+        } => format!("{} #{check_id} {state}", e.kind),
+        IssueReopened { previous_pass } => format!("{} after pass {previous_pass}", e.kind),
+        Plan { pass, .. } => format!("{} pass {pass}", e.kind),
+        Review {
+            reviewer_model,
+            pass,
+            round,
+            verdict,
+            ..
+        } => format!(
+            "{} {reviewer_model} pass {pass} round {round} {verdict}",
+            e.kind
+        ),
+        FindingDisposition {
+            finding,
+            disposition,
+            login,
+            ..
+        } => format!("{} {finding} {} ({login})", e.kind, disposition.as_str()),
+        CommandIgnored { login, why, .. } => format!("{} ({login}) {why}", e.kind),
+        FindingInferred {
+            finding,
+            rule_version,
+            ..
+        } => format!("{} {finding} (rule v{rule_version})", e.kind),
+        Routed { .. } => e.kind.clone(),
+    }
+}
+
+/// The record as JSON Lines: one object per event, then per finding. Free
+/// text is redacted (length and digest) unless `with_text`. Command output is
+/// never included: events carry only a reference to it.
+pub async fn export(
+    store: &Store,
+    repo: Option<&str>,
+    since: Option<&str>,
+    with_text: bool,
+) -> Result<String, CommandError> {
+    let since = since
+        .map(|s| parse_date(s).ok_or(CommandError::BadDate("--since must be YYYY-MM-DD")))
+        .transpose()?;
+    let (events, findings) = store.export_rows(repo, since).await?;
+    let mut out = String::new();
+    let mut line = |v: serde_json::Value| {
+        out.push_str(&serde_json::to_string(&v).unwrap_or_default());
+        out.push('\n');
+    };
+    for (t, e) in events {
+        line(serde_json::json!({
+            "type": "event", "task": t.id, "repo": t.repo, "issue": t.issue_number,
+            "seq": e.seq, "kind": e.kind, "source": e.source,
+            "schema_version": e.schema_version, "at": e.at,
+            "payload": if with_text { e.payload.clone() } else { redact_event(&e) },
+        }));
+    }
+    for (t, f, d) in findings {
+        line(serde_json::json!({
+            "type": "finding", "task": t.id, "key": f.key, "pass": f.pass,
+            "round": f.round, "reviewer_model": f.reviewer_model,
+            "severity": f.severity, "file": f.file, "line": f.line,
+            "text": if with_text { serde_json::Value::String(f.text.clone()) } else { redact_text(&f.text) },
+            "disposition": d.map(|d| d.as_str()),
+        }));
+    }
+    Ok(out)
+}
+
+/// Deletes the record of finished tasks last updated before `before`
+/// (`YYYY-MM-DD`); a dry run unless `yes`.
+pub async fn prune(store: &Store, before: &str, yes: bool) -> Result<String, CommandError> {
+    let at = parse_date(before).ok_or(CommandError::BadDate("--before must be YYYY-MM-DD"))?;
+    let tasks = store.prunable_tasks(at).await?;
+    let mut out = String::new();
+    for t in &tasks {
+        let _ = writeln!(out, "task {} {}#{}", t.id, t.repo, t.issue_number);
+    }
+    if yes {
+        let ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+        let (events, findings) = store.prune_record(&ids).await?;
+        let _ = writeln!(out, "deleted {events} events, {findings} findings");
+    } else {
+        out.push_str("dry run: pass --yes to delete\n");
     }
     Ok(out)
 }

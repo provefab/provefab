@@ -519,3 +519,88 @@ async fn command_lines_are_stripped_from_closed_pr_change_requests() {
             .contains_key("F1")
     );
 }
+
+#[tokio::test]
+async fn export_redacts_free_text_unless_asked_and_every_line_is_json() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let out = provefab::commands::export(&p.store, None, None, false)
+        .await
+        .unwrap();
+    assert!(!out.contains("SENTINEL_SECRET_42"), "{out}");
+    for line in out.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(v["type"] == "event" || v["type"] == "finding");
+    }
+    assert!(out.contains("\"redacted\":true"));
+    let full = provefab::commands::export(&p.store, None, None, true)
+        .await
+        .unwrap();
+    assert!(full.contains("SENTINEL_SECRET_42"));
+    let _ = id;
+}
+
+#[tokio::test]
+async fn export_of_an_empty_record_prints_nothing() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    assert_eq!(
+        provefab::commands::export(&p.store, None, None, false)
+            .await
+            .unwrap(),
+        ""
+    );
+}
+
+#[tokio::test]
+async fn prune_deletes_only_with_yes_and_only_finished_tasks() {
+    let (_f, p, id) = merged_task(&[]).await;
+    p.store.set_pr_state(id, "archived").await.unwrap();
+    let dry = provefab::commands::prune(&p.store, "2999-01-01", false)
+        .await
+        .unwrap();
+    assert!(dry.contains(&format!("task {id}")), "{dry}");
+    assert!(!p.store.events(id).await.unwrap().is_empty());
+    provefab::commands::prune(&p.store, "2999-01-01", true)
+        .await
+        .unwrap();
+    assert!(p.store.events(id).await.unwrap().is_empty());
+    assert!(p.store.findings(id).await.unwrap().is_empty());
+    assert!(
+        provefab::commands::prune(&p.store, "30/09/2026", true)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn log_shows_the_record_with_sources_and_current_dispositions() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let task = p.store.task(id).await.unwrap().unwrap();
+    p.apply_finding_commands(
+        &task,
+        &[comment(
+            "alice",
+            "NONE",
+            "/provefab F1 rejected",
+            "2026-09-30T10:00:00Z",
+        )],
+    )
+    .await
+    .unwrap();
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    assert!(log.contains("record:"), "{log}");
+    assert!(log.contains("[fact] routed"), "{log}");
+    assert!(log.contains("[claim] review"), "{log}");
+    assert!(
+        log.contains("[human] finding_disposition F1 rejected"),
+        "{log}"
+    );
+    assert!(log.contains("F1 · "), "{log}");
+    assert!(!log.to_lowercase().contains("proof"));
+}

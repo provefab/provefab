@@ -56,6 +56,22 @@ enum Cmd {
     Stats,
     /// Everything recorded about one task.
     Log { task: i64 },
+    /// The evidence record as JSON Lines (free text redacted unless --with-text).
+    Export {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        with_text: bool,
+    },
+    /// Delete the record of finished tasks last updated before a date (dry run without --yes).
+    Prune {
+        #[arg(long)]
+        before: String,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Check tools, logins, the Jev key and the repos.
     Doctor,
     /// Run `provefab run` as a launchd agent (start at login, restart on exit).
@@ -330,6 +346,23 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
         Cmd::Log { task } => {
             let store = Store::open(&paths.db()).await?;
             print!("{}", commands::log(&store, task).await?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Export {
+            repo,
+            since,
+            with_text,
+        } => {
+            let store = Store::open(&paths.db()).await?;
+            print!(
+                "{}",
+                commands::export(&store, repo.as_deref(), since.as_deref(), with_text).await?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Prune { before, yes } => {
+            let store = Store::open(&paths.db()).await?;
+            print!("{}", commands::prune(&store, &before, yes).await?);
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Doctor => {

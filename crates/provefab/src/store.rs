@@ -989,6 +989,89 @@ impl Store {
         rows.iter().map(stored_event).collect()
     }
 
+    /// Every task's events (from `since`, unix seconds) and findings with their
+    /// current disposition, optionally for one repo. Ordered by task, then seq.
+    #[allow(clippy::type_complexity)]
+    pub async fn export_rows(
+        &self,
+        repo: Option<&str>,
+        since: Option<i64>,
+    ) -> Result<
+        (
+            Vec<(TaskRow, StoredEvent)>,
+            Vec<(TaskRow, FindingRow, Option<Disposition>)>,
+        ),
+        StoreError,
+    > {
+        let rows = match repo {
+            Some(r) => {
+                sqlx::query("SELECT * FROM tasks WHERE repo = ? ORDER BY id")
+                    .bind(r)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query("SELECT * FROM tasks ORDER BY id")
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        let (mut events, mut findings) = (Vec::new(), Vec::new());
+        for r in rows {
+            let task = task_row(&r)?;
+            for e in self.events(task.id).await? {
+                if since.is_none_or(|s| e.at >= s) {
+                    events.push((task.clone(), e));
+                }
+            }
+            let disp = self.current_dispositions(task.id).await?;
+            for f in self.findings(task.id).await? {
+                let d = disp.get(&f.key).copied();
+                findings.push((task.clone(), f, d));
+            }
+        }
+        Ok((events, findings))
+    }
+
+    /// Finished tasks last updated before `before`: failed, or a PR that is
+    /// done or archived, with no post-merge check still open.
+    pub async fn prunable_tasks(&self, before: i64) -> Result<Vec<TaskRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE updated_at < ? \
+             AND (state = ? OR (state = ? AND pr_state IN ('done', 'archived'))) \
+             AND NOT EXISTS (SELECT 1 FROM post_merge_checks c WHERE c.task_id = tasks.id \
+                 AND c.state NOT IN ('passed','superseded','revert_open','blocked')) \
+             ORDER BY id",
+        )
+        .bind(before)
+        .bind(TaskState::Failed.as_str())
+        .bind(TaskState::PrOpen.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(task_row).collect()
+    }
+
+    /// Deletes the findings and events of `task_ids` in one transaction;
+    /// returns (events, findings) deleted.
+    pub async fn prune_record(&self, task_ids: &[i64]) -> Result<(u64, u64), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (mut events, mut findings) = (0, 0);
+        for id in task_ids {
+            findings += sqlx::query("DELETE FROM findings WHERE task_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            events += sqlx::query("DELETE FROM change_events WHERE task_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+        Ok((events, findings))
+    }
+
     /// Worker runs (stage runs with a model, not gates) started at or after `since`,
     /// across all tasks (the daily budget, D53).
     pub async fn worker_runs_since(&self, since: i64) -> Result<u32, StoreError> {
