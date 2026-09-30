@@ -263,27 +263,55 @@ pub fn redact_text(s: &str) -> Value {
     })
 }
 
+/// The `stage_run.exit` values that carry no text of their own; any other
+/// (`provider_error: ...`, `crashed (...): <stderr>`) is redacted.
+const PLAIN_EXITS: &[&str] = &["completed", "max_turns", "timeout", "passed", "failed"];
+
 /// The payload with its free-text fields (per kind) replaced by `redact_text`.
+/// An allowlist: a kind or version this build does not know exports
+/// `{"unknown": true}`, never its payload.
 pub fn redact_event(e: &StoredEvent) -> Value {
+    let Some(typed) = e.typed() else {
+        return serde_json::json!({"unknown": true});
+    };
     let mut p = e.payload.clone();
-    let fields: &[&str] = match e.kind.as_str() {
-        "plan" => &["summary", "steps", "risks"],
-        "finding_disposition" => &["reason"],
-        "command_ignored" => &["line"],
+    let fields: &[&str] = match &typed {
+        Event::Plan { .. } => &["summary", "steps", "risks"],
+        Event::FindingDisposition { .. } => &["reason"],
+        Event::CommandIgnored { .. } => &["line"],
+        // Model-written (the plan's reproduction command).
+        Event::Reproduction { .. } => &["command"],
+        Event::StageRun { exit, .. } if !PLAIN_EXITS.contains(&exit.as_str()) => &["exit"],
         _ => &[],
     };
     for f in fields {
-        if let Some(v) = p.get_mut(*f)
-            && !v.is_null()
-        {
-            let text = match &*v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            *v = redact_text(&text);
+        if let Some(v) = p.get_mut(*f) {
+            redact_value(v);
+        }
+    }
+    // The reproduction command also runs as the last gate: redact every gate
+    // command, the digest still compares the configured ones across tasks.
+    if let Some(Value::Array(results)) = p.get_mut("results")
+        && matches!(typed, Event::GatesRun { .. })
+    {
+        for r in results {
+            if let Some(v) = r.get_mut("command") {
+                redact_value(v);
+            }
         }
     }
     p
+}
+
+fn redact_value(v: &mut Value) {
+    if v.is_null() {
+        return;
+    }
+    let text = match &*v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    *v = redact_text(&text);
 }
 
 /// `YYYY-MM-DD` at 00:00 UTC, or `None` for anything else or an impossible date.
@@ -569,6 +597,79 @@ mod tests {
         assert_eq!(strip_commands("/provefab F1 fixed\n"), "");
         let fenced = "see:\n```\n/provefab F4 waived\n```";
         assert_eq!(strip_commands(fenced), fenced);
+    }
+
+    fn stored(kind: &str, schema_version: u32, payload: Value) -> StoredEvent {
+        StoredEvent {
+            id: 1,
+            task_id: 1,
+            seq: 1,
+            kind: kind.into(),
+            source: "fact".into(),
+            schema_version,
+            payload,
+            at: 0,
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_or_version_exports_no_payload() {
+        let future = stored(
+            "future",
+            1,
+            serde_json::json!({"kind": "future", "note": "SENTINEL_SECRET_42"}),
+        );
+        assert_eq!(redact_event(&future), serde_json::json!({"unknown": true}));
+        let v2 = stored(
+            "plan",
+            2,
+            serde_json::json!({"kind": "plan", "pass": 1, "summary": "SENTINEL_SECRET_42", "steps": [], "risks": []}),
+        );
+        assert_eq!(redact_event(&v2), serde_json::json!({"unknown": true}));
+    }
+
+    #[test]
+    fn model_written_commands_and_error_exits_are_redacted() {
+        let e = |ev: Event| stored(ev.kind(), 1, serde_json::to_value(&ev).unwrap());
+        let repro = e(Event::Reproduction {
+            command: "grep SENTINEL_SECRET_42 x".into(),
+            failed_before_fix: true,
+        });
+        let out = redact_event(&repro).to_string();
+        assert!(!out.contains("SENTINEL_SECRET_42"), "{out}");
+        assert_eq!(redact_event(&repro)["failed_before_fix"], true);
+        let gates = e(Event::GatesRun {
+            stage: "gates".into(),
+            round: 0,
+            results: vec![GateEntry {
+                command: "grep SENTINEL_SECRET_42 x".into(),
+                exit: Some(1),
+                timed_out: false,
+                passed: false,
+                output_ref: "/s".into(),
+            }],
+        });
+        let out = redact_event(&gates);
+        assert!(!out.to_string().contains("SENTINEL_SECRET_42"), "{out}");
+        assert_eq!(out["results"][0]["passed"], false);
+        let run = |exit: &str| {
+            e(Event::StageRun {
+                stage: "plan".into(),
+                model_id: "m".into(),
+                actual_model: None,
+                provider: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: None,
+                exit: exit.into(),
+            })
+        };
+        assert_eq!(redact_event(&run("completed"))["exit"], "completed");
+        let err = redact_event(&run("provider_error: SENTINEL_SECRET_42"));
+        assert!(!err.to_string().contains("SENTINEL_SECRET_42"), "{err}");
+        assert_eq!(err["exit"]["redacted"], true);
     }
 
     #[test]
