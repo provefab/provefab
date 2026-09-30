@@ -122,6 +122,13 @@ async fn open_task_with_findings() -> (Fixture, P, i64) {
 /// "broken" in one commit on origin/main (so `grep -q hello README.md`
 /// post-merge checks fail and a revert is prepared).
 async fn merged_task(checks: &[&str]) -> (Fixture, P, i64) {
+    merged_task_with(checks, vec![]).await
+}
+
+async fn merged_task_with(
+    checks: &[&str],
+    comments: Vec<provefab::forge::Comment>,
+) -> (Fixture, P, i64) {
     let mut f = fixture(&["test -f feature.txt"]);
     f.config.repos[0].post_merge_checks = checks.iter().map(|c| c.to_string()).collect();
     let p = pipeline(
@@ -142,7 +149,7 @@ async fn merged_task(checks: &[&str]) -> (Fixture, P, i64) {
     let sha = git(&repo, &["rev-parse", "HEAD"]);
     *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
         state: provefab::forge::PrState::Merged,
-        comments: vec![],
+        comments,
         head_sha: Some("pr-head".into()),
         merge_sha: Some(sha),
         base_ref: Some("main".into()),
@@ -447,6 +454,63 @@ async fn a_command_on_a_closed_pr_is_not_a_change_request() {
     *p.hub.pr_status.lock().unwrap() = status;
     let state = p.watch_pr(id).await.unwrap();
     assert_eq!(state, Failed);
+    assert!(
+        p.store
+            .current_dispositions(id)
+            .await
+            .unwrap()
+            .contains_key("F1")
+    );
+}
+
+#[tokio::test]
+async fn a_command_posted_before_the_merge_is_read_before_it_is_inferred() {
+    let (_f, p, id) = merged_task_with(
+        &[],
+        vec![comment(
+            "alice",
+            "NONE",
+            "/provefab F1 rejected",
+            "2026-09-30T10:00:00Z",
+        )],
+    )
+    .await;
+    assert_eq!(
+        p.store.current_dispositions(id).await.unwrap()["F1"],
+        provefab::record::Disposition::Rejected
+    );
+    let ev = p.store.events(id).await.unwrap();
+    let inferred: Vec<_> = ev
+        .iter()
+        .filter(|e| e.kind == "finding_unaddressed_at_merge")
+        .map(|e| e.payload["finding"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(inferred, ["F2"]);
+}
+
+#[tokio::test]
+async fn command_lines_are_stripped_from_closed_pr_change_requests() {
+    let (_f, p, id) = open_task_with_findings().await;
+    let mut status = p.hub.pr_status.lock().unwrap().clone();
+    status.state = provefab::forge::PrState::Closed;
+    status.comments = vec![comment(
+        "alice",
+        "NONE",
+        "Please rename x\n/provefab F1 rejected",
+        "2026-09-30T10:00:00Z",
+    )];
+    *p.hub.pr_status.lock().unwrap() = status;
+    p.watch_pr(id).await.unwrap();
+    let review = p.store.last_output(id, "review").await.unwrap().unwrap();
+    let human: Vec<_> = review["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["text"].as_str())
+        .filter(|t| t.contains("Please rename x"))
+        .collect();
+    assert_eq!(human.len(), 1, "{review}");
+    assert!(!human[0].contains("/provefab"));
     assert!(
         p.store
             .current_dispositions(id)

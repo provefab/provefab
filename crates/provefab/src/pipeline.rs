@@ -1097,6 +1097,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 Ok(task.state)
             }
             PrState::Merged => {
+                // Before the merge is recorded: a command posted between the
+                // last poll and the merge must not be inferred "unaddressed".
+                self.apply_finding_commands(&task, &status.comments).await?;
                 self.record_merge(
                     &task,
                     &repo,
@@ -1115,22 +1118,19 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 let findings: Vec<Finding> = status
                     .comments
                     .iter()
-                    .filter(|c| !is_bot_comment(&c.body) && !c.body.trim().is_empty())
-                    .filter(|c| {
-                        !c.body
-                            .trim_start()
-                            .to_ascii_lowercase()
-                            .starts_with("/provefab ")
-                    })
+                    .filter(|c| !is_bot_comment(&c.body))
                     .filter(|c| {
                         c.author == task.author
                             || matches!(c.association.as_str(), "OWNER" | "MEMBER" | "COLLABORATOR")
                     })
-                    .map(|c| Finding {
+                    // Command lines are dispositions, not change requests.
+                    .map(|c| (c, crate::record::strip_commands(&c.body)))
+                    .filter(|(_, body)| !body.is_empty())
+                    .map(|(c, body)| Finding {
                         file: "(pull request comment)".into(),
                         line: None,
                         severity: Severity::Blocking,
-                        text: format!("{} wrote: {}", c.author, c.body),
+                        text: format!("{} wrote: {}", c.author, body),
                     })
                     .collect();
                 // The state change comes first; `pr_state` only after it, so a

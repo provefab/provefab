@@ -296,6 +296,22 @@ pub fn parse_commands(body: &str) -> Vec<Result<Command, String>> {
     out
 }
 
+/// `body` without the lines `parse_commands` treats as commands, trimmed.
+pub fn strip_commands(body: &str) -> String {
+    let mut fenced = false;
+    let mut kept = Vec::new();
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.starts_with("```") {
+            fenced = !fenced;
+        } else if !fenced && line.to_ascii_lowercase().starts_with("/provefab ") {
+            continue;
+        }
+        kept.push(raw);
+    }
+    kept.join("\n").trim().to_string()
+}
+
 fn line_of(p: &Result<Command, String>) -> String {
     match p {
         Err(l) => l.clone(),
@@ -433,6 +449,17 @@ mod tests {
                 reason: None
             })
         );
+    }
+
+    #[test]
+    fn strip_commands_removes_only_command_lines() {
+        assert_eq!(
+            strip_commands("Thanks!\n/provefab F1 rejected\nrename x"),
+            "Thanks!\nrename x"
+        );
+        assert_eq!(strip_commands("/provefab F1 fixed\n"), "");
+        let fenced = "see:\n```\n/provefab F4 waived\n```";
+        assert_eq!(strip_commands(fenced), fenced);
     }
 
     #[test]
