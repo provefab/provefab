@@ -23,9 +23,10 @@ use crate::paths::Paths;
 use crate::policy::{Approval, BoxFuture, MergeOutcome, MergeTools, PrOpened, ReviewPolicy};
 use crate::ports::{Hub, Oracle};
 use crate::prompts::{Template, render};
+use crate::record::{Event, GateEntry};
 use crate::router::{StageTiers, fallback_tiers, resolve_tier, select, stage_tiers};
 use crate::stage::{Finding, PlanOutput, ReviewOutput, ReviewVerdict, Severity, output_schema};
-use crate::store::{Also, StageRunRecord, Store, StoreError, TaskRow, now, rfc3339};
+use crate::store::{Also, StageRunRecord, Store, StoreError, TaskRow, Write, now, rfc3339};
 use crate::task::{Stage, TaskKind, TaskState, Tier};
 
 /// Loop detector cadence and window (spec §4.3).
@@ -153,6 +154,11 @@ fn issue_snapshot(v: &Value) -> (String, String) {
         v["title"].as_str().unwrap_or_default().to_string(),
         v["body"].as_str().unwrap_or_default().to_string(),
     )
+}
+
+/// The pass number of a task: 1, plus one per reopen.
+pub(crate) fn pass_of(task: &TaskRow) -> u32 {
+    task.reopen_count + 1
 }
 
 fn tiers_json(t: &StageTiers) -> Value {
@@ -698,13 +704,22 @@ where
         let verdict_json = verdict
             .as_ref()
             .map(|v| serde_json::to_value(v).unwrap_or(Value::Null));
+        let jev = verdict.as_ref().map(|v| v.jev_model.as_str());
+        let tiers_value = tiers_json(&tiers);
         self.store
-            .record_routing(
+            .write_with_events(
                 task.id,
-                verdict.as_ref().map(|v| v.jev_model.as_str()),
-                verdict_json.as_ref(),
-                &tiers_json(&tiers),
-                &tiers.reasons,
+                Write::Routing {
+                    jev_model: jev,
+                    verdict: verdict_json.as_ref(),
+                    tiers: &tiers_value,
+                    reasons: &tiers.reasons,
+                },
+                &[Event::Routed {
+                    tiers: tiers_value.clone(),
+                    jev_model: jev.map(str::to_string),
+                    fallback: verdict.is_none(),
+                }],
             )
             .await?;
         self.go(
@@ -1644,25 +1659,41 @@ Please reply with what should happen, what happens instead, and how to reproduce
         // Serialises this record+mark with `claim`'s count+claim, so a claim
         // freed here is never missed by another worker's count (issue #12).
         let _gate = self.budget.lock().await;
+        let run = StageRunRecord {
+            task_id: task.id,
+            stage: stage.into(),
+            model_id: model.id.clone(),
+            exit,
+            turns,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            session_dir: session,
+            gate_score: None,
+            started_at: started,
+            finished_at: now(),
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            actual_model,
+            cost_usd: cost.usd,
+            quota_units: cost.quota_units,
+        };
         self.store
-            .record_stage_run(&StageRunRecord {
-                task_id: task.id,
-                stage: stage.into(),
-                model_id: model.id.clone(),
-                exit,
-                turns,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                session_dir: session,
-                gate_score: None,
-                started_at: started,
-                finished_at: now(),
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                actual_model,
-                cost_usd: cost.usd,
-                quota_units: cost.quota_units,
-            })
+            .write_with_events(
+                task.id,
+                Write::StageRun(&run),
+                &[Event::StageRun {
+                    stage: run.stage.clone(),
+                    model_id: run.model_id.clone(),
+                    actual_model: run.actual_model.clone(),
+                    provider: Some(model.provider_key()),
+                    input_tokens: run.input_tokens,
+                    output_tokens: run.output_tokens,
+                    cache_read_tokens: run.cache_read_tokens,
+                    cache_write_tokens: run.cache_write_tokens,
+                    cost_usd: run.cost_usd,
+                    exit: run.exit.clone(),
+                }],
+            )
             .await?;
         slot.recorded();
         drop(_gate);
@@ -1902,9 +1933,23 @@ Please reply with what should happen, what happens instead, and how to reproduce
         };
         let mut value = serde_json::to_value(&plan).unwrap_or(Value::Null);
         if let Some(o) = value.as_object_mut() {
-            o.insert("pass".into(), json!(u64::from(task.reopen_count) + 1));
+            o.insert("pass".into(), json!(u64::from(pass_of(task))));
         }
-        self.store.record_output(task.id, "plan", &value).await?;
+        self.store
+            .write_with_events(
+                task.id,
+                Write::Output {
+                    kind: "plan",
+                    value: &value,
+                },
+                &[Event::Plan {
+                    pass: pass_of(task),
+                    summary: plan.summary.clone(),
+                    steps: plan.steps.clone(),
+                    risks: plan.risks.clone(),
+                }],
+            )
+            .await?;
         Self::mirror(&wt, "plan", &value);
         self.plan_ready(task, repo, &wt, kind, &plan).await
     }
@@ -1943,15 +1988,22 @@ Please reply with what should happen, what happens instead, and how to reproduce
             let genuine = report
                 .first_failure()
                 .is_some_and(|r| !could_not_run(r.exit, &r.output_tail));
+            let result = json!({
+                "pass": u64::from(pass_of(task)),
+                "command": cmd,
+                "reproduced": genuine,
+            });
             self.store
-                .record_output(
+                .write_with_events(
                     task.id,
-                    "repro_result",
-                    &json!({
-                        "pass": u64::from(task.reopen_count) + 1,
-                        "command": cmd,
-                        "reproduced": genuine,
-                    }),
+                    Write::Output {
+                        kind: "repro_result",
+                        value: &result,
+                    },
+                    &[Event::Reproduction {
+                        command: cmd.to_string(),
+                        failed_before_fix: genuine,
+                    }],
                 )
                 .await?;
         }
@@ -1997,25 +2049,45 @@ Please reply with what should happen, what happens instead, and how to reproduce
             std::fs::write(&path, json!({"results": results}).to_string())
                 .map_err(|e| ForgeError::Parse(path.display().to_string(), e.to_string()))?;
         }
+        let output_ref = scratch.display().to_string();
+        let run = StageRunRecord {
+            task_id: task.id,
+            stage: stage.into(),
+            model_id: String::new(),
+            exit: if report.passed() { "passed" } else { "failed" }.into(),
+            turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            session_dir: scratch,
+            gate_score: Some(report.score.to_string()),
+            started_at: started,
+            finished_at: now(),
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            actual_model: None,
+            cost_usd: None,
+            quota_units: None,
+        };
         self.store
-            .record_stage_run(&StageRunRecord {
-                task_id: task.id,
-                stage: stage.into(),
-                model_id: String::new(),
-                exit: if report.passed() { "passed" } else { "failed" }.into(),
-                turns: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                session_dir: scratch,
-                gate_score: Some(report.score.to_string()),
-                started_at: started,
-                finished_at: now(),
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                actual_model: None,
-                cost_usd: None,
-                quota_units: None,
-            })
+            .write_with_events(
+                task.id,
+                Write::StageRun(&run),
+                &[Event::GatesRun {
+                    stage: stage.into(),
+                    round: task.review_rounds,
+                    results: report
+                        .results
+                        .iter()
+                        .map(|r| GateEntry {
+                            command: r.command.clone(),
+                            exit: r.exit,
+                            timed_out: r.timed_out,
+                            passed: r.passed,
+                            output_ref: output_ref.clone(),
+                        })
+                        .collect(),
+                }],
+            )
             .await?;
         Ok(report)
     }

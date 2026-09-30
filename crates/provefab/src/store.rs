@@ -1004,6 +1004,7 @@ fn task_row(r: &SqliteRow) -> Result<TaskRow, StoreError> {
 }
 
 /// One existing write, run in the same transaction as its record events.
+#[derive(Debug)]
 pub enum Write<'a> {
     Nothing,
     StageRun(&'a StageRunRecord),
@@ -1032,6 +1033,12 @@ async fn exec_write(
     match write {
         Write::Nothing => {}
         Write::StageRun(run) => {
+            if run.task_id != task_id {
+                return Err(StoreError::Corrupt(format!(
+                    "stage run for task {} written under task {task_id}",
+                    run.task_id
+                )));
+            }
             sqlx::query(
                 "INSERT INTO stage_runs (task_id, stage, model_id, exit, turns, input_tokens, output_tokens, session_dir, gate_score, started_at, finished_at,
                                          cache_read_tokens, cache_write_tokens, actual_model, cost_usd, quota_units)
@@ -1423,6 +1430,38 @@ mod tests {
             s.last_reply_seen(id).await.unwrap().as_deref(),
             Some("2026-09-24T11:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn a_stage_run_written_under_another_task_is_refused() {
+        let (_d, s) = store().await;
+        let a = s.add_issue(&issue(7)).await.unwrap().unwrap();
+        let b = s.add_issue(&issue(8)).await.unwrap().unwrap();
+        let run = StageRunRecord {
+            task_id: a,
+            stage: "plan".into(),
+            model_id: "m".into(),
+            exit: "completed".into(),
+            turns: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            session_dir: "/s".into(),
+            gate_score: None,
+            started_at: 1,
+            finished_at: 2,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            actual_model: None,
+            cost_usd: None,
+            quota_units: None,
+        };
+        let err = s
+            .write_with_events(b, Write::StageRun(&run), &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+        assert!(s.stage_runs(a).await.unwrap().is_empty());
+        assert!(s.stage_runs(b).await.unwrap().is_empty());
     }
 
     /// Final review C1: `--workers N` moves tasks concurrently through one store.
