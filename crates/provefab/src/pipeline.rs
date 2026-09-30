@@ -226,16 +226,17 @@ fn plan_text(p: &PlanOutput) -> String {
     s
 }
 
-fn findings_text(r: &ReviewOutput) -> String {
+fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
     r.findings
         .iter()
-        .map(|f| {
+        .zip(keys)
+        .map(|(f, k)| {
             let at = f.line.map(|l| format!(":{l}")).unwrap_or_default();
             let sev = match f.severity {
                 Severity::Blocking => "blocking",
                 Severity::Minor => "minor",
             };
-            format!("- {}{at} [{sev}] {}", f.file, f.text)
+            format!("- {k} · {sev} · `{}{at}` · {}", f.file, f.text)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2472,14 +2473,28 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Err(reason) => return self.stage_failed(task, repo, "review", &reason).await,
         };
         let value = serde_json::to_value(&review).unwrap_or(Value::Null);
-        self.store.record_output(task.id, "review", &value).await?;
+        let keys = self
+            .store
+            .record_review(
+                task.id,
+                &value,
+                &model.id,
+                pass_of(task),
+                task.review_rounds,
+                match review.verdict {
+                    ReviewVerdict::Approve => "approve",
+                    ReviewVerdict::Changes => "changes",
+                },
+                &review.findings,
+            )
+            .await?;
         Self::mirror(&wt, "review", &value);
         if review.verdict == ReviewVerdict::Changes {
             if task.review_rounds + 1 > self.config.limits.review_rounds {
                 let why = format!(
                     "the reviewer still asks for changes after {} rounds:\n{}",
                     self.config.limits.review_rounds,
-                    findings_text(&review)
+                    findings_text(&review, &keys)
                 );
                 // D50: a fresh pass on the frontier tier, with every finding kept.
                 return self.auto_pass(task, repo, &why, true).await;
@@ -2542,7 +2557,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 )
                 .await;
         }
-        self.open_pr(task, repo, &wt, &review, plan.as_ref()).await
+        self.open_pr(task, repo, &wt, &review, &keys, plan.as_ref())
+            .await
     }
 
     /// This pass's reproduction really failed before the change (review I5).
@@ -2617,9 +2633,19 @@ Please reply with what should happen, what happens instead, and how to reproduce
         else {
             return Ok(None);
         };
+        let keys = self
+            .store
+            .events(task.id)
+            .await?
+            .iter()
+            .rev()
+            .find(|e| e.kind == "review")
+            .and_then(|e| serde_json::from_value::<Vec<String>>(e.payload["findings"].clone()).ok())
+            .unwrap_or_default();
         let plan = self.plan_output(task.id).await?;
         Ok(Some(
-            self.open_pr(task, repo, wt, &review, plan.as_ref()).await?,
+            self.open_pr(task, repo, wt, &review, &keys, plan.as_ref())
+                .await?,
         ))
     }
 
@@ -2658,6 +2684,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
         repo: &RepoConfig,
         wt: &Path,
         review: &ReviewOutput,
+        keys: &[String],
         plan: Option<&PlanOutput>,
     ) -> Result<String, PipelineError> {
         let mut b = format!("Closes #{}.\n\n", task.issue_number);
@@ -2718,7 +2745,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
         }
         if !review.findings.is_empty() {
-            b.push_str(&format!("\n## Review notes\n\n{}\n", findings_text(review)));
+            b.push_str(&format!(
+                "\n## Review notes\n\n{}\n\nReply `/provefab {} rejected` (or accepted, fixed, waived), optionally followed by a reason, to record what you decided.\n",
+                findings_text(review, keys),
+                keys.first().map(String::as_str).unwrap_or("F1")
+            ));
         }
         b.push_str(&format!(
             "\n---\nOpened by Provefab (task {}). Details: `provefab log {}`.\n",
@@ -2733,13 +2764,14 @@ Please reply with what should happen, what happens instead, and how to reproduce
         repo: &RepoConfig,
         wt: &Path,
         review: &ReviewOutput,
+        keys: &[String],
         plan: Option<&PlanOutput>,
     ) -> Result<TaskState, PipelineError> {
         let branch = task_branch(task);
         if let Err(e) = self.git.push(wt, &branch).await {
             return self.failed(task, repo, "push failed", &e).await;
         }
-        let body = self.pr_body(task, repo, wt, review, plan).await?;
+        let body = self.pr_body(task, repo, wt, review, keys, plan).await?;
         let url = match self
             .hub
             .pr_create(&repo.slug, &branch, &repo.base, &task.title, &body)

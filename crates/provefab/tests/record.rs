@@ -23,7 +23,7 @@ async fn a_pass_records_routing_stage_runs_gates_and_the_plan_in_order() {
     let ev = p.store.events(id).await.unwrap();
     let k = kinds(&ev);
     assert_eq!(k[0], "routed");
-    for want in ["stage_run", "plan", "gates_run"] {
+    for want in ["stage_run", "plan", "gates_run", "review"] {
         assert!(k.contains(&want.to_string()), "{want} missing from {k:?}");
     }
     // Every stage_runs row has exactly one stage_run or gates_run event.
@@ -82,4 +82,175 @@ async fn a_bugfix_records_whether_its_reproduction_failed_before_the_fix() {
         .find(|e| e.kind == "reproduction")
         .expect("reproduction event");
     assert_eq!(r.payload["failed_before_fix"], true);
+}
+
+// Shared helpers, used by the tests of later tasks.
+#[allow(dead_code)]
+type P = provefab::pipeline::Pipeline<FakeRunner, FakeOracle, FakeHub>;
+
+/// Approves with two minor findings; F1's text carries a sentinel secret for
+/// the export redaction test.
+#[allow(dead_code)]
+fn approve_with_findings(
+    m: &provefab::config::ModelEntry,
+    req: &agent_workers::StageRequest,
+    tx: &tokio::sync::mpsc::UnboundedSender<agent_workers::WorkerEvent>,
+) -> Option<agent_workers::StageResult> {
+    match stage_of(&req.prompt) {
+        "review" => done(Some(serde_json::json!({"verdict": "approve", "findings": [
+            {"file": "src/a.rs", "line": 4, "severity": "minor", "text": "typo SENTINEL_SECRET_42"},
+            {"file": "src/b.rs", "line": null, "severity": "minor", "text": "naming"}
+        ]}))),
+        _ => happy(m, req, tx),
+    }
+}
+
+/// A task driven to PrOpen with findings F1 and F2 (pass 1).
+#[allow(dead_code)]
+async fn open_task_with_findings() -> (Fixture, P, i64) {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(approve_with_findings),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    (f, p, id)
+}
+
+/// `open_task_with_findings`, then merged by a person: README.md becomes
+/// "broken" in one commit on origin/main (so `grep -q hello README.md`
+/// post-merge checks fail and a revert is prepared).
+#[allow(dead_code)]
+async fn merged_task(checks: &[&str]) -> (Fixture, P, i64) {
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.config.repos[0].post_merge_checks = checks.iter().map(|c| c.to_string()).collect();
+    let p = pipeline(
+        &f,
+        Box::new(approve_with_findings),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let repo = f.config.repos[0].path_in(&f.home);
+    std::fs::write(repo.join("README.md"), "broken\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-qm", "squash merge"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let sha = git(&repo, &["rev-parse", "HEAD"]);
+    *p.hub.pr_status.lock().unwrap() = provefab::forge::PrStatus {
+        state: provefab::forge::PrState::Merged,
+        comments: vec![],
+        head_sha: Some("pr-head".into()),
+        merge_sha: Some(sha),
+        base_ref: Some("main".into()),
+        commit_count: Some(1),
+    };
+    p.watch_pr(id).await.unwrap();
+    (f, p, id)
+}
+
+fn review_with(findings: serde_json::Value, verdict: &str) -> serde_json::Value {
+    serde_json::json!({"verdict": verdict, "findings": findings})
+}
+
+#[tokio::test]
+async fn review_findings_get_stable_keys_across_rounds() {
+    // Round 1 asks for changes with two findings, round 2 approves with one minor note.
+    let f = fixture(&["test -f feature.txt"]);
+    let rounds = std::sync::Mutex::new(0);
+    let script =
+        move |m: &provefab::config::ModelEntry,
+              req: &agent_workers::StageRequest,
+              tx: &tokio::sync::mpsc::UnboundedSender<agent_workers::WorkerEvent>| {
+            match stage_of(&req.prompt) {
+                "review" => {
+                    let mut n = rounds.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        done(Some(review_with(
+                            serde_json::json!([
+                                {"file": "src/a.rs", "line": 3, "severity": "blocking", "text": "off by one"},
+                                {"file": "src/b.rs", "line": null, "severity": "minor", "text": "naming"}
+                            ]),
+                            "changes",
+                        )))
+                    } else {
+                        done(Some(review_with(
+                            serde_json::json!([
+                                {"file": "src/a.rs", "line": 4, "severity": "minor", "text": "comment typo"}
+                            ]),
+                            "approve",
+                        )))
+                    }
+                }
+                _ => happy(m, req, tx),
+            }
+        };
+    let p = pipeline(
+        &f,
+        Box::new(script),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let fs = p.store.findings(id).await.unwrap();
+    assert_eq!(
+        fs.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(),
+        ["F1", "F2", "F3"]
+    );
+    assert_eq!((fs[0].round, fs[2].round), (0, 1));
+    assert!(fs.iter().all(|x| x.pass == 1));
+    let reviews: Vec<_> = p
+        .store
+        .events(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "review")
+        .collect();
+    assert_eq!(
+        reviews[0].payload["findings"],
+        serde_json::json!(["F1", "F2"])
+    );
+    assert_eq!(reviews[1].payload["findings"], serde_json::json!(["F3"]));
+    let body = &p.hub.prs.lock().unwrap()[0].3;
+    assert!(
+        body.contains("F3 · minor · `src/a.rs:4` · comment typo"),
+        "{body}"
+    );
+    assert!(body.contains("Reply `/provefab F3 rejected`"), "{body}");
+    assert!(!body.contains('\u{2014}'));
+}
+
+#[tokio::test]
+async fn an_approval_without_findings_has_no_review_notes() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    p.drive(id).await.unwrap();
+    assert!(p.store.findings(id).await.unwrap().is_empty());
+    let review = p
+        .store
+        .events(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "review")
+        .unwrap();
+    assert_eq!(review.payload["findings"], serde_json::json!([]));
+    assert!(!p.hub.prs.lock().unwrap()[0].3.contains("Review notes"));
 }

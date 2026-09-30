@@ -11,7 +11,7 @@ use sqlx::sqlite::{
 use sqlx::{Row, SqliteConnection};
 
 use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
-use crate::record::{Event, StoredEvent};
+use crate::record::{Event, FindingRow, StoredEvent};
 use crate::task::{TaskKind, TaskState};
 
 #[derive(Debug, thiserror::Error)]
@@ -784,6 +784,93 @@ impl Store {
         }
         tx.commit().await?;
         Ok(ids)
+    }
+
+    /// Records a review output, its `review` event and its findings with
+    /// new keys, in one transaction (spec sections 3.2 and 4).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_review(
+        &self,
+        task_id: i64,
+        value: &Value,
+        reviewer_model: &str,
+        pass: u32,
+        round: u32,
+        verdict: &str,
+        findings: &[crate::stage::Finding],
+    ) -> Result<Vec<String>, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        exec_write(
+            &mut tx,
+            task_id,
+            &Write::Output {
+                kind: "review",
+                value,
+            },
+        )
+        .await?;
+        let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM findings WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let keys: Vec<String> = (0..findings.len())
+            .map(|i| format!("F{}", taken + 1 + i as i64))
+            .collect();
+        let event_id = append_event(
+            &mut tx,
+            task_id,
+            &Event::Review {
+                reviewer_model: reviewer_model.into(),
+                pass,
+                round,
+                verdict: verdict.into(),
+                findings: keys.clone(),
+            },
+        )
+        .await?;
+        for (k, f) in keys.iter().zip(findings) {
+            sqlx::query(
+                "INSERT INTO findings (task_id, key, pass, round, reviewer_model, severity, file, line, text, event_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(task_id)
+            .bind(k)
+            .bind(pass)
+            .bind(round)
+            .bind(reviewer_model)
+            .bind(match f.severity { crate::stage::Severity::Blocking => "blocking", crate::stage::Severity::Minor => "minor" })
+            .bind(&f.file)
+            .bind(f.line)
+            .bind(&f.text)
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(keys)
+    }
+
+    pub async fn findings(&self, task_id: i64) -> Result<Vec<FindingRow>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM findings WHERE task_id = ? ORDER BY id")
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| FindingRow {
+                id: r.get("id"),
+                task_id: r.get("task_id"),
+                key: r.get("key"),
+                pass: r.get::<i64, _>("pass") as u32,
+                round: r.get::<i64, _>("round") as u32,
+                reviewer_model: r.get("reviewer_model"),
+                severity: r.get("severity"),
+                file: r.get("file"),
+                line: r.get::<Option<i64>, _>("line").map(|l| l as u32),
+                text: r.get("text"),
+                event_id: r.get("event_id"),
+            })
+            .collect())
     }
 
     pub async fn events(&self, task_id: i64) -> Result<Vec<StoredEvent>, StoreError> {

@@ -320,3 +320,19 @@ mod tests {
         assert_eq!(e.typed(), None);
     }
 }
+
+/// A review finding with its stable key (spec section 3.2).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FindingRow {
+    pub id: i64,
+    pub task_id: i64,
+    pub key: String,
+    pub pass: u32,
+    pub round: u32,
+    pub reviewer_model: String,
+    pub severity: String,
+    pub file: String,
+    pub line: Option<u32>,
+    pub text: String,
+    pub event_id: i64,
+}
