@@ -60,8 +60,9 @@ gates = ["cargo fmt -- --check", "cargo clippy --all-targets -- -D warnings", "c
 # max_lines = 400
 
 # Risk-aware policy (optional): changed paths in ci, dependencies, migrations,
-# infrastructure or secrets-config get a frontier reviewer, a Risk section in the PR
-# and a provefab:risk-<category> label. Add your own sensitive paths:
+# infrastructure or secrets-config get a frontier reviewer (when one from another
+# provider than the implementer's is configured), a Risk section in the PR and a
+# provefab:risk-<category> label. Add your own sensitive paths:
 # [repos.risk]
 # disable = ["infrastructure"]                # turn a built-in category off
 # [repos.risk.categories.auth]

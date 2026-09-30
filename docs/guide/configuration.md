@@ -102,7 +102,7 @@ For gates that work well:
 
 ## `[repos.risk]`: risk-aware policy
 
-Provefab classifies each round's changed files by path into risk categories. A risky change gets stricter handling: extra checks, a frontier reviewer, a visible Risk section in the PR and a label on the issue. The policy raises scrutiny; it does not prove a change is harmless. It works with no configuration, and `[repos.risk]` is optional. Path matching only: file contents are not read.
+Provefab classifies each round's changed files by path into risk categories. A risky change gets stricter handling: extra checks, a frontier reviewer from another provider when you have one, a visible Risk section in the PR and a label on the issue. The policy raises scrutiny; it does not prove a change is harmless. It works with no configuration, and `[repos.risk]` is optional. Path matching only: file contents are not read.
 
 **Built-in categories** (a path matching any pattern puts the change in the category):
 
@@ -122,7 +122,7 @@ Provefab classifies each round's changed files by path into risk categories. A r
 | `[repos.risk.categories.<name>]` | none | Adds a category, or extends a built-in of the same name. |
 | `paths` | required for a new category | Patterns of the category. For a built-in, they are added to its patterns. |
 | `checks` | `[]` | Commands run in the worktree, after your `gates`, when the category is detected. For a built-in, they replace its checks. A command already in `gates` runs once. Same timeout and rerun rules as gates; a failing check is an ordinary gate failure: the round goes back to implementation and counts toward the same attempt limit as other gates. |
-| `reviewer_tier` | `frontier` | `frontier` or `standard`: the tier of the review when the category is detected. |
+| `reviewer_tier` | `frontier` | `frontier` or `standard`: the tier of the review when the category is detected. `frontier` applies only when a frontier model from another provider than the implementer's is configured; otherwise the usual reviewer from another provider stays (see [Usage](usage.md#risk-aware-changes)). |
 
 ```toml
 [[repos]]
@@ -141,19 +141,20 @@ paths = ["db/schema/**"]
 checks = ["./scripts/check-migration.sh"]
 ```
 
-Category names use lowercase letters, digits and `-`. `unknown` is reserved: Provefab uses it when the changed files cannot be computed.
+Category names use lowercase letters, digits and `-`. `unknown` and `none` are reserved: Provefab uses `unknown` when the changed files cannot be computed, and Provefab Pro's calibration report uses `none` for changes with no risk category.
 
 **Validation errors** (an invalid `[repos.risk]` is refused when the configuration loads, so Provefab does not start; `provefab doctor` and `provefab run` report `<slug>: [repos.risk]: <message>`):
 
 - `unknown category in disable: <name>`: `disable` names something that is not built-in.
-- `invalid category name: <name>`: empty, `unknown`, or not lowercase letters, digits and `-`.
+- `invalid category name: <name>`: empty, `unknown`, `none`, or not lowercase letters, digits and `-`.
 - `<name>: empty path`, `<name>: empty check`: a blank entry.
+- `<name>: path "<p>" must be relative, without "./", a trailing "/" or empty segments`: a pattern that can never match a changed path (`/src/**`, `./src/**`, `src/`, `src//auth`).
 - `<name>: no paths`: a new category without `paths`.
 - `<name>: reviewer_tier must be standard or frontier`.
 - `<name> is disabled`: the same built-in is in `disable` and in `categories`.
 - An unknown key under `[repos.risk]` or a category table is refused too.
 
-`provefab doctor` prints one `risk <slug>` line per repository: the category count and names, and how many checks were added. See [Usage](usage.md#risk-aware-changes) for what happens to a risky change.
+`provefab doctor` prints one `risk <slug>` line per repository: the category count and names, and how many checks were added. It ends with `; warning: no frontier model from a second provider, risky changes keep a standard cross-provider reviewer` when no frontier model has a provider different from one of your standard models. See [Usage](usage.md#risk-aware-changes) for what happens to a risky change.
 
 ## `[limits]`
 

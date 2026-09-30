@@ -45,8 +45,8 @@ checks = ["./scripts/check-migration.sh"]
 
 - `[repos.risk]` is optional; absent, the built-ins apply.
 - A table under `categories` with a built-in name extends it (its paths are added; its `checks` and `reviewer_tier` apply); a new name creates a category.
-- Validation at load (a config error, like the others): an unknown name in `disable`; a category with no paths (for a new category); an empty path or check; a `reviewer_tier` other than `standard` or `frontier`; a category name outside `[a-z0-9-]+`; the reserved name `unknown`.
-- `provefab doctor` prints each repository's resolved policy (categories, paths count, checks, tier).
+- Validation at load (a config error, like the others): an unknown name in `disable`; a category with no paths (for a new category); an empty path or check; a `reviewer_tier` other than `standard` or `frontier`; a category name outside `[a-z0-9-]+`; the reserved names `unknown` and `none` (Pro's calibration uses `none` for "no risk"); a path with a leading `/` or `./`, a trailing `/` or an empty segment (it can never match). (amended 2026-09-30 after final review)
+- `provefab doctor` prints one `risk <slug>` line per repository: the number of categories and their names, and the total number of checks. (amended 2026-09-30 after final review) When no frontier model has a provider different from a standard model's (or there is no frontier model), the line ends with `; warning: no frontier model from a second provider, risky changes keep a standard cross-provider reviewer`.
 
 ## 5. Path patterns
 
@@ -56,14 +56,14 @@ A small matcher in the core, no new dependency: patterns are `/`-separated; `**`
 
 - `risk::classify(policy, paths) -> Vec<Detected>` is pure: for each category (in a stable order: built-ins in table order, then repository categories by name), the list of paths that matched. Categories with no match are absent.
 - Input paths: every path `Git::changed_files(base...HEAD)` reports, including both sides of a rename.
-- Run after each implementation round, on the actual diff. (amended 2026-09-30 in the plan) Classification runs in the gate step right after the round is committed, because the diff exists only then; the categories' extra checks run as a second gates pass named `risk-gates`, after the repository's own gates. If the changed paths cannot be computed, the result is the single category `unknown` (fail closed: frontier reviewer; Pro never auto-merges it) and the round continues.
+- Run after each implementation round, on the actual diff. (amended 2026-09-30 in the plan) Classification runs in the gate step right after the round is committed, because the diff exists only then; the categories' extra checks run as a second gates pass named `risk-gates`, after the repository's own gates. If the changed paths cannot be computed, the result is the single category `unknown` (fail closed: treated as a category needing a frontier reviewer, see §7.2; Pro never auto-merges it) and the round continues.
 - Each classification is recorded as a `risk_classified` event (source `fact`, schema_version 1): `{ pass, round, categories: [{ name, paths }] }`. The record's export treats `paths` as identity (not free text).
 
 ## 7. Consequences in the core
 
 1. Gates: the union of the detected categories' `checks` is appended to the repository's gates for that round, deduplicated, in category order; same timeout and rerun rules; a failure is an ordinary gate failure (back to implementation). The stage run and `gates_run` event record them like other gates.
-2. Review: when any detected category (or `unknown`) has `reviewer_tier = "frontier"`, the review stage runs on the frontier tier (a new rule in `review_tier`, after the existing ones). If no frontier model is configured, the task goes to `needs_you` with the reason "a risk category requires a frontier reviewer and none is configured".
-3. PR body: a "Risk" section, one line per category: `- migrations: \`migrations/0005.sql\`, \`db/schema/users.sql\` · checks added: \`./scripts/check-migration.sh\` · reviewer: frontier` (paths listed up to 5, then "and N more"). No section when nothing is detected.
+2. Review: when any detected category (or `unknown`) has `reviewer_tier = "frontier"`, the review stage runs on the frontier tier (a new rule in `review_tier`, after the existing ones), provided the catalog has a frontier model whose provider differs from the provider of the model that implemented the round (the latest `implement` stage run). Otherwise the tier the other rules give is kept, so the usual cross-provider reviewer applies; nothing parks for lack of a frontier model. (amended 2026-09-30 after final review: owner decision, option 1) The earlier rule sent the task to `needs_you` when no frontier model was configured; it is removed.
+3. PR body: a "Risk" section, one line per category: `- migrations: \`migrations/0005.sql\`, \`db/schema/users.sql\` · checks added: \`./scripts/check-migration.sh\` · reviewer: frontier` (paths listed up to 5, then "and N more"). No section when nothing is detected. When a category wants frontier but no frontier model from another provider than the implementer's exists, its line ends with `reviewer: standard (no frontier reviewer from another provider is configured)`; the section uses the same decision as the review tier. (amended 2026-09-30 after final review: owner decision, option 1)
 4. Labels: `<label>:risk-<category>` for each detected category, created like the other Provefab labels; stale risk labels from an earlier round are removed. (amended 2026-09-30 in the plan) The labels go on the issue like every Provefab label, created on demand with `ensure_label`, and are applied right after classification, before the extra checks run.
 5. `provefab log` shows the risk classification of each round.
 
@@ -85,7 +85,7 @@ Committed with the feature; deployed at the release.
 - Matcher: `*`, `**`, anchoring, examples (`db/migrations/0005.sql`, `.env.local`, `web/package-lock.json`, `src/auth/mod.rs`) and non-matches (`src/authz.rs` against `src/auth/**`).
 - Policy resolution: built-ins, `disable`, repository category, extending a built-in, every validation error.
 - Classification: several categories, matched paths, no match, rename both sides, `unknown` when paths cannot be computed.
-- Pipeline (existing fakes): a change under `migrations/` adds the category check to the gates, forces a frontier reviewer, adds the Risk section and label, records `risk_classified`; a failing risk check goes back to implementation; no frontier model gives `needs_you`; a later round without the category removes its label.
+- Pipeline (existing fakes): a change under `migrations/` adds the category check to the gates, forces a frontier reviewer from another provider, adds the Risk section and label, records `risk_classified`; a failing risk check goes back to implementation; a frontier model only from the implementer's provider, or none, keeps the standard cross-provider reviewer and says so in the PR; `unknown` when the changed files cannot be computed; a later round without the category removes its label. (amended 2026-09-30 after final review: owner decision, option 1)
 - Pro: tested in the Pro repository.
 - Non-regression: a repository with no detected risk behaves exactly as before (same gates, tiers, PR body).
 
@@ -107,7 +107,8 @@ Out of v1, each with a re-open trigger:
 
 1-4: owner decisions in section 2.
 5. Classification runs on the actual diff after each implementation round, not on the plan's predicted files (controller, reversible). Why: the plan can be wrong; the diff is what merges.
-6. `unknown` when the diff cannot be computed, with a frontier reviewer and no auto-merge (controller). Why: fail closed.
+6. `unknown` when the diff cannot be computed, with a frontier reviewer (per §7.2) and no auto-merge (controller). Why: fail closed.
 7. Default consequence of a category is a frontier reviewer only; checks are opt-in per repository (controller). Why: commands are repository-specific; a wrong default command would fail every run.
 8. Pro reclassifies at merge time with the core's function instead of reading the last event (controller). Why: the merge decision must describe the exact head being merged.
 9. No new dependency for glob matching (controller). Why: the pattern language is small and must be explainable in the docs.
+10. A risky review is frontier only when a frontier model from another provider than the implementer's exists; otherwise the standard cross-provider reviewer stays and the PR and `provefab doctor` say so (owner decision 2026-09-30 after final review, option 1). Why: owner's choice among the options the final review listed; it keeps the reviewer on another provider than the implementer. Re-open if pilots want risky changes to wait for a frontier reviewer instead.

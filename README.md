@@ -16,7 +16,7 @@ issue labelled `provefab`
 
 Provefab keeps a local record of what each change observed, claimed and decided, exportable as JSON Lines.
 
-Changes that touch CI, dependencies, migrations, infrastructure, secret-looking files or paths you name get stricter review: extra checks, a frontier reviewer, a Risk section in the PR and a label on the issue (see [Configuration](docs/guide/configuration.md#reposrisk-risk-aware-policy)).
+Changes that touch CI, dependencies, migrations, infrastructure, secret-looking files or paths you name get stricter review: extra checks, a frontier reviewer from another provider when one is configured, a Risk section in the PR and a label on the issue (see [Configuration](docs/guide/configuration.md#reposrisk-risk-aware-policy)).
 
 The pull request then waits for your click. Optionally set `post_merge_checks` per repository: after a Provefab PR merges, Provefab runs your commands on the merged commit; on failure it can open a human-reviewed revert PR (unless a later commit already fixed it), but only when the reverted tree passes the same checks. It never merges a revert automatically. This checks repository commands, not deployed production health. Provefab Pro adds a second reviewer on another model, merge policies (auto-merge small, tested changes under fail-closed conditions), cost reports per repository and model, and reviewer calibration reports; it is not in this repository.
 
