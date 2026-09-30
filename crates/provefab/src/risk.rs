@@ -123,9 +123,12 @@ pub fn builtins() -> Vec<Category> {
     ]
 }
 
+// `none` is Pro's calibration bucket for "no risk detected"; a category of
+// that name would merge into it, so it is reserved like `unknown`.
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name != UNKNOWN
+        && name != "none"
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -150,6 +153,14 @@ pub fn resolve(cfg: Option<&RiskConfig>) -> Result<Policy, String> {
         }
         if cc.paths.iter().any(|p| p.trim().is_empty()) {
             return Err(format!("{name}: empty path"));
+        }
+        // Changed paths are relative and normalised, so these can never match.
+        if let Some(p) = cc.paths.iter().find(|p| {
+            p.starts_with('/') || p.starts_with("./") || p.ends_with('/') || p.contains("//")
+        }) {
+            return Err(format!(
+                "{name}: path \"{p}\" must be relative, without \"./\", a trailing \"/\" or empty segments"
+            ));
         }
         if cc.checks.iter().any(|c| c.trim().is_empty()) {
             return Err(format!("{name}: empty check"));
@@ -348,6 +359,41 @@ mod tests {
         assert!(p.needs_frontier(&d));
         assert!(p.needs_frontier(&unknown()));
         assert!(!p.needs_frontier(&[]));
+    }
+
+    #[test]
+    fn none_is_reserved_like_unknown() {
+        let c: RiskConfig = toml::from_str("[categories.none]\npaths = [\"x\"]").unwrap();
+        assert_eq!(
+            resolve(Some(&c)).unwrap_err(),
+            "invalid category name: none"
+        );
+    }
+
+    #[test]
+    fn patterns_that_can_never_match_are_rejected() {
+        for bad in ["/src/auth/**", "./src/auth/**", "src/auth/", "src//auth/**"] {
+            let c = RiskConfig {
+                categories: BTreeMap::from([(
+                    "auth".to_string(),
+                    CategoryConfig {
+                        paths: vec![bad.into()],
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve(Some(&c)).unwrap_err(),
+                format!(
+                    "auth: path \"{bad}\" must be relative, without \"./\", a trailing \"/\" or empty segments"
+                ),
+                "{bad}"
+            );
+        }
+        // Extending a built-in is validated the same way.
+        let c: RiskConfig = toml::from_str("[categories.ci]\npaths = [\"ci/\"]").unwrap();
+        assert!(resolve(Some(&c)).is_err());
     }
 
     #[test]
