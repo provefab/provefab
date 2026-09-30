@@ -155,6 +155,33 @@ async fn a_same_provider_frontier_keeps_the_cross_provider_reviewer() {
     );
 }
 
+/// Jev's review risk already asks for frontier and the only frontier model
+/// shares the implementer's provider: the router falls back to it, so the
+/// PR says a frontier model reviewed, and why the risk rule could not pick
+/// one from another provider.
+#[tokio::test]
+async fn a_frontier_review_from_jev_is_what_the_pr_states() {
+    let f = fixture(&["test -f feature.txt"]);
+    let oracle = FakeOracle {
+        verdict: Some(Verdict {
+            review_risk: Some(3.5),
+            ..verdict(TaskKind::Feature, 0.1)
+        }),
+        ..Default::default()
+    };
+    let p = pipeline(&f, Box::new(risky), oracle, FakeHub::new("x")).await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    assert_eq!(reviewers(&p), ["top-claude"], "{:?}", p.runner.stages());
+    let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+    assert!(
+        body.contains(
+            "- migrations: `migrations/0005.sql` · reviewer: frontier (no frontier reviewer from another provider is configured)\n"
+        ),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn no_frontier_model_keeps_the_cross_provider_reviewer() {
     let mut f = fixture(&["test -f feature.txt"]);

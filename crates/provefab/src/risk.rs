@@ -274,7 +274,8 @@ impl Policy {
 /// frontier when a detected category needs it and the catalog has a
 /// frontier model from a provider other than the implementer's; `None`
 /// otherwise, so the usual tier and cross-provider choice apply. The PR's
-/// Risk section reads the same answer, so it states what ran.
+/// Risk section reads the same answer to say why no frontier reviewer
+/// from another provider ran.
 pub fn risky_review_tier(
     catalog: &[ModelEntry],
     implementer: Option<&str>,

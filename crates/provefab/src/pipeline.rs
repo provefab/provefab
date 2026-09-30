@@ -254,16 +254,30 @@ fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
 /// The PR body's "Risk" section, `None` when nothing was detected: one line
 /// per category with its paths, the checks it added and the reviewer tier.
 /// `frontier_ok`: `risk::risky_review_tier` found a frontier reviewer from
-/// another provider, so a category wanting frontier got one.
-fn risk_section(policy: &risk::Policy, detected: &[Detected], frontier_ok: bool) -> Option<String> {
+/// another provider, so a category wanting frontier got one. `ran`: the tier
+/// of the model that ran the round's review, which another rule (Jev's
+/// review risk, a second approver) may have made frontier anyway; every
+/// line states it, and a category wanting frontier keeps the reason the risk
+/// rule could not pick one. `None` (no review run, a model not in the
+/// catalog) falls back to what the risk rule decided.
+fn risk_section(
+    policy: &risk::Policy,
+    detected: &[Detected],
+    frontier_ok: bool,
+    ran: Option<Tier>,
+) -> Option<String> {
     const SHOWN: usize = 5;
+    const NO_FRONTIER: &str = " (no frontier reviewer from another provider is configured)";
     if detected.is_empty() {
         return None;
     }
-    let wanted = if frontier_ok {
-        "frontier"
-    } else {
-        "standard (no frontier reviewer from another provider is configured)"
+    let (wanted, other) = match ran {
+        Some(t) => {
+            let reason = if frontier_ok { "" } else { NO_FRONTIER };
+            (format!("{}{reason}", tier_name(t)), tier_name(t))
+        }
+        None if frontier_ok => ("frontier".to_string(), "standard"),
+        None => (format!("standard{NO_FRONTIER}"), "standard"),
     };
     let mut s = String::from("## Risk\n\n");
     for d in detected {
@@ -289,9 +303,9 @@ fn risk_section(policy: &risk::Policy, detected: &[Detected], frontier_ok: bool)
             s.push_str(&format!(" · checks added: {}", checks.join(", ")));
         }
         let tier = if cat.is_none_or(|c| c.frontier) {
-            wanted
+            wanted.as_str()
         } else {
-            "standard"
+            other
         };
         s.push_str(&format!(" · reviewer: {tier}\n"));
     }
@@ -3053,7 +3067,13 @@ Please reply with what should happen, what happens instead, and how to reproduce
             let frontier_ok =
                 risk::risky_review_tier(&self.config.models, implementer.as_deref(), true)
                     .is_some();
-            if let Some(section) = risk_section(&policy, &detected, frontier_ok) {
+            // What actually reviewed: the round's last review run.
+            let ran = runs
+                .iter()
+                .rfind(|r| r.stage == "review")
+                .and_then(|r| self.config.models.iter().find(|m| m.id == r.model_id))
+                .map(|m| m.tier);
+            if let Some(section) = risk_section(&policy, &detected, frontier_ok, ran) {
                 b.push('\n');
                 b.push_str(&section);
             }
@@ -3308,6 +3328,7 @@ mod tests {
             &policy,
             &[det("migrations", &["a", "b"]), det("ci", &["x.yml"])],
             true,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3318,6 +3339,7 @@ mod tests {
             &policy,
             &[det("migrations", &["a"]), det("ci", &["x.yml"])],
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3332,12 +3354,12 @@ mod tests {
             categories: vec![cat("ci", &[], true)],
         };
         let paths = ["1", "2", "3", "4", "5", "6", "7"];
-        let s = risk_section(&policy, &[det("ci", &paths)], true).unwrap();
+        let s = risk_section(&policy, &[det("ci", &paths)], true, None).unwrap();
         assert!(
             s.contains("- ci: `1`, `2`, `3`, `4`, `5`, and 2 more · reviewer: frontier\n"),
             "{s}"
         );
-        let five = risk_section(&policy, &[det("ci", &paths[..5])], true).unwrap();
+        let five = risk_section(&policy, &[det("ci", &paths[..5])], true, None).unwrap();
         assert!(!five.contains("more"), "{five}");
     }
 
@@ -3345,14 +3367,53 @@ mod tests {
     fn risk_section_unknown_and_empty() {
         let policy = risk::Policy::default();
         assert_eq!(
-            risk_section(&policy, &risk::unknown(), true).unwrap(),
+            risk_section(&policy, &risk::unknown(), true, None).unwrap(),
             "## Risk\n\n- unknown: the changed files could not be computed · reviewer: frontier\n\n"
         );
         assert_eq!(
-            risk_section(&policy, &risk::unknown(), false).unwrap(),
+            risk_section(&policy, &risk::unknown(), false, None).unwrap(),
             "## Risk\n\n- unknown: the changed files could not be computed · reviewer: standard (no frontier reviewer from another provider is configured)\n\n"
         );
-        assert_eq!(risk_section(&policy, &[], true), None);
+        assert_eq!(risk_section(&policy, &[], true, None), None);
+    }
+
+    /// The line states the tier that actually reviewed; the suffix says the
+    /// risk rule found no frontier reviewer from another provider.
+    #[test]
+    fn risk_section_states_the_tier_that_ran() {
+        const NO: &str = " (no frontier reviewer from another provider is configured)";
+        let policy = risk::Policy {
+            categories: vec![cat("migrations", &[], true), cat("ci", &[], false)],
+        };
+        let line = |frontier_ok, ran| {
+            risk_section(
+                &policy,
+                &[det("migrations", &["a"]), det("ci", &["x.yml"])],
+                frontier_ok,
+                Some(ran),
+            )
+            .unwrap()
+        };
+        let body = |m: &str, c: &str| {
+            format!(
+                "## Risk\n\n- migrations: `a` · reviewer: {m}\n- ci: `x.yml` · reviewer: {c}\n\n"
+            )
+        };
+        assert_eq!(
+            line(false, Tier::Frontier),
+            body(&format!("frontier{NO}"), "frontier")
+        );
+        assert_eq!(
+            line(false, Tier::Standard),
+            body(&format!("standard{NO}"), "standard")
+        );
+        assert_eq!(line(true, Tier::Frontier), body("frontier", "frontier"));
+        assert_eq!(
+            risk_section(&policy, &risk::unknown(), false, Some(Tier::Frontier)).unwrap(),
+            format!(
+                "## Risk\n\n- unknown: the changed files could not be computed · reviewer: frontier{NO}\n\n"
+            )
+        );
     }
 
     #[test]
