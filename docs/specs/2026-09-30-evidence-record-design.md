@@ -79,7 +79,7 @@ human:
 
 inferred (each names its rule and rule version):
 
-- `finding_unaddressed_at_merge`: the PR merged while the finding had no human disposition. Only the findings of the pass's last review count, those the PR showed; earlier rounds were never in front of the person who merged (amended 2026-09-30 after final review).
+- `finding_unaddressed_at_merge`: the PR merged while the finding had no human disposition. Only the findings of the pass's last review count, those the PR showed; earlier rounds were never in front of the person who merged (amended 2026-09-30 after final review). The last review is the pass's last review round: the highest `round` of the pass's `review` events (a final review without findings still defines it), and every review of that round counts, so with two approvers both final reviews' findings are targeted; findings with a `finding_disposition` are excluded (amended 2026-09-30: all final-round reviews).
 - `finding_followed_by_revert`: the finding's PR got a post-merge revert PR (`post_merge` reached `revert_open`).
 - `finding_followed_by_reopen`: the finding's issue was reopened after the merge.
 
@@ -94,7 +94,7 @@ Storage (amended 2026-09-30 during implementation): the three inferred kinds sha
 
 ## 5. Human dispositions
 
-- The PR body's "Review notes" shows each finding with its key, for example ``F3 · blocking · `src/lib.rs:42` · text``, followed by one help line: "Reply `/provefab F3 rejected` (or accepted, fixed, waived), optionally followed by a reason." A review approved before the record existed has no keys: its findings show without keys and without the help line (amended 2026-09-30 after final review).
+- The PR body's "Review notes" shows each finding with its key, for example ``F3 · blocking · `src/lib.rs:42` · text``, followed by one help line: "Reply `/provefab F3 rejected` (or accepted, fixed, waived), optionally followed by a reason." A review approved before the record existed has no keys: its findings show without keys and without the help line (amended 2026-09-30 after final review). The section lists the findings of every review of the pass's last review round, read from `findings`, each followed by its reviewer model, for example ``F3 · minor · `src/a.rs:4` · text (model-id)``; the help line names the first key. There is no section when that round and the review have no findings (amended 2026-09-30: all final-round reviews).
 - Commands are read from PR comments. While the PR is open, `watch_pr` already reads them every tick. After the merge, PR comments are read at most hourly with the existing reopen watch, until the task is archived (two weeks). That is one more `gh` call per hour per merged task.
 - Grammar: one or more commands per comment, each `/provefab <key> <disposition>[: reason]` on its own line. Keys are case-insensitive.
 - Only the issue author and people with write access count (the existing authorization rule). Others are ignored and logged locally.

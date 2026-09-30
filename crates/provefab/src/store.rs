@@ -15,6 +15,18 @@ use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
 use crate::record::{Disposition, Event, FindingRow, RULE_VERSION, Rule, StoredEvent};
 use crate::task::{TaskKind, TaskState};
 
+/// A finding `f` belongs to the last review round of its pass: the highest
+/// round of the pass's `review` events, so a final review without findings
+/// still defines the round (spec section 3.3). A macro so queries stay
+/// `&'static str` through `concat!`.
+macro_rules! final_round {
+    () => {
+        "f.round = (SELECT MAX(json_extract(r.payload, '$.round')) \
+         FROM change_events r WHERE r.task_id = f.task_id AND r.kind = 'review' \
+         AND json_extract(r.payload, '$.pass') = f.pass)"
+    };
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("store: {0}")]
@@ -915,22 +927,26 @@ impl Store {
             .bind(task_id)
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows
-            .iter()
-            .map(|r| FindingRow {
-                id: r.get("id"),
-                task_id: r.get("task_id"),
-                key: r.get("key"),
-                pass: r.get::<i64, _>("pass") as u32,
-                round: r.get::<i64, _>("round") as u32,
-                reviewer_model: r.get("reviewer_model"),
-                severity: r.get("severity"),
-                file: r.get("file"),
-                line: r.get::<Option<i64>, _>("line").map(|l| l as u32),
-                text: r.get("text"),
-                event_id: r.get("event_id"),
-            })
-            .collect())
+        Ok(rows.iter().map(finding_row).collect())
+    }
+
+    /// The findings of every review of the pass's last review round: with two
+    /// approvers, both final reviews (what the PR shows).
+    pub async fn final_round_findings(
+        &self,
+        task_id: i64,
+        pass: u32,
+    ) -> Result<Vec<FindingRow>, StoreError> {
+        let rows = sqlx::query(concat!(
+            "SELECT * FROM findings f WHERE f.task_id = ? AND f.pass = ? AND ",
+            final_round!(),
+            " ORDER BY f.id"
+        ))
+        .bind(task_id)
+        .bind(pass)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(finding_row).collect())
     }
 
     /// Appends a human event unless the same comment already recorded the same
@@ -1406,6 +1422,22 @@ async fn exec_write(
     Ok(())
 }
 
+fn finding_row(r: &SqliteRow) -> FindingRow {
+    FindingRow {
+        id: r.get("id"),
+        task_id: r.get("task_id"),
+        key: r.get("key"),
+        pass: r.get::<i64, _>("pass") as u32,
+        round: r.get::<i64, _>("round") as u32,
+        reviewer_model: r.get("reviewer_model"),
+        severity: r.get("severity"),
+        file: r.get("file"),
+        line: r.get::<Option<i64>, _>("line").map(|l| l as u32),
+        text: r.get("text"),
+        event_id: r.get("event_id"),
+    }
+}
+
 async fn infer_findings(
     conn: &mut SqliteConnection,
     task_id: i64,
@@ -1419,17 +1451,17 @@ async fn infer_findings(
     }
     .kind();
     let keys: Vec<String> = match rule {
-        // Only the findings of the pass's last review: those the PR showed.
-        // Earlier rounds' findings were never in front of the person who merged.
+        // Only the findings of the pass's last review round (every review of
+        // it, both approvers' with two): those the PR showed. Earlier rounds'
+        // findings were never in front of the person who merged.
         Rule::UnaddressedAtMerge => {
-            sqlx::query_scalar(
-                "SELECT j.value FROM change_events r, json_each(r.payload, '$.findings') j \
-                 WHERE r.id = (SELECT id FROM change_events WHERE task_id = ? AND kind = 'review' \
-                   AND json_extract(payload, '$.pass') = ? ORDER BY seq DESC LIMIT 1) \
-                 AND NOT EXISTS (SELECT 1 FROM change_events e WHERE e.task_id = r.task_id \
-                   AND e.kind = 'finding_disposition' AND json_extract(e.payload, '$.finding') = j.value) \
-                 ORDER BY j.key",
-            )
+            sqlx::query_scalar(concat!(
+                "SELECT f.key FROM findings f WHERE f.task_id = ? AND f.pass = ? AND ",
+                final_round!(),
+                " AND NOT EXISTS (SELECT 1 FROM change_events e WHERE e.task_id = f.task_id \
+                   AND e.kind = 'finding_disposition' AND json_extract(e.payload, '$.finding') = f.key) \
+                 ORDER BY f.id"
+            ))
             .bind(task_id)
             .bind(pass)
             .fetch_all(&mut *conn)

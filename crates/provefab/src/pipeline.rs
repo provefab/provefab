@@ -23,7 +23,7 @@ use crate::paths::Paths;
 use crate::policy::{Approval, BoxFuture, MergeOutcome, MergeTools, PrOpened, ReviewPolicy};
 use crate::ports::{Hub, Oracle};
 use crate::prompts::{Template, render};
-use crate::record::{Event, GateEntry, MergedBy, Rule};
+use crate::record::{Event, FindingRow, GateEntry, MergedBy, Rule};
 use crate::router::{StageTiers, fallback_tiers, resolve_tier, select, stage_tiers};
 use crate::stage::{Finding, PlanOutput, ReviewOutput, ReviewVerdict, Severity, output_schema};
 use crate::store::{Also, StageRunRecord, Store, StoreError, TaskRow, Write, now, rfc3339};
@@ -250,21 +250,35 @@ fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
         .join("\n")
 }
 
-/// The PR body's "Review notes" section, `None` without findings.
-fn review_notes(review: &ReviewOutput, keys: &[String]) -> Option<String> {
-    if review.findings.is_empty() {
-        return None;
-    }
-    let mut s = format!("\n## Review notes\n\n{}\n", findings_text(review, keys));
-    // Without keys there is nothing a command could name.
-    if keys.len() == review.findings.len()
-        && let Some(k) = keys.first()
-    {
-        s.push_str(&format!(
-            "\nReply `/provefab {k} rejected` (or accepted, fixed, waived), optionally followed by a reason, to record what you decided.\n"
+/// The PR body's "Review notes" section, `None` without findings: every
+/// keyed finding of the pass's last review round (both approvers' with two),
+/// else the review's own findings without keys (approved before the record
+/// existed), with no command help since nothing could be named.
+fn review_notes(review: &ReviewOutput, final_round: &[FindingRow]) -> Option<String> {
+    let Some(first) = final_round.first() else {
+        if review.findings.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "\n## Review notes\n\n{}\n",
+            findings_text(review, &[])
         ));
-    }
-    Some(s)
+    };
+    let lines = final_round
+        .iter()
+        .map(|f| {
+            let at = f.line.map(|l| format!(":{l}")).unwrap_or_default();
+            format!(
+                "- {} · {} · `{}{at}` · {} ({})",
+                f.key, f.severity, f.file, f.text, f.reviewer_model
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "\n## Review notes\n\n{lines}\n\nReply `/provefab {} rejected` (or accepted, fixed, waived), optionally followed by a reason, to record what you decided.\n",
+        first.key
+    ))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2624,8 +2638,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 )
                 .await;
         }
-        self.open_pr(task, repo, &wt, &review, &keys, plan.as_ref())
-            .await
+        self.open_pr(task, repo, &wt, &review, plan.as_ref()).await
     }
 
     /// This pass's reproduction really failed before the change (review I5).
@@ -2700,19 +2713,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
         else {
             return Ok(None);
         };
-        let keys = self
-            .store
-            .events(task.id)
-            .await?
-            .iter()
-            .rev()
-            .find(|e| e.kind == "review")
-            .and_then(|e| serde_json::from_value::<Vec<String>>(e.payload["findings"].clone()).ok())
-            .unwrap_or_default();
         let plan = self.plan_output(task.id).await?;
         Ok(Some(
-            self.open_pr(task, repo, wt, &review, &keys, plan.as_ref())
-                .await?,
+            self.open_pr(task, repo, wt, &review, plan.as_ref()).await?,
         ))
     }
 
@@ -2751,7 +2754,6 @@ Please reply with what should happen, what happens instead, and how to reproduce
         repo: &RepoConfig,
         wt: &Path,
         review: &ReviewOutput,
-        keys: &[String],
         plan: Option<&PlanOutput>,
     ) -> Result<String, PipelineError> {
         let mut b = format!("Closes #{}.\n\n", task.issue_number);
@@ -2811,7 +2813,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 b.push_str(&format!("- {w}\n"));
             }
         }
-        if let Some(notes) = review_notes(review, keys) {
+        let final_round = self
+            .store
+            .final_round_findings(task.id, pass_of(task))
+            .await?;
+        if let Some(notes) = review_notes(review, &final_round) {
             b.push_str(&notes);
         }
         b.push_str(&format!(
@@ -2827,14 +2833,13 @@ Please reply with what should happen, what happens instead, and how to reproduce
         repo: &RepoConfig,
         wt: &Path,
         review: &ReviewOutput,
-        keys: &[String],
         plan: Option<&PlanOutput>,
     ) -> Result<TaskState, PipelineError> {
         let branch = task_branch(task);
         if let Err(e) = self.git.push(wt, &branch).await {
             return self.failed(task, repo, "push failed", &e).await;
         }
-        let body = self.pr_body(task, repo, wt, review, keys, plan).await?;
+        let body = self.pr_body(task, repo, wt, review, plan).await?;
         let url = match self
             .hub
             .pr_create(&repo.slug, &branch, &repo.base, &task.title, &body)
@@ -3034,9 +3039,22 @@ mod tests {
                 text: "typo".into(),
             }],
         };
-        let keyed = review_notes(&review, &["F3".into()]).unwrap();
+        let row = FindingRow {
+            id: 3,
+            task_id: 1,
+            key: "F3".into(),
+            pass: 1,
+            round: 0,
+            reviewer_model: "std-codex".into(),
+            severity: "minor".into(),
+            file: "src/a.rs".into(),
+            line: Some(4),
+            text: "typo".into(),
+            event_id: 1,
+        };
+        let keyed = review_notes(&review, &[row]).unwrap();
         assert!(
-            keyed.contains("- F3 · minor · `src/a.rs:4` · typo"),
+            keyed.contains("- F3 · minor · `src/a.rs:4` · typo (std-codex)"),
             "{keyed}"
         );
         assert!(keyed.contains("Reply `/provefab F3 rejected`"), "{keyed}");

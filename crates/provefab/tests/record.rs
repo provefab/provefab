@@ -139,6 +139,14 @@ async fn merged_task_scripted(
 ) -> (Fixture, P, i64) {
     let mut f = fixture(&["test -f feature.txt"]);
     f.config.repos[0].post_merge_checks = checks.iter().map(|c| c.to_string()).collect();
+    merged_task_in(f, comments, script).await
+}
+
+async fn merged_task_in(
+    f: Fixture,
+    comments: Vec<provefab::forge::Comment>,
+    script: Box<Script>,
+) -> (Fixture, P, i64) {
     let p = pipeline(&f, script, FakeOracle::default(), FakeHub::new("x")).await;
     *p.hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
     let id = queue(&p).await;
@@ -324,6 +332,84 @@ async fn only_the_findings_shown_in_the_merged_pr_are_inferred_unaddressed() {
         inferred(&ev, "finding_followed_by_reopen"),
         ["F1", "F2", "F3"]
     );
+}
+
+/// Pro's second reviewer: two approvals before the PR opens.
+struct TwoApprovals;
+
+impl provefab::policy::ReviewPolicy for TwoApprovals {
+    fn approvals_needed(&self, _repo: &provefab::config::RepoConfig) -> u8 {
+        2
+    }
+    fn after_pr_opened<'a>(
+        &'a self,
+        _cx: provefab::policy::PrOpened<'a>,
+    ) -> provefab::policy::BoxFuture<'a, Result<String, provefab::pipeline::PipelineError>> {
+        Box::pin(async move { Ok("opened".to_string()) })
+    }
+}
+
+/// Round 0 asks for changes with F1; round 1 is approved twice, with F2 then F3.
+fn two_approvers_two_rounds() -> Box<Script> {
+    let reviews = std::sync::Mutex::new(0);
+    Box::new(
+        move |m: &provefab::config::ModelEntry,
+              req: &agent_workers::StageRequest,
+              tx: &tokio::sync::mpsc::UnboundedSender<agent_workers::WorkerEvent>| {
+            match stage_of(&req.prompt) {
+                "review" => {
+                    let mut n = reviews.lock().unwrap();
+                    *n += 1;
+                    let (file, text, verdict) = match *n {
+                        1 => ("src/a.rs", "off by one", "changes"),
+                        2 => ("src/b.rs", "first approver note", "approve"),
+                        _ => ("src/c.rs", "second approver note", "approve"),
+                    };
+                    done(Some(review_with(
+                        serde_json::json!([
+                            {"file": file, "line": 5, "severity": "minor", "text": text}
+                        ]),
+                        verdict,
+                    )))
+                }
+                _ => happy(m, req, tx),
+            }
+        },
+    )
+}
+
+#[tokio::test]
+async fn every_final_round_review_is_shown_and_inferred_unaddressed() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.policy = std::sync::Arc::new(TwoApprovals);
+    let (_f, p, id) = merged_task_in(f, vec![], two_approvers_two_rounds()).await;
+    let fs = p.store.findings(id).await.unwrap();
+    assert_eq!(
+        fs.iter()
+            .map(|x| (x.key.as_str(), x.round))
+            .collect::<Vec<_>>(),
+        [("F1", 0), ("F2", 1), ("F3", 1)]
+    );
+    assert_ne!(fs[1].reviewer_model, fs[2].reviewer_model);
+    let body = p.hub.prs.lock().unwrap()[0].3.clone();
+    assert!(
+        body.contains(&format!(
+            "- F2 · minor · `src/b.rs:5` · first approver note ({})",
+            fs[1].reviewer_model
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "- F3 · minor · `src/c.rs:5` · second approver note ({})",
+            fs[2].reviewer_model
+        )),
+        "{body}"
+    );
+    assert!(!body.contains("F1"), "{body}");
+    assert!(body.contains("Reply `/provefab F2 rejected`"), "{body}");
+    let ev = p.store.events(id).await.unwrap();
+    assert_eq!(inferred(&ev, "finding_unaddressed_at_merge"), ["F2", "F3"]);
 }
 
 #[tokio::test]
