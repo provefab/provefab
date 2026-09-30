@@ -85,12 +85,10 @@ async fn a_bugfix_records_whether_its_reproduction_failed_before_the_fix() {
 }
 
 // Shared helpers, used by the tests of later tasks.
-#[allow(dead_code)]
 type P = provefab::pipeline::Pipeline<FakeRunner, FakeOracle, FakeHub>;
 
 /// Approves with two minor findings; F1's text carries a sentinel secret for
 /// the export redaction test.
-#[allow(dead_code)]
 fn approve_with_findings(
     m: &provefab::config::ModelEntry,
     req: &agent_workers::StageRequest,
@@ -124,7 +122,6 @@ async fn open_task_with_findings() -> (Fixture, P, i64) {
 /// `open_task_with_findings`, then merged by a person: README.md becomes
 /// "broken" in one commit on origin/main (so `grep -q hello README.md`
 /// post-merge checks fail and a revert is prepared).
-#[allow(dead_code)]
 async fn merged_task(checks: &[&str]) -> (Fixture, P, i64) {
     let mut f = fixture(&["test -f feature.txt"]);
     f.config.repos[0].post_merge_checks = checks.iter().map(|c| c.to_string()).collect();
@@ -135,6 +132,7 @@ async fn merged_task(checks: &[&str]) -> (Fixture, P, i64) {
         FakeHub::new("x"),
     )
     .await;
+    *p.hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
     let id = queue(&p).await;
     assert_eq!(p.drive(id).await.unwrap(), PrOpen);
     let repo = f.config.repos[0].path_in(&f.home);
@@ -151,6 +149,10 @@ async fn merged_task(checks: &[&str]) -> (Fixture, P, i64) {
         base_ref: Some("main".into()),
         commit_count: Some(1),
     };
+    // With `revert_origin` set, the fake hub tracks each PR by URL.
+    let status = p.hub.pr_status.lock().unwrap().clone();
+    let url = p.store.task(id).await.unwrap().unwrap().pr_url.unwrap();
+    p.hub.pr_statuses.lock().unwrap().insert(url, status);
     p.watch_pr(id).await.unwrap();
     (f, p, id)
 }
@@ -253,4 +255,80 @@ async fn an_approval_without_findings_has_no_review_notes() {
         .unwrap();
     assert_eq!(review.payload["findings"], serde_json::json!([]));
     assert!(!p.hub.prs.lock().unwrap()[0].3.contains("Review notes"));
+}
+
+#[tokio::test]
+async fn opening_and_merging_a_pr_are_facts_and_open_findings_are_inferred_unaddressed() {
+    let (_f, p, id) = merged_task(&[]).await;
+    let ev = p.store.events(id).await.unwrap();
+    let opened = ev.iter().find(|e| e.kind == "pr_opened").unwrap();
+    assert_eq!(opened.payload["pass"], 1);
+    let merged = ev.iter().find(|e| e.kind == "merged").unwrap();
+    assert_eq!(merged.payload["by"], "human");
+    let inferred: Vec<_> = ev
+        .iter()
+        .filter(|e| e.kind == "finding_unaddressed_at_merge")
+        .collect();
+    assert_eq!(inferred.len(), 2);
+    assert_eq!(inferred[0].source, "inferred");
+    assert_eq!(inferred[0].payload["finding"], "F1");
+    assert_eq!(inferred[0].payload["rule_version"], 1);
+    // Replaying the merge write infers nothing new.
+    p.store
+        .write_with_inference(
+            id,
+            provefab::store::Write::Nothing,
+            &[],
+            Some((provefab::record::Rule::UnaddressedAtMerge, 1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        p.store
+            .events(id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "finding_unaddressed_at_merge")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_post_merge_revert_marks_the_merged_findings() {
+    let (_f, p, id) = merged_task(&["grep -q hello README.md"]).await;
+    for _ in 0..12 {
+        let _ = p.process_post_merge(id).await;
+    }
+    let ev = p.store.events(id).await.unwrap();
+    assert!(
+        ev.iter()
+            .any(|e| e.kind == "post_merge" && e.payload["state"] == "revert_open")
+    );
+    assert_eq!(
+        ev.iter()
+            .filter(|e| e.kind == "finding_followed_by_revert")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_reopened_issue_marks_the_previous_pass_findings() {
+    let (_f, p, id) = merged_task(&[]).await;
+    p.store.set_pr_state(id, "done").await.unwrap();
+    p.hub
+        .issue_is_open
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    p.watch_pr(id).await.unwrap();
+    let ev = p.store.events(id).await.unwrap();
+    let reopened = ev.iter().find(|e| e.kind == "issue_reopened").unwrap();
+    assert_eq!(reopened.payload["previous_pass"], 1);
+    assert_eq!(
+        ev.iter()
+            .filter(|e| e.kind == "finding_followed_by_reopen")
+            .count(),
+        2
+    );
 }

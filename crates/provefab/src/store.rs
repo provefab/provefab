@@ -11,7 +11,7 @@ use sqlx::sqlite::{
 use sqlx::{Row, SqliteConnection};
 
 use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
-use crate::record::{Event, FindingRow, StoredEvent};
+use crate::record::{Event, FindingRow, RULE_VERSION, Rule, StoredEvent};
 use crate::task::{TaskKind, TaskState};
 
 #[derive(Debug, thiserror::Error)]
@@ -515,6 +515,7 @@ impl Store {
             .transpose()
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         let at = now();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let done = sqlx::query(
             "UPDATE post_merge_checks SET state = ?, \
                failure_kind = COALESCE(?, failure_kind), \
@@ -546,9 +547,47 @@ impl Store {
         .bind(at)
         .bind(id)
         .bind(from.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(done.rows_affected() == 1)
+        if done.rows_affected() != 1 {
+            return Ok(false);
+        }
+        if to.is_terminal() {
+            let (task_id, stored_kind): (i64, Option<String>) =
+                sqlx::query_as("SELECT task_id, failure_kind FROM post_merge_checks WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let failure_kind = patch
+                .failure_kind
+                .map(|k| k.as_str().to_string())
+                .or(stored_kind);
+            append_event(
+                &mut tx,
+                task_id,
+                &Event::PostMerge {
+                    check_id: id,
+                    state: to.as_str().into(),
+                    failure_kind,
+                },
+            )
+            .await?;
+            if to == CheckState::RevertOpen {
+                let pass: Option<i64> = sqlx::query_scalar(
+                    "SELECT json_extract(payload, '$.pass') FROM change_events \
+                     WHERE task_id = ? AND kind = 'merged' ORDER BY seq DESC LIMIT 1",
+                )
+                .bind(task_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+                if let Some(pass) = pass {
+                    infer_findings(&mut tx, task_id, Rule::FollowedByRevert, pass as u32).await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Counts one more consecutive infra error; returns the new count.
@@ -776,11 +815,28 @@ impl Store {
         write: Write<'_>,
         events: &[Event],
     ) -> Result<Vec<i64>, StoreError> {
+        self.write_with_inference(task_id, write, events, None)
+            .await
+    }
+
+    /// `write_with_events` plus, in the same transaction and after the
+    /// events, the inferences of `rule` for the findings of `pass`. Each
+    /// (finding, rule, rule version) is inferred at most once (spec section 4).
+    pub async fn write_with_inference(
+        &self,
+        task_id: i64,
+        write: Write<'_>,
+        events: &[Event],
+        infer: Option<(Rule, u32)>,
+    ) -> Result<Vec<i64>, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         exec_write(&mut tx, task_id, &write).await?;
         let mut ids = Vec::with_capacity(events.len());
         for e in events {
             ids.push(append_event(&mut tx, task_id, e).await?);
+        }
+        if let Some((rule, pass)) = infer {
+            infer_findings(&mut tx, task_id, rule, pass).await?;
         }
         tx.commit().await?;
         Ok(ids)
@@ -1201,6 +1257,65 @@ async fn exec_write(
             if done.rows_affected() == 0 {
                 return Err(StoreError::UnknownTask(task_id));
             }
+        }
+    }
+    Ok(())
+}
+
+async fn infer_findings(
+    conn: &mut SqliteConnection,
+    task_id: i64,
+    rule: Rule,
+    pass: u32,
+) -> Result<(), StoreError> {
+    let kind = Event::FindingInferred {
+        finding: String::new(),
+        rule,
+        rule_version: RULE_VERSION,
+    }
+    .kind();
+    let keys: Vec<String> = match rule {
+        Rule::UnaddressedAtMerge => {
+            sqlx::query_scalar(
+                "SELECT key FROM findings f WHERE task_id = ? AND pass = ? AND NOT EXISTS (\
+                   SELECT 1 FROM change_events e WHERE e.task_id = f.task_id AND e.kind = 'finding_disposition' \
+                   AND json_extract(e.payload, '$.finding') = f.key) ORDER BY id",
+            )
+            .bind(task_id)
+            .bind(pass)
+            .fetch_all(&mut *conn)
+            .await?
+        }
+        _ => {
+            sqlx::query_scalar("SELECT key FROM findings WHERE task_id = ? AND pass = ? ORDER BY id")
+                .bind(task_id)
+                .bind(pass)
+                .fetch_all(&mut *conn)
+                .await?
+        }
+    };
+    for key in keys {
+        let seen: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM change_events WHERE task_id = ? AND kind = ? \
+             AND json_extract(payload, '$.finding') = ? AND json_extract(payload, '$.rule_version') = ?",
+        )
+        .bind(task_id)
+        .bind(kind)
+        .bind(&key)
+        .bind(RULE_VERSION)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if seen.is_none() {
+            append_event(
+                conn,
+                task_id,
+                &Event::FindingInferred {
+                    finding: key,
+                    rule,
+                    rule_version: RULE_VERSION,
+                },
+            )
+            .await?;
         }
     }
     Ok(())

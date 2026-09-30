@@ -23,7 +23,7 @@ use crate::paths::Paths;
 use crate::policy::{Approval, BoxFuture, MergeOutcome, MergeTools, PrOpened, ReviewPolicy};
 use crate::ports::{Hub, Oracle};
 use crate::prompts::{Template, render};
-use crate::record::{Event, GateEntry};
+use crate::record::{Event, GateEntry, MergedBy, Rule};
 use crate::router::{StageTiers, fallback_tiers, resolve_tier, select, stage_tiers};
 use crate::stage::{Finding, PlanOutput, ReviewOutput, ReviewVerdict, Severity, output_schema};
 use crate::store::{Also, StageRunRecord, Store, StoreError, TaskRow, Write, now, rfc3339};
@@ -1203,11 +1203,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
             &[&in_pr],
         )
         .await?;
+        let auto_merged = match (self.store.last_output(task.id, "auto_merged").await?, head) {
+            (Some(v), Some(h)) => v["head"].as_str() == Some(h),
+            _ => false,
+        };
         if !repo.post_merge_checks.is_empty() {
-            let auto_merged = match (self.store.last_output(task.id, "auto_merged").await?, head) {
-                (Some(v), Some(h)) => v["head"].as_str() == Some(h),
-                _ => false,
-            };
             match (merge_sha, base) {
                 (Some(sha), Some(b)) if b == repo.base => {
                     self.store
@@ -1259,7 +1259,23 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 &json!({"at": now(), "sha": merge_sha, "base": base}),
             )
             .await?;
-        self.store.set_pr_state(task.id, "merged").await?;
+        self.store
+            .write_with_inference(
+                task.id,
+                Write::SetPrState("merged"),
+                &[Event::Merged {
+                    sha: merge_sha.map(str::to_string),
+                    base: base.map(str::to_string),
+                    by: if auto_merged {
+                        MergedBy::Auto
+                    } else {
+                        MergedBy::Human
+                    },
+                    pass: pass_of(task),
+                }],
+                Some((Rule::UnaddressedAtMerge, pass_of(task))),
+            )
+            .await?;
         let wt = self.paths.worktree(task.id);
         if wt.exists() {
             let lock = self.repo_lock(repo);
@@ -1297,6 +1313,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 Ok(task.state)
             }
             Ok(true) if pr_state == "done" => {
+                let previous = pass_of(task);
                 let state = self
                     .auto_pass(
                         task,
@@ -1305,7 +1322,16 @@ Please reply with what should happen, what happens instead, and how to reproduce
                         false,
                     )
                     .await?;
-                self.store.set_pr_state(task.id, "reopened").await?;
+                self.store
+                    .write_with_inference(
+                        task.id,
+                        Write::SetPrState("reopened"),
+                        &[Event::IssueReopened {
+                            previous_pass: previous,
+                        }],
+                        Some((Rule::FollowedByReopen, previous)),
+                    )
+                    .await?;
                 Ok(state)
             }
             Ok(_) => Ok(task.state),
@@ -2782,7 +2808,21 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 return self.failed(task, repo, "could not open the PR", &e).await;
             }
         };
-        self.store.set_pr(task.id, &url, "open").await?;
+        self.store
+            .write_with_events(
+                task.id,
+                Write::SetPr {
+                    url: &url,
+                    state: "open",
+                },
+                &[Event::PrOpened {
+                    url: url.clone(),
+                    head: self.git.head(wt).await.ok(),
+                    base: repo.base.clone(),
+                    pass: pass_of(task),
+                }],
+            )
+            .await?;
         self.store
             .transition(task.id, TaskState::PrOpen, &format!("opened {url}"))
             .await?;
