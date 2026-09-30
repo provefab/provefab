@@ -257,3 +257,53 @@ async fn a_later_round_without_the_category_removes_its_label() {
     assert_eq!(reviewers[0], "top-claude");
     assert_ne!(reviewers[1], "top-claude");
 }
+
+fn headers(body: &str) -> Vec<&str> {
+    body.lines().filter(|l| l.starts_with("## ")).collect()
+}
+
+#[tokio::test]
+async fn the_pr_body_lists_the_risk_after_the_checks() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    f.config.repos[0].risk = migration_checks(r#"["test -f migrations/0005.sql"]"#);
+    let p = pipeline(
+        &f,
+        Box::new(risky),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+    assert!(
+        body.contains(
+            "## Risk\n\n- migrations: `migrations/0005.sql` · checks added: `test -f migrations/0005.sql` · reviewer: frontier\n"
+        ),
+        "{body}"
+    );
+    let h = headers(&body);
+    let pos = |n: &str| h.iter().position(|x| *x == n).unwrap();
+    assert_eq!(pos("## Risk"), pos("## Checks") + 1, "{h:?}");
+}
+
+#[tokio::test]
+async fn pr_body_is_unchanged_without_risk() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+    assert!(!body.contains("Risk"), "{body}");
+    assert_eq!(
+        headers(&body),
+        vec!["## Plan", "## Routing", "## Checks"],
+        "{body}"
+    );
+}

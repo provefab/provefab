@@ -466,11 +466,18 @@ fn event_summary(e: &StoredEvent) -> String {
         } => format!("{} #{check_id} {state}", e.kind),
         IssueReopened { previous_pass } => format!("{} after pass {previous_pass}", e.kind),
         RiskClassified { categories, .. } => {
-            let names: Vec<&str> = categories.iter().map(|c| c.name.as_str()).collect();
-            if names.is_empty() {
+            if categories.is_empty() {
                 format!("{} none", e.kind)
             } else {
-                format!("{} {}", e.kind, names.join(", "))
+                let each: Vec<String> = categories
+                    .iter()
+                    .map(|c| match c.paths.len() {
+                        0 => c.name.clone(),
+                        1 => format!("{} (1 path)", c.name),
+                        n => format!("{} ({n} paths)", c.name),
+                    })
+                    .collect();
+                format!("{} {}", e.kind, each.join(", "))
             }
         }
         Plan { pass, .. } => format!("{} pass {pass}", e.kind),
@@ -972,6 +979,19 @@ pub async fn doctor(
                 .map_err(|e| format!("{}: {e}", path.display())),
             ));
         }
+        if let Ok(policy) = crate::risk::resolve(repo.risk.as_ref()) {
+            let names: Vec<&str> = policy.categories.iter().map(|c| c.name.as_str()).collect();
+            let checks_n: usize = policy.categories.iter().map(|c| c.checks.len()).sum();
+            checks.push(Check {
+                name: format!("risk {}", repo.slug),
+                ok: true,
+                detail: format!(
+                    "{} categories: {}; checks: {checks_n}",
+                    names.len(),
+                    names.join(", ")
+                ),
+            });
+        }
         checks.push(Check {
             name: format!("post-merge {}", repo.slug),
             ok: !repo
@@ -1157,6 +1177,44 @@ tier = "standard"
         assert!(!get("jev key").ok);
         // Workers the catalog does not use are not checked.
         assert!(checks.iter().all(|c| c.name != "codex" && c.name != "pi"));
+    }
+
+    #[tokio::test]
+    async fn doctor_prints_each_repos_risk_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tools = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: fake(d, "claude", "echo '2.1.281 (Claude Code)'"),
+            codex: d.join("missing-codex"),
+            pi: d.join("missing-pi"),
+            security: fake(d, "security", "exit 0"),
+        };
+        let config = Config::from_toml_str(
+            r#"
+[jev]
+model = "jev-1.13"
+[[models]]
+id = "c"
+worker = "claude-code"
+model = "sonnet"
+tier = "standard"
+[[repos]]
+slug = "o/r"
+gates = ["make"]
+[repos.risk.categories.migrations]
+checks = ["./scripts/check-migration.sh"]
+"#,
+        )
+        .unwrap();
+        let checks = doctor(&tools, &config, &Paths::new(d), None).await;
+        let risk = checks.iter().find(|c| c.name == "risk o/r").unwrap();
+        assert!(risk.ok, "{risk:?}");
+        assert!(
+            risk.detail.starts_with("5 categories: ") && risk.detail.ends_with("; checks: 1"),
+            "{risk:?}"
+        );
     }
 
     #[tokio::test]

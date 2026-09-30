@@ -251,6 +251,45 @@ fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
         .join("\n")
 }
 
+/// The PR body's "Risk" section, `None` when nothing was detected: one line
+/// per category with its paths, the checks it added and the reviewer tier.
+fn risk_section(policy: &risk::Policy, detected: &[Detected]) -> Option<String> {
+    const SHOWN: usize = 5;
+    if detected.is_empty() {
+        return None;
+    }
+    let mut s = String::from("## Risk\n\n");
+    for d in detected {
+        if d.name == risk::UNKNOWN {
+            s.push_str("- unknown: the changed files could not be computed · reviewer: frontier\n");
+            continue;
+        }
+        let cat = policy.categories.iter().find(|c| c.name == d.name);
+        let mut paths: Vec<String> = d
+            .paths
+            .iter()
+            .take(SHOWN)
+            .map(|p| format!("`{p}`"))
+            .collect();
+        if d.paths.len() > SHOWN {
+            paths.push(format!("and {} more", d.paths.len() - SHOWN));
+        }
+        s.push_str(&format!("- {}: {}", d.name, paths.join(", ")));
+        if let Some(c) = cat.filter(|c| !c.checks.is_empty()) {
+            let checks: Vec<String> = c.checks.iter().map(|k| format!("`{k}`")).collect();
+            s.push_str(&format!(" · checks added: {}", checks.join(", ")));
+        }
+        let tier = if cat.is_none_or(|c| c.frontier) {
+            "frontier"
+        } else {
+            "standard"
+        };
+        s.push_str(&format!(" · reviewer: {tier}\n"));
+    }
+    s.push('\n');
+    Some(s)
+}
+
 /// The PR body's "Review notes" section, `None` without findings: every
 /// keyed finding of the pass's last review round (both approvers' with two),
 /// else the review's own findings without keys (approved before the record
@@ -2990,6 +3029,15 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 "\nReproduction: `{cmd}` failed before the change and passes after it.\n"
             ));
         }
+        // The PR opens right after the final round's review, so the event of
+        // the task's current (pass, round) is the change being proposed.
+        if let Some(detected) = self.risk_of_round(task).await?
+            && let Ok(policy) = risk::resolve(repo.risk.as_ref())
+            && let Some(section) = risk_section(&policy, &detected)
+        {
+            b.push('\n');
+            b.push_str(&section);
+        }
         let base = self.pass_base(task, repo).await?;
         let changed = self.git.changed_files(wt, &base).await.unwrap_or_default();
         let diff = self.git.diff(wt, &base).await.unwrap_or_default();
@@ -3214,6 +3262,63 @@ pub fn numstat_lines(rows: &[(Option<u32>, Option<u32>, String)]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cat(name: &str, checks: &[&str], frontier: bool) -> risk::Category {
+        risk::Category {
+            name: name.into(),
+            paths: vec![],
+            checks: checks.iter().map(|c| c.to_string()).collect(),
+            frontier,
+        }
+    }
+
+    fn det(name: &str, paths: &[&str]) -> Detected {
+        Detected {
+            name: name.into(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn risk_section_lists_paths_checks_and_tier() {
+        let policy = risk::Policy {
+            categories: vec![cat("migrations", &["./c.sh"], true), cat("ci", &[], false)],
+        };
+        let s = risk_section(
+            &policy,
+            &[det("migrations", &["a", "b"]), det("ci", &["x.yml"])],
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            "## Risk\n\n- migrations: `a`, `b` · checks added: `./c.sh` · reviewer: frontier\n- ci: `x.yml` · reviewer: standard\n\n"
+        );
+    }
+
+    #[test]
+    fn risk_section_truncates_after_five_paths() {
+        let policy = risk::Policy {
+            categories: vec![cat("ci", &[], true)],
+        };
+        let paths = ["1", "2", "3", "4", "5", "6", "7"];
+        let s = risk_section(&policy, &[det("ci", &paths)]).unwrap();
+        assert!(
+            s.contains("- ci: `1`, `2`, `3`, `4`, `5`, and 2 more · reviewer: frontier\n"),
+            "{s}"
+        );
+        let five = risk_section(&policy, &[det("ci", &paths[..5])]).unwrap();
+        assert!(!five.contains("more"), "{five}");
+    }
+
+    #[test]
+    fn risk_section_unknown_and_empty() {
+        let policy = risk::Policy::default();
+        assert_eq!(
+            risk_section(&policy, &risk::unknown()).unwrap(),
+            "## Risk\n\n- unknown: the changed files could not be computed · reviewer: frontier\n\n"
+        );
+        assert_eq!(risk_section(&policy, &[]), None);
+    }
 
     #[test]
     fn review_notes_without_keys_keep_the_findings_and_drop_the_command_help() {
