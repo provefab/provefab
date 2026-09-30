@@ -226,20 +226,45 @@ fn plan_text(p: &PlanOutput) -> String {
     s
 }
 
+/// One line per finding, keyed when `keys` matches them one to one. A review
+/// approved before the record existed has no `review` event, so no keys.
 fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
+    let keyed = keys.len() == r.findings.len();
     r.findings
         .iter()
-        .zip(keys)
-        .map(|(f, k)| {
+        .enumerate()
+        .map(|(i, f)| {
             let at = f.line.map(|l| format!(":{l}")).unwrap_or_default();
             let sev = match f.severity {
                 Severity::Blocking => "blocking",
                 Severity::Minor => "minor",
             };
-            format!("- {k} · {sev} · `{}{at}` · {}", f.file, f.text)
+            let key = if keyed {
+                format!("{} · ", keys[i])
+            } else {
+                String::new()
+            };
+            format!("- {key}{sev} · `{}{at}` · {}", f.file, f.text)
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The PR body's "Review notes" section, `None` without findings.
+fn review_notes(review: &ReviewOutput, keys: &[String]) -> Option<String> {
+    if review.findings.is_empty() {
+        return None;
+    }
+    let mut s = format!("\n## Review notes\n\n{}\n", findings_text(review, keys));
+    // Without keys there is nothing a command could name.
+    if keys.len() == review.findings.len()
+        && let Some(k) = keys.first()
+    {
+        s.push_str(&format!(
+            "\nReply `/provefab {k} rejected` (or accepted, fixed, waived), optionally followed by a reason, to record what you decided.\n"
+        ));
+    }
+    Some(s)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2786,12 +2811,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 b.push_str(&format!("- {w}\n"));
             }
         }
-        if !review.findings.is_empty() {
-            b.push_str(&format!(
-                "\n## Review notes\n\n{}\n\nReply `/provefab {} rejected` (or accepted, fixed, waived), optionally followed by a reason, to record what you decided.\n",
-                findings_text(review, keys),
-                keys.first().map(String::as_str).unwrap_or("F1")
-            ));
+        if let Some(notes) = review_notes(review, keys) {
+            b.push_str(&notes);
         }
         b.push_str(&format!(
             "\n---\nOpened by Provefab (task {}). Details: `provefab log {}`.\n",
@@ -3001,6 +3022,34 @@ pub fn numstat_lines(rows: &[(Option<u32>, Option<u32>, String)]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_notes_without_keys_keep_the_findings_and_drop_the_command_help() {
+        let review = ReviewOutput {
+            verdict: ReviewVerdict::Approve,
+            findings: vec![Finding {
+                file: "src/a.rs".into(),
+                line: Some(4),
+                severity: Severity::Minor,
+                text: "typo".into(),
+            }],
+        };
+        let keyed = review_notes(&review, &["F3".into()]).unwrap();
+        assert!(
+            keyed.contains("- F3 · minor · `src/a.rs:4` · typo"),
+            "{keyed}"
+        );
+        assert!(keyed.contains("Reply `/provefab F3 rejected`"), "{keyed}");
+        // Approved before the record existed: no review event, so no keys.
+        let plain = review_notes(&review, &[]).unwrap();
+        assert!(plain.contains("- minor · `src/a.rs:4` · typo"), "{plain}");
+        assert!(!plain.contains("/provefab"), "{plain}");
+        let none = ReviewOutput {
+            verdict: ReviewVerdict::Approve,
+            findings: vec![],
+        };
+        assert_eq!(review_notes(&none, &[]), None);
+    }
 
     #[test]
     fn numstat_lines_sums_rows_and_binary_never_merges() {
