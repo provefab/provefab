@@ -535,6 +535,9 @@ where
         repo: &RepoConfig,
         check: &PostMergeCheckRow,
     ) -> Result<(), PipelineError> {
+        // GitHub made the merge commit on the server: fetch it first, on every
+        // replay too (seen missing in the real run, 2026-09-30).
+        self.git.fetch(&self.checkout(repo)).await?;
         let r = self
             .pm_run(
                 task,

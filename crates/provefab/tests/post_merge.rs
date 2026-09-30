@@ -1144,3 +1144,27 @@ async fn an_infra_error_path_leaves_no_worktree() {
     assert!(p.process_post_merge(id).await.is_err());
     assert!(leftovers(&f, c.id).is_empty());
 }
+
+/// Real-run regression (2026-09-30): GitHub merges on the server, so the merge
+/// commit is not in Provefab's checkout until a fetch. The fixture's usual
+/// commits are made in that checkout, which hid a missing fetch.
+#[tokio::test]
+async fn a_merge_made_on_the_server_is_fetched_before_it_is_verified() {
+    let (f, p, id) = open_pr_task(&["grep -q hello README.md"]).await;
+    let other = f.home.join("other-clone");
+    git(
+        f.home.as_path(),
+        &[
+            "clone",
+            "-q",
+            f.origin.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    git(&other, &["config", "user.name", "t"]);
+    git(&other, &["config", "user.email", "t@t"]);
+    let sha = commit_and_push(&other, "README.md", "hello world\n", "server-side merge");
+    *p.hub.pr_status.lock().unwrap() = merged(Some(&sha), Some("main"), Some(1));
+    p.watch_pr(id).await.unwrap();
+    assert_eq!(drive(&p, id).await.state, CheckState::Passed);
+}
