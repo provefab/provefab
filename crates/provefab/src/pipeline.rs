@@ -260,6 +260,41 @@ fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
 /// line states it, and a category wanting frontier keeps the reason the risk
 /// rule could not pick one. `None` (no review run, a model not in the
 /// catalog) falls back to what the risk rule decided.
+/// The detected categories' checks that are not already gates, each with the
+/// categories that asked for it: what the `risk-gates` pass runs.
+fn risk_checks(
+    policy: &risk::Policy,
+    detected: &[Detected],
+    gates: &[String],
+) -> Vec<(String, Vec<String>)> {
+    policy
+        .checks(detected)
+        .into_iter()
+        .filter(|c| !gates.contains(c))
+        .map(|c| {
+            let names = policy
+                .categories
+                .iter()
+                .filter(|cat| {
+                    cat.checks.contains(&c) && detected.iter().any(|d| d.name == cat.name)
+                })
+                .map(|cat| cat.name.clone())
+                .collect();
+            (c, names)
+        })
+        .collect()
+}
+
+/// A failure's text for the task state: the detail is left out when the
+/// public text already ends with it.
+fn reason_text(public: &str, detail: &str) -> String {
+    if detail.is_empty() || public.ends_with(detail) {
+        public.to_string()
+    } else {
+        format!("{public}: {detail}")
+    }
+}
+
 fn risk_section(
     policy: &risk::Policy,
     detected: &[Detected],
@@ -654,11 +689,7 @@ where
         public: &str,
         detail: &str,
     ) -> Result<TaskState, PipelineError> {
-        let reason = if detail.is_empty() {
-            public.to_string()
-        } else {
-            format!("{public}: {detail}")
-        };
+        let reason = reason_text(public, detail);
         self.store.transition(task.id, to, &reason).await?;
         let what = if to == TaskState::NeedsYou {
             "needs a person to continue"
@@ -2637,10 +2668,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
         )
         .await?;
         // A check that is already a gate ran above: once, not twice (Review Focus 2).
-        let extra: Vec<String> = policy
-            .checks(&detected)
+        let extra: Vec<String> = risk_checks(&policy, &detected, commands)
             .into_iter()
-            .filter(|c| !commands.contains(c))
+            .map(|(c, _)| c)
             .collect();
         if !extra.is_empty() {
             let report = self.gates_rerun(task, wt, &extra, "risk-gates").await?;
@@ -3047,8 +3077,17 @@ Please reply with what should happen, what happens instead, and how to reproduce
         }
         b.push('\n');
         b.push_str("## Checks\n\n");
-        for g in Self::gate_commands(repo, plan) {
+        let gates = Self::gate_commands(repo, plan);
+        for g in &gates {
             b.push_str(&format!("- `{g}`: passed\n"));
+        }
+        // The round's risk checks passed too, or the PR would not open.
+        if let Some(detected) = self.risk_of_round(task).await?
+            && let Ok(policy) = risk::resolve(repo.risk.as_ref())
+        {
+            for (c, names) in risk_checks(&policy, &detected, &gates) {
+                b.push_str(&format!("- `{c}`: passed (risk: {})\n", names.join(", ")));
+            }
         }
         // Only a bugfix runs the repro before the fix, and only a failure of the
         // check itself (not a missing script) reproduces: never claim otherwise.
@@ -3301,6 +3340,17 @@ pub fn numstat_lines(rows: &[(Option<u32>, Option<u32>, String)]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// A detail the public text already ends with is not repeated.
+    #[test]
+    fn reason_text_does_not_repeat_the_detail() {
+        assert_eq!(reason_text("out of scope: x", "x"), "out of scope: x");
+        assert_eq!(
+            reason_text("gates failed", "cargo test"),
+            "gates failed: cargo test"
+        );
+        assert_eq!(reason_text("gates failed", ""), "gates failed");
+    }
+
     use super::*;
 
     fn cat(name: &str, checks: &[&str], frontier: bool) -> risk::Category {

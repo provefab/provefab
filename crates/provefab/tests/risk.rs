@@ -462,6 +462,10 @@ async fn the_pr_body_lists_the_risk_after_the_checks() {
         ),
         "{body}"
     );
+    assert!(
+        body.contains("- `test -f feature.txt`: passed\n- `test -f migrations/0005.sql`: passed (risk: migrations)\n"),
+        "{body}"
+    );
     let h = headers(&body);
     let pos = |n: &str| h.iter().position(|x| *x == n).unwrap();
     assert_eq!(pos("## Risk"), pos("## Checks") + 1, "{h:?}");
