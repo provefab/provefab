@@ -15,7 +15,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::agents::StageRunner;
 use crate::config::{Config, ModelEntry, RepoConfig};
 use crate::cooldown::Cooldowns;
-use crate::forge::{ForgeError, Git, PrState, branch_name, is_bot_comment, weakened_tests};
+use crate::forge::{Change, ForgeError, Git, PrState, branch_name, is_bot_comment, weakened_tests};
 use crate::gates::{GateReport, ProgressScore, run_gates};
 use crate::intake::new_replies;
 use crate::jevq::{IssueContext, Triage};
@@ -23,7 +23,8 @@ use crate::paths::Paths;
 use crate::policy::{Approval, BoxFuture, MergeOutcome, MergeTools, PrOpened, ReviewPolicy};
 use crate::ports::{Hub, Oracle};
 use crate::prompts::{Template, render};
-use crate::record::{Event, FindingRow, GateEntry, MergedBy, Rule};
+use crate::record::{Event, FindingRow, GateEntry, MergedBy, Rule, StoredEvent};
+use crate::risk::{self, Detected};
 use crate::router::{StageTiers, fallback_tiers, resolve_tier, select, stage_tiers};
 use crate::stage::{Finding, PlanOutput, ReviewOutput, ReviewVerdict, Severity, output_schema};
 use crate::store::{Also, StageRunRecord, Store, StoreError, TaskRow, Write, now, rfc3339};
@@ -1091,6 +1092,16 @@ Please reply with what should happen, what happens instead, and how to reproduce
             && task.reopen_count > 0
             && let Some(b) = self.store.last_output(task.id, "boost").await?
             && b["pass"].as_u64() == Some(u64::from(task.reopen_count) + 1)
+        {
+            tier = resolve(Tier::Frontier);
+        }
+        // A risky change is reviewed on the frontier tier (risk policy §7).
+        if stage == Stage::Review
+            && let Some(detected) = self.risk_of_round(task).await?
+            && let Some(repo) = self.repo(task)
+            && risk::resolve(repo.risk.as_ref())
+                .map(|p| p.needs_frontier(&detected))
+                .unwrap_or(true)
         {
             tier = resolve(Tier::Frontier);
         }
@@ -2417,63 +2428,239 @@ Please reply with what should happen, what happens instead, and how to reproduce
         };
         let plan = self.plan_output(task.id).await?;
         let commands = Self::gate_commands(repo, plan.as_ref());
-        let mut report = self.gates(task, &wt, &commands, "gates").await?;
-        if !report.passed() {
-            let failure = report.first_failure().cloned().expect("a failing gate");
-            let verdict = self
-                .oracle
-                .triage(&failure.command, &failure.output_tail)
-                .await;
-            if verdict == Some(Triage::FlakyTest) {
-                // Flaky: run the gates once more before counting a failure (spec §4.4).
-                report = self.gates(task, &wt, &commands, "gates").await?;
-            }
-        }
-        if let Some(failure) = report.first_failure().cloned() {
-            let reason = format!("gate `{}` failed", failure.command);
-            return self
-                .failed_attempt(
-                    task,
-                    repo,
-                    &failure.command,
-                    (&reason, &reason),
-                    &failure.output_tail,
-                    Some(report.score),
-                )
-                .await;
+        let report = self.gates_rerun(task, &wt, &commands, "gates").await?;
+        if let Some(state) = self.gate_failed(task, repo, &report).await? {
+            return Ok(state);
         }
         let message = format!(
             "{}\n\nProvefab task {}, issue #{}.",
             task.title, task.id, task.issue_number
         );
         let base = self.pass_base(task, repo).await?;
-        match self.git.commit_all(&wt, &message).await {
-            // "Changed nothing" is about the branch, not this commit: after a crash
-            // the work may already be committed (review I1).
-            Ok(_)
-                if !self
-                    .git
-                    .changed_files(&wt, &base)
-                    .await
-                    .unwrap_or_default()
-                    .is_empty() => {}
-            Ok(_) => {
-                return self
-                    .failed_attempt(
-                        task,
-                        repo,
-                        "implement stage",
-                        ("the agent changed no file", "the agent changed no file"),
-                        "",
-                        None,
-                    )
-                    .await;
-            }
+        let changed = match self.git.commit_all(&wt, &message).await {
+            Ok(_) => self.git.changed_files(&wt, &base).await,
             Err(e) => {
                 return self.failed(task, repo, "commit failed", &e).await;
             }
+        };
+        // "Changed nothing" is about the branch, not this commit: after a crash
+        // the work may already be committed (review I1). Paths that cannot be
+        // computed are not "nothing": the risk policy classifies them `unknown`.
+        if changed.as_ref().is_ok_and(Vec::is_empty) {
+            return self
+                .failed_attempt(
+                    task,
+                    repo,
+                    "implement stage",
+                    ("the agent changed no file", "the agent changed no file"),
+                    "",
+                    None,
+                )
+                .await;
+        }
+        if let Some(state) = self
+            .risk_round(task, repo, &wt, &commands, changed.ok())
+            .await?
+        {
+            return Ok(state);
         }
         self.enter(task.id, TaskState::Reviewing, "gates passed")
+            .await
+    }
+
+    /// Runs gates; a failure the oracle calls flaky runs them once more before
+    /// it counts (spec §4.4).
+    async fn gates_rerun(
+        &self,
+        task: &TaskRow,
+        wt: &Path,
+        commands: &[String],
+        stage: &str,
+    ) -> Result<GateReport, PipelineError> {
+        let report = self.gates(task, wt, commands, stage).await?;
+        if let Some(failure) = report.first_failure() {
+            let verdict = self
+                .oracle
+                .triage(&failure.command, &failure.output_tail)
+                .await;
+            if verdict == Some(Triage::FlakyTest) {
+                return self.gates(task, wt, commands, stage).await;
+            }
+        }
+        Ok(report)
+    }
+
+    /// A failing gate is a failed attempt (back to implementation); `None` when all passed.
+    async fn gate_failed(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        report: &GateReport,
+    ) -> Result<Option<TaskState>, PipelineError> {
+        let Some(failure) = report.first_failure().cloned() else {
+            return Ok(None);
+        };
+        let reason = format!("gate `{}` failed", failure.command);
+        self.failed_attempt(
+            task,
+            repo,
+            &failure.command,
+            (&reason, &reason),
+            &failure.output_tail,
+            Some(report.score),
+        )
+        .await
+        .map(Some)
+    }
+
+    /// Risk policy §6-§7 for this round: classify the changed paths (`None`:
+    /// they could not be computed, fail closed as `unknown`), record it, label
+    /// the issue, run the categories' extra checks, and require a frontier
+    /// reviewer when a category asks for one. `Some` ends the round.
+    async fn risk_round(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        wt: &Path,
+        commands: &[String],
+        changed: Option<Vec<Change>>,
+    ) -> Result<Option<TaskState>, PipelineError> {
+        let policy = match risk::resolve(repo.risk.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                let public = format!("invalid [repos.risk]: {e}");
+                return self
+                    .give_up(task, Some(repo), TaskState::NeedsYou, &public, "")
+                    .await
+                    .map(Some);
+            }
+        };
+        let detected = match changed {
+            // Both sides of a rename count (Review Focus 1).
+            Some(changed) => {
+                let paths: Vec<String> = changed
+                    .into_iter()
+                    .flat_map(|c| std::iter::once(c.path).chain(c.from))
+                    .collect();
+                risk::classify(&policy, &paths)
+            }
+            None => risk::unknown(),
+        };
+        let previous = self.latest_risk(task.id, |_, _| true).await?;
+        self.store
+            .write_with_events(
+                task.id,
+                Write::Nothing,
+                &[Event::RiskClassified {
+                    pass: pass_of(task),
+                    round: task.review_rounds,
+                    categories: detected.clone(),
+                }],
+            )
+            .await?;
+        self.risk_labels(task, repo, &detected, previous.as_deref())
+            .await?;
+        // A check that is already a gate ran above: once, not twice (Review Focus 2).
+        let extra: Vec<String> = policy
+            .checks(&detected)
+            .into_iter()
+            .filter(|c| !commands.contains(c))
+            .collect();
+        if !extra.is_empty() {
+            let report = self.gates_rerun(task, wt, &extra, "risk-gates").await?;
+            if let Some(state) = self.gate_failed(task, repo, &report).await? {
+                return Ok(Some(state));
+            }
+        }
+        if policy.needs_frontier(&detected)
+            && !self.config.models.iter().any(|m| m.tier == Tier::Frontier)
+        {
+            let names: Vec<&str> = detected.iter().map(|d| d.name.as_str()).collect();
+            return self
+                .give_up(
+                    task,
+                    Some(repo),
+                    TaskState::NeedsYou,
+                    "a risk category requires a frontier reviewer and none is configured",
+                    &format!("detected: {}", names.join(", ")),
+                )
+                .await
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    /// `<label>:risk-<category>` on the issue for each detected category; the
+    /// ones of the previous classification that no longer apply are removed
+    /// (Review Focus 3). Labelled before the extra checks run, so every
+    /// recorded category was also ensured and added: a later removal never
+    /// names a label that was never created.
+    async fn risk_labels(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        detected: &[Detected],
+        previous: Option<&[Detected]>,
+    ) -> Result<(), PipelineError> {
+        let name = |d: &Detected| format!("{}:risk-{}", repo.label, d.name);
+        let add: Vec<String> = detected.iter().map(name).collect();
+        let remove: Vec<String> = previous
+            .unwrap_or_default()
+            .iter()
+            .map(name)
+            .filter(|l| !add.contains(l))
+            .collect();
+        for (label, d) in add.iter().zip(detected) {
+            let description = format!("Provefab: change touches {}", d.name);
+            if let Err(e) = self
+                .hub
+                .ensure_label(&repo.slug, label, "b60205", &description)
+                .await
+            {
+                eprintln!(
+                    "provefab: could not create label {label} on {}: {e}",
+                    repo.slug
+                );
+            }
+        }
+        if add.is_empty() && remove.is_empty() {
+            return Ok(());
+        }
+        let add: Vec<&str> = add.iter().map(String::as_str).collect();
+        let remove: Vec<&str> = remove.iter().map(String::as_str).collect();
+        self.relabel(task.id, &task.repo, task.issue_number, &add, &remove)
+            .await
+    }
+
+    /// The categories of the latest `risk_classified` event whose (pass, round) `keep` accepts.
+    async fn latest_risk(
+        &self,
+        id: i64,
+        keep: impl Fn(u32, u32) -> bool,
+    ) -> Result<Option<Vec<Detected>>, PipelineError> {
+        let events = self.store.events(id).await?;
+        Ok(events
+            .iter()
+            .rev()
+            .filter(|e| e.kind == "risk_classified")
+            .filter_map(StoredEvent::typed)
+            .find_map(|e| match e {
+                Event::RiskClassified {
+                    pass,
+                    round,
+                    categories,
+                } if keep(pass, round) => Some(categories),
+                _ => None,
+            }))
+    }
+
+    /// The risk classification of the task's current pass and round, if any.
+    pub(crate) async fn risk_of_round(
+        &self,
+        task: &TaskRow,
+    ) -> Result<Option<Vec<Detected>>, PipelineError> {
+        let pass = pass_of(task);
+        self.latest_risk(task.id, |p, r| p == pass && r == task.review_rounds)
             .await
     }
 

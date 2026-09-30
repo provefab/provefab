@@ -152,6 +152,13 @@ pub enum Event {
     IssueReopened {
         previous_pass: u32,
     },
+    /// The risk categories of one round's change (risk policy §6). Paths are
+    /// identity, not free text: exported as is.
+    RiskClassified {
+        pass: u32,
+        round: u32,
+        categories: Vec<crate::risk::Detected>,
+    },
     // claim
     Plan {
         pass: u32,
@@ -202,6 +209,7 @@ impl Event {
             Self::Merged { .. } => "merged",
             Self::PostMerge { .. } => "post_merge",
             Self::IssueReopened { .. } => "issue_reopened",
+            Self::RiskClassified { .. } => "risk_classified",
             Self::Plan { .. } => "plan",
             Self::Review { .. } => "review",
             Self::FindingDisposition { .. } => "finding_disposition",

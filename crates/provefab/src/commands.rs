@@ -465,6 +465,14 @@ fn event_summary(e: &StoredEvent) -> String {
             check_id, state, ..
         } => format!("{} #{check_id} {state}", e.kind),
         IssueReopened { previous_pass } => format!("{} after pass {previous_pass}", e.kind),
+        RiskClassified { categories, .. } => {
+            let names: Vec<&str> = categories.iter().map(|c| c.name.as_str()).collect();
+            if names.is_empty() {
+                format!("{} none", e.kind)
+            } else {
+                format!("{} {}", e.kind, names.join(", "))
+            }
+        }
         Plan { pass, .. } => format!("{} pass {pass}", e.kind),
         Review {
             reviewer_model,
