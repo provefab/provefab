@@ -21,6 +21,7 @@ pub mod ports;
 pub mod post_merge;
 pub mod prices;
 pub mod prompts;
+pub mod record;
 pub mod router;
 pub mod routing;
 pub mod scheduler;

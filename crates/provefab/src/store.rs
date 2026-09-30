@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use sqlx::Row;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
 };
+use sqlx::{Row, SqliteConnection};
 
 use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
+use crate::record::{Event, StoredEvent};
 use crate::task::{TaskKind, TaskState};
 
 #[derive(Debug, thiserror::Error)]
@@ -416,21 +417,15 @@ impl Store {
 
     /// Links the task to its pull request (spec §3.4 item 7).
     pub async fn set_pr(&self, id: i64, url: &str, state: &str) -> Result<(), StoreError> {
-        self.update(
-            id,
-            "UPDATE tasks SET pr_url = ?, pr_state = ?, updated_at = ? WHERE id = ?",
-            |q| q.bind(url.to_string()).bind(state.to_string()),
-        )
-        .await
+        self.write_with_events(id, Write::SetPr { url, state }, &[])
+            .await
+            .map(|_| ())
     }
 
     pub async fn set_pr_state(&self, id: i64, state: &str) -> Result<(), StoreError> {
-        self.update(
-            id,
-            "UPDATE tasks SET pr_state = ?, updated_at = ? WHERE id = ?",
-            |q| q.bind(state.to_string()),
-        )
-        .await
+        self.write_with_events(id, Write::SetPrState(state), &[])
+            .await
+            .map(|_| ())
     }
 
     /// Creates the one check for a merged commit, or returns the existing row
@@ -644,18 +639,13 @@ impl Store {
         tiers: &Value,
         reasons: &[String],
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO routing_decisions (task_id, jev_model, verdict_json, tiers_json, reasons, at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(jev_model)
-        .bind(verdict.map(Value::to_string))
-        .bind(tiers.to_string())
-        .bind(reasons.join("\n"))
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let write = Write::Routing {
+            jev_model,
+            verdict,
+            tiers,
+            reasons,
+        };
+        self.write_with_events(id, write, &[]).await.map(|_| ())
     }
 
     /// `(jev_model, verdict, tiers, reasons)` of every routing decision, oldest first.
@@ -689,30 +679,9 @@ impl Store {
     }
 
     pub async fn record_stage_run(&self, run: &StageRunRecord) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO stage_runs (task_id, stage, model_id, exit, turns, input_tokens, output_tokens, session_dir, gate_score, started_at, finished_at,
-                                     cache_read_tokens, cache_write_tokens, actual_model, cost_usd, quota_units)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(run.task_id)
-        .bind(&run.stage)
-        .bind(&run.model_id)
-        .bind(&run.exit)
-        .bind(run.turns as i64)
-        .bind(run.input_tokens as i64)
-        .bind(run.output_tokens as i64)
-        .bind(run.session_dir.display().to_string())
-        .bind(&run.gate_score)
-        .bind(run.started_at)
-        .bind(run.finished_at)
-        .bind(run.cache_read_tokens as i64)
-        .bind(run.cache_write_tokens as i64)
-        .bind(&run.actual_model)
-        .bind(run.cost_usd)
-        .bind(run.quota_units)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.write_with_events(run.task_id, Write::StageRun(run), &[])
+            .await
+            .map(|_| ())
     }
 
     pub async fn stage_runs(&self, id: i64) -> Result<Vec<StageRunRecord>, StoreError> {
@@ -793,14 +762,36 @@ impl Store {
         kind: &str,
         value: &Value,
     ) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO stage_outputs (task_id, kind, json, at) VALUES (?, ?, ?, ?)")
-            .bind(id)
-            .bind(kind)
-            .bind(value.to_string())
-            .bind(now())
-            .execute(&self.pool)
+        self.write_with_events(id, Write::Output { kind, value }, &[])
+            .await
+            .map(|_| ())
+    }
+
+    /// Runs `write` and appends `events` in one `BEGIN IMMEDIATE`
+    /// transaction (spec section 4): the record never disagrees with the
+    /// tables the pipeline reads. Returns the new event ids, in order.
+    pub async fn write_with_events(
+        &self,
+        task_id: i64,
+        write: Write<'_>,
+        events: &[Event],
+    ) -> Result<Vec<i64>, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        exec_write(&mut tx, task_id, &write).await?;
+        let mut ids = Vec::with_capacity(events.len());
+        for e in events {
+            ids.push(append_event(&mut tx, task_id, e).await?);
+        }
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    pub async fn events(&self, task_id: i64) -> Result<Vec<StoredEvent>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM change_events WHERE task_id = ? ORDER BY seq")
+            .bind(task_id)
+            .fetch_all(&self.pool)
             .await?;
-        Ok(())
+        rows.iter().map(stored_event).collect()
     }
 
     /// Worker runs (stage runs with a model, not gates) started at or after `since`,
@@ -1012,6 +1003,151 @@ fn task_row(r: &SqliteRow) -> Result<TaskRow, StoreError> {
     })
 }
 
+/// One existing write, run in the same transaction as its record events.
+pub enum Write<'a> {
+    Nothing,
+    StageRun(&'a StageRunRecord),
+    Output {
+        kind: &'a str,
+        value: &'a Value,
+    },
+    Routing {
+        jev_model: Option<&'a str>,
+        verdict: Option<&'a Value>,
+        tiers: &'a Value,
+        reasons: &'a [String],
+    },
+    SetPr {
+        url: &'a str,
+        state: &'a str,
+    },
+    SetPrState(&'a str),
+}
+
+async fn exec_write(
+    conn: &mut SqliteConnection,
+    task_id: i64,
+    write: &Write<'_>,
+) -> Result<(), StoreError> {
+    match write {
+        Write::Nothing => {}
+        Write::StageRun(run) => {
+            sqlx::query(
+                "INSERT INTO stage_runs (task_id, stage, model_id, exit, turns, input_tokens, output_tokens, session_dir, gate_score, started_at, finished_at,
+                                         cache_read_tokens, cache_write_tokens, actual_model, cost_usd, quota_units)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(run.task_id)
+            .bind(&run.stage)
+            .bind(&run.model_id)
+            .bind(&run.exit)
+            .bind(run.turns as i64)
+            .bind(run.input_tokens as i64)
+            .bind(run.output_tokens as i64)
+            .bind(run.session_dir.display().to_string())
+            .bind(&run.gate_score)
+            .bind(run.started_at)
+            .bind(run.finished_at)
+            .bind(run.cache_read_tokens as i64)
+            .bind(run.cache_write_tokens as i64)
+            .bind(&run.actual_model)
+            .bind(run.cost_usd)
+            .bind(run.quota_units)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Write::Output { kind, value } => {
+            sqlx::query("INSERT INTO stage_outputs (task_id, kind, json, at) VALUES (?, ?, ?, ?)")
+                .bind(task_id)
+                .bind(*kind)
+                .bind(value.to_string())
+                .bind(now())
+                .execute(&mut *conn)
+                .await?;
+        }
+        Write::Routing {
+            jev_model,
+            verdict,
+            tiers,
+            reasons,
+        } => {
+            sqlx::query(
+                "INSERT INTO routing_decisions (task_id, jev_model, verdict_json, tiers_json, reasons, at) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(task_id)
+            .bind(*jev_model)
+            .bind(verdict.map(Value::to_string))
+            .bind(tiers.to_string())
+            .bind(reasons.join("\n"))
+            .bind(now())
+            .execute(&mut *conn)
+            .await?;
+        }
+        Write::SetPr { url, state } => {
+            let done = sqlx::query(
+                "UPDATE tasks SET pr_url = ?, pr_state = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(*url)
+            .bind(*state)
+            .bind(now())
+            .bind(task_id)
+            .execute(&mut *conn)
+            .await?;
+            if done.rows_affected() == 0 {
+                return Err(StoreError::UnknownTask(task_id));
+            }
+        }
+        Write::SetPrState(state) => {
+            let done = sqlx::query("UPDATE tasks SET pr_state = ?, updated_at = ? WHERE id = ?")
+                .bind(*state)
+                .bind(now())
+                .bind(task_id)
+                .execute(&mut *conn)
+                .await?;
+            if done.rows_affected() == 0 {
+                return Err(StoreError::UnknownTask(task_id));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn append_event(
+    conn: &mut SqliteConnection,
+    task_id: i64,
+    e: &Event,
+) -> Result<i64, StoreError> {
+    let payload = serde_json::to_string(e).map_err(|x| StoreError::Corrupt(x.to_string()))?;
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO change_events (task_id, seq, kind, source, schema_version, payload, at) \
+         VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM change_events WHERE task_id = ?), ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(task_id)
+    .bind(task_id)
+    .bind(e.kind())
+    .bind(e.source().as_str())
+    .bind(e.schema_version())
+    .bind(payload)
+    .bind(now())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(id)
+}
+
+fn stored_event(r: &SqliteRow) -> Result<StoredEvent, StoreError> {
+    let payload: String = r.get("payload");
+    Ok(StoredEvent {
+        id: r.get("id"),
+        task_id: r.get("task_id"),
+        seq: r.get("seq"),
+        kind: r.get("kind"),
+        source: r.get("source"),
+        schema_version: r.get::<i64, _>("schema_version") as u32,
+        payload: serde_json::from_str(&payload).map_err(|x| StoreError::Corrupt(x.to_string()))?,
+        at: r.get("at"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1170,7 @@ mod tests {
                 "fa9d5e7daa5ddeec2a821c7123b4fcca83a08f59d147187aac8a58405466bc12e383f228b0a8574c97fa57817f6fa432",
                 "9f9cca5cfdefacd436e685a2daf6b99f3a4d7104dbda6fd6c5df338adc59f1379ec0d15f86887d96c4ec23b3c1e3eaa5",
                 "daca2e3a57485b3a91ce46779913c341fec2ab5c757e523088b9c89a9fe3683a62f86b83b3adf5775babc4a8fb17ac49",
+                "5f568cb3d17aaf248e9f208ef39268d14393dd87157e348b5946549ebf4a359aedf16a05374529315b4dba8d461e9832",
             ]
         );
     }
@@ -1053,6 +1190,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("provefab.db")).await.unwrap();
         (dir, s)
+    }
+
+    use crate::record::{Event, MergedBy};
+
+    #[tokio::test]
+    async fn events_share_the_write_transaction_and_seq_is_gap_free() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(1)).await.unwrap().unwrap();
+        let ids = s
+            .write_with_events(
+                id,
+                Write::SetPr {
+                    url: "u",
+                    state: "open",
+                },
+                &[Event::PrOpened {
+                    url: "u".into(),
+                    head: None,
+                    base: "main".into(),
+                    pass: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        s.write_with_events(
+            id,
+            Write::Nothing,
+            &[
+                Event::IssueReopened { previous_pass: 1 },
+                Event::Merged {
+                    sha: None,
+                    base: None,
+                    by: MergedBy::Human,
+                    pass: 1,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        let ev = s.events(id).await.unwrap();
+        assert_eq!(ev.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(ev[0].kind, "pr_opened");
+        assert_eq!(ev[0].source, "fact");
+        assert_eq!(
+            s.task(id).await.unwrap().unwrap().pr_url.as_deref(),
+            Some("u")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_write_rolls_its_events_back() {
+        let (_d, s) = store().await;
+        // Unknown task: the UPDATE matches nothing, so the write fails.
+        let r = s
+            .write_with_events(
+                999,
+                Write::SetPr {
+                    url: "u",
+                    state: "open",
+                },
+                &[Event::IssueReopened { previous_pass: 1 }],
+            )
+            .await;
+        assert!(matches!(r, Err(StoreError::UnknownTask(999))));
+        assert!(s.events(999).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn existing_writers_still_write_without_events() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(1)).await.unwrap().unwrap();
+        s.record_output(id, "plan", &json!({"a": 1})).await.unwrap();
+        s.set_pr(id, "u", "open").await.unwrap();
+        assert!(s.events(id).await.unwrap().is_empty());
+        assert_eq!(
+            s.last_output(id, "plan").await.unwrap(),
+            Some(json!({"a": 1}))
+        );
     }
 
     #[tokio::test]
