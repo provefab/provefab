@@ -15,7 +15,7 @@ pub use crate::forge::{Comment, ForgeError, Git, Issue};
 pub use crate::jevq::{IssueContext, Triage};
 pub use crate::paths::Paths;
 pub use crate::pipeline::Pipeline;
-pub use crate::ports::{Hub, Oracle};
+pub use crate::ports::{Forge, Hub, Oracle, Tracker};
 pub use crate::store::{NewIssue, Store};
 pub use crate::task::{TaskKind, TaskState, Verdict};
 pub use agent_workers::{ExitReason, StageRequest, StageResult, Usage, WorkerError, WorkerEvent};
@@ -332,7 +332,11 @@ impl FakeHub {
     }
 }
 
-impl Hub for FakeHub {
+impl Tracker for FakeHub {
+    /// The fake's one issue, labelled or not (what every scheduler test polled).
+    async fn open_issues(&self, _: &str, _: &str) -> Result<Vec<Issue>, ForgeError> {
+        Ok(vec![self.issue.clone()])
+    }
     async fn issue(&self, _: &str, _: u64) -> Result<Issue, ForgeError> {
         if self.issue_missing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ForgeError::Failed {
@@ -361,26 +365,6 @@ impl Hub for FakeHub {
         self.add_comment("me", &crate::forge::with_prefix(body));
         Ok(())
     }
-    async fn pr_comment(&self, _: &str, url: &str, body: &str) -> Result<(), ForgeError> {
-        use std::sync::atomic::Ordering;
-        let left = self.pr_comment_failures.load(Ordering::SeqCst);
-        if left > 0 {
-            self.pr_comment_failures.store(left - 1, Ordering::SeqCst);
-            return Err(ForgeError::Parse("gh pr comment".into(), "HTTP 502".into()));
-        }
-        self.posted.lock().unwrap().push(body.to_string());
-        let comment = Comment {
-            author: "me".into(),
-            association: "MEMBER".into(),
-            body: crate::forge::with_prefix(body),
-            created_at: crate::store::rfc3339(crate::store::now()),
-        };
-        match self.pr_statuses.lock().unwrap().get_mut(url) {
-            Some(s) => s.comments.push(comment),
-            None => self.pr_status.lock().unwrap().comments.push(comment),
-        }
-        Ok(())
-    }
     async fn edit_labels(
         &self,
         _: &str,
@@ -401,6 +385,48 @@ impl Hub for FakeHub {
             add.iter().map(|s| s.to_string()).collect(),
             remove.iter().map(|s| s.to_string()).collect(),
         ));
+        Ok(())
+    }
+    async fn ensure_label(&self, _: &str, name: &str, _: &str, _: &str) -> Result<(), ForgeError> {
+        if self.ensure_fails.lock().unwrap().iter().any(|l| l == name) {
+            return Err(ForgeError::Parse("gh label".into(), "HTTP 422".into()));
+        }
+        {
+            let mut once = self.ensure_fails_once.lock().unwrap();
+            if let Some(i) = once.iter().position(|l| l == name) {
+                once.remove(i);
+                return Err(ForgeError::Parse("gh label".into(), "HTTP 422".into()));
+            }
+        }
+        self.ensured.lock().unwrap().push(name.to_string());
+        Ok(())
+    }
+    async fn issue_open(&self, _: &str, _: u64) -> Result<bool, ForgeError> {
+        self.issue_open_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.issue_is_open.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+impl Forge for FakeHub {
+    async fn pr_comment(&self, _: &str, url: &str, body: &str) -> Result<(), ForgeError> {
+        use std::sync::atomic::Ordering;
+        let left = self.pr_comment_failures.load(Ordering::SeqCst);
+        if left > 0 {
+            self.pr_comment_failures.store(left - 1, Ordering::SeqCst);
+            return Err(ForgeError::Parse("gh pr comment".into(), "HTTP 502".into()));
+        }
+        self.posted.lock().unwrap().push(body.to_string());
+        let comment = Comment {
+            author: "me".into(),
+            association: "MEMBER".into(),
+            body: crate::forge::with_prefix(body),
+            created_at: crate::store::rfc3339(crate::store::now()),
+        };
+        match self.pr_statuses.lock().unwrap().get_mut(url) {
+            Some(s) => s.comments.push(comment),
+            None => self.pr_status.lock().unwrap().comments.push(comment),
+        }
         Ok(())
     }
     async fn pr_create(
@@ -454,20 +480,6 @@ impl Hub for FakeHub {
             .push((head.into(), base.into(), title.into(), body.into()));
         Ok("https://github.com/o/r/pull/8".into())
     }
-    async fn ensure_label(&self, _: &str, name: &str, _: &str, _: &str) -> Result<(), ForgeError> {
-        if self.ensure_fails.lock().unwrap().iter().any(|l| l == name) {
-            return Err(ForgeError::Parse("gh label".into(), "HTTP 422".into()));
-        }
-        {
-            let mut once = self.ensure_fails_once.lock().unwrap();
-            if let Some(i) = once.iter().position(|l| l == name) {
-                once.remove(i);
-                return Err(ForgeError::Parse("gh label".into(), "HTTP 422".into()));
-            }
-        }
-        self.ensured.lock().unwrap().push(name.to_string());
-        Ok(())
-    }
     async fn pr_status(&self, _: &str, url: &str) -> Result<crate::forge::PrStatus, ForgeError> {
         if let Some(s) = self.pr_statuses.lock().unwrap().get(url) {
             return Ok(s.clone());
@@ -480,11 +492,6 @@ impl Hub for FakeHub {
     }
     async fn repo_is_public(&self, _: &str) -> Result<bool, ForgeError> {
         Ok(self.public.load(std::sync::atomic::Ordering::SeqCst))
-    }
-    async fn issue_open(&self, _: &str, _: u64) -> Result<bool, ForgeError> {
-        self.issue_open_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(self.issue_is_open.load(std::sync::atomic::Ordering::SeqCst))
     }
     async fn repo_clone(&self, _: &str, dest: &Path) -> Result<(), ForgeError> {
         let Some(src) = self.clone_from.lock().unwrap().clone() else {

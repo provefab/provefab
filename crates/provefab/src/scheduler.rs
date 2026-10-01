@@ -10,10 +10,10 @@ use tokio::task::JoinSet;
 use crate::agents::StageRunner;
 use crate::config::{Config, RepoConfig};
 use crate::forge::ForgeError;
-use crate::intake::{IssueSource, poll};
+use crate::intake::poll;
 use crate::jevq::IssueContext;
 use crate::pipeline::{Pipeline, PipelineError};
-use crate::ports::{Hub, Oracle};
+use crate::ports::{Hub, Oracle, Tracker};
 use crate::router::{Availability, fallback_tiers, select, stage_tiers};
 use crate::task::{TaskKind, TaskState, Tier};
 
@@ -90,9 +90,8 @@ where
 /// Runs until `stop` resolves (Ctrl-C in `main`), or, with `once`, until
 /// nothing can move. On stop, running stages are cancelled: dropping them
 /// kills their process trees (D26), and the tasks resume on the next run.
-pub async fn run<R, O, H, S>(
+pub async fn run<R, O, H>(
     p: Arc<Pipeline<R, O, H>>,
-    source: &S,
     opts: RunOptions,
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), PipelineError>
@@ -100,7 +99,6 @@ where
     R: StageRunner + Send + Sync + 'static,
     O: Oracle + Send + Sync + 'static,
     H: Hub + Send + Sync + 'static,
-    S: IssueSource,
 {
     tokio::pin!(stop);
     for repo in &p.config.repos {
@@ -179,7 +177,7 @@ where
                     continue;
                 }
                 next_poll.insert(repo.slug.clone(), Instant::now() + repo.poll_interval);
-                match poll(source, repo, &p.store).await {
+                match poll(&p.hub, repo, &p.store).await {
                     Ok(ids) if !ids.is_empty() => {
                         eprintln!(
                             "provefab: {} new issue(s) queued from {}",
@@ -339,9 +337,9 @@ fn should_report(before: TaskState, after: &Result<TaskState, PipelineError>) ->
 
 /// One line per open labelled issue: what Jev said and which models would run.
 /// Touches nothing: no store, no worker, no comment, no label (spec §3.4 item 5).
-pub async fn dry_run<O: Oracle, S: IssueSource>(
+pub async fn dry_run<O: Oracle, T: Tracker>(
     config: &Config,
-    source: &S,
+    tracker: &T,
     oracle: &O,
 ) -> Result<Vec<String>, ForgeError> {
     let mut lines = Vec::new();
@@ -353,7 +351,7 @@ pub async fn dry_run<O: Oracle, S: IssueSource>(
             .unwrap_or_else(|| "(none)".into())
     };
     for repo in &config.repos {
-        for issue in source.open_issues(repo).await? {
+        for issue in tracker.open_issues(&repo.slug, &repo.label).await? {
             let ctx = IssueContext {
                 title: issue.title.clone(),
                 body: issue.body.clone(),

@@ -116,8 +116,15 @@ impl<O: Oracle + Sync> Oracle for Option<O> {
     }
 }
 
-/// GitHub, seen by the pipeline.
-pub trait Hub {
+/// Where a repository's issues live and Provefab reports progress on them:
+/// GitHub, Jira or Linear (issue trackers spec §3). Addressed by repository
+/// slug and issue number; an adapter rebuilds a ticket key from its config.
+pub trait Tracker {
+    fn open_issues(
+        &self,
+        slug: &str,
+        label: &str,
+    ) -> impl Future<Output = Result<Vec<Issue>, ForgeError>> + Send;
     fn issue(
         &self,
         slug: &str,
@@ -134,18 +141,34 @@ pub trait Hub {
         number: u64,
         body: &str,
     ) -> impl Future<Output = Result<(), ForgeError>> + Send;
-    fn pr_comment(
-        &self,
-        slug: &str,
-        url: &str,
-        body: &str,
-    ) -> impl Future<Output = Result<(), ForgeError>> + Send;
     fn edit_labels(
         &self,
         slug: &str,
         number: u64,
         add: &[&str],
         remove: &[&str],
+    ) -> impl Future<Output = Result<(), ForgeError>> + Send;
+    fn ensure_label(
+        &self,
+        slug: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> impl Future<Output = Result<(), ForgeError>> + Send;
+    fn issue_open(
+        &self,
+        slug: &str,
+        number: u64,
+    ) -> impl Future<Output = Result<bool, ForgeError>> + Send;
+}
+
+/// Where the code lives: GitHub, always (pull requests, clone, visibility).
+pub trait Forge {
+    fn pr_comment(
+        &self,
+        slug: &str,
+        url: &str,
+        body: &str,
     ) -> impl Future<Output = Result<(), ForgeError>> + Send;
     fn pr_create(
         &self,
@@ -155,13 +178,6 @@ pub trait Hub {
         title: &str,
         body: &str,
     ) -> impl Future<Output = Result<String, ForgeError>> + Send;
-    fn ensure_label(
-        &self,
-        slug: &str,
-        name: &str,
-        color: &str,
-        description: &str,
-    ) -> impl Future<Output = Result<(), ForgeError>> + Send;
     /// Clones the repo into `dest` (a provefab-managed checkout, D48).
     fn repo_clone(
         &self,
@@ -173,11 +189,6 @@ pub trait Hub {
         slug: &str,
         url: &str,
     ) -> impl Future<Output = Result<PrStatus, ForgeError>> + Send;
-    fn issue_open(
-        &self,
-        slug: &str,
-        number: u64,
-    ) -> impl Future<Output = Result<bool, ForgeError>> + Send;
     /// Squash-merges the PR and deletes its branch, only at `head` (auto-merge, D49).
     fn pr_merge(
         &self,
@@ -189,7 +200,16 @@ pub trait Hub {
     fn repo_is_public(&self, slug: &str) -> impl Future<Output = Result<bool, ForgeError>> + Send;
 }
 
-impl Hub for Gh {
+/// Everything the pipeline needs: one tracker and the forge. A blanket
+/// implementation, so the pipeline's bounds and Provefab Pro stay unchanged.
+pub trait Hub: Tracker + Forge {}
+
+impl<T: Tracker + Forge> Hub for T {}
+
+impl Tracker for Gh {
+    async fn open_issues(&self, slug: &str, label: &str) -> Result<Vec<Issue>, ForgeError> {
+        Gh::labeled_issues(self, slug, label).await
+    }
     async fn issue(&self, slug: &str, number: u64) -> Result<Issue, ForgeError> {
         Gh::issue(self, slug, number).await
     }
@@ -199,9 +219,6 @@ impl Hub for Gh {
     async fn comment(&self, slug: &str, number: u64, body: &str) -> Result<(), ForgeError> {
         Gh::comment(self, slug, number, body).await
     }
-    async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
-        Gh::pr_comment(self, slug, url, body).await
-    }
     async fn edit_labels(
         &self,
         slug: &str,
@@ -210,6 +227,24 @@ impl Hub for Gh {
         remove: &[&str],
     ) -> Result<(), ForgeError> {
         Gh::edit_labels(self, slug, number, add, remove).await
+    }
+    async fn ensure_label(
+        &self,
+        slug: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> Result<(), ForgeError> {
+        Gh::ensure_label(self, slug, name, color, description).await
+    }
+    async fn issue_open(&self, slug: &str, number: u64) -> Result<bool, ForgeError> {
+        Gh::issue_open(self, slug, number).await
+    }
+}
+
+impl Forge for Gh {
+    async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
+        Gh::pr_comment(self, slug, url, body).await
     }
     async fn pr_create(
         &self,
@@ -221,23 +256,11 @@ impl Hub for Gh {
     ) -> Result<String, ForgeError> {
         Gh::pr_create(self, slug, head, base, title, body).await
     }
-    async fn ensure_label(
-        &self,
-        slug: &str,
-        name: &str,
-        color: &str,
-        description: &str,
-    ) -> Result<(), ForgeError> {
-        Gh::ensure_label(self, slug, name, color, description).await
-    }
     async fn repo_clone(&self, slug: &str, dest: &Path) -> Result<(), ForgeError> {
         Gh::repo_clone(self, slug, dest).await
     }
     async fn pr_status(&self, slug: &str, url: &str) -> Result<PrStatus, ForgeError> {
         Gh::pr_status(self, slug, url).await
-    }
-    async fn issue_open(&self, slug: &str, number: u64) -> Result<bool, ForgeError> {
-        Gh::issue_open(self, slug, number).await
     }
     async fn pr_merge(&self, slug: &str, url: &str, head: &str) -> Result<(), ForgeError> {
         Gh::pr_merge(self, slug, url, head).await
@@ -250,6 +273,17 @@ impl Hub for Gh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The port split (issue trackers spec §3): `Gh` is both ports, so a hub.
+    #[test]
+    fn gh_is_a_tracker_and_a_forge_so_a_hub() {
+        fn tracker<T: Tracker>() {}
+        fn forge<F: Forge>() {}
+        fn hub<H: Hub>() {}
+        tracker::<Gh>();
+        forge::<Gh>();
+        hub::<Gh>();
+    }
 
     #[tokio::test]
     async fn no_oracle_always_falls_back() {

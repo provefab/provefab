@@ -2,24 +2,6 @@
 
 use provefab::testkit::*;
 
-pub struct FakeSource(Issue);
-
-impl provefab::intake::IssueSource for FakeSource {
-    async fn open_issues(
-        &self,
-        _: &provefab::config::RepoConfig,
-    ) -> Result<Vec<Issue>, ForgeError> {
-        Ok(vec![self.0.clone()])
-    }
-    async fn comments(
-        &self,
-        _: &provefab::config::RepoConfig,
-        _: u64,
-    ) -> Result<Vec<Comment>, ForgeError> {
-        Ok(Vec::new())
-    }
-}
-
 #[tokio::test]
 async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
     let f = fixture(&["test -f feature.txt"]);
@@ -32,12 +14,11 @@ async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
         )
         .await,
     );
-    let source = FakeSource(p.hub.issue.clone());
     let opts = provefab::scheduler::RunOptions {
         workers: 2,
         once: true,
     };
-    provefab::scheduler::run(p.clone(), &source, opts, std::future::pending::<()>())
+    provefab::scheduler::run(p.clone(), opts, std::future::pending::<()>())
         .await
         .unwrap();
     let t = p
@@ -63,7 +44,7 @@ async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
         ]
     );
     // A second run finds nothing new to do.
-    provefab::scheduler::run(p.clone(), &source, opts, std::future::pending::<()>())
+    provefab::scheduler::run(p.clone(), opts, std::future::pending::<()>())
         .await
         .unwrap();
     assert_eq!(p.hub.prs.lock().unwrap().len(), 1);
@@ -73,12 +54,11 @@ async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
 async fn dry_run_reports_routes_and_touches_nothing() {
     let f = fixture(&["true"]);
     let hub = FakeHub::new("x");
-    let source = FakeSource(hub.issue.clone());
     let oracle = FakeOracle {
         verdict: Some(verdict(TaskKind::Feature, 0.1)),
         ..Default::default()
     };
-    let lines = provefab::scheduler::dry_run(&f.config, &source, &oracle)
+    let lines = provefab::scheduler::dry_run(&f.config, &hub, &oracle)
         .await
         .unwrap();
     assert_eq!(lines.len(), 1);
@@ -96,7 +76,7 @@ async fn dry_run_reports_routes_and_touches_nothing() {
         verdict: Some(wide),
         ..Default::default()
     };
-    let lines = provefab::scheduler::dry_run(&f.config, &source, &routed)
+    let lines = provefab::scheduler::dry_run(&f.config, &hub, &routed)
         .await
         .unwrap();
     assert!(
@@ -108,7 +88,7 @@ async fn dry_run_reports_routes_and_touches_nothing() {
         verdict: Some(verdict(TaskKind::Feature, 0.9)),
         ..Default::default()
     };
-    let lines = provefab::scheduler::dry_run(&f.config, &source, &asks)
+    let lines = provefab::scheduler::dry_run(&f.config, &hub, &asks)
         .await
         .unwrap();
     assert!(
@@ -116,7 +96,7 @@ async fn dry_run_reports_routes_and_touches_nothing() {
         "{}",
         lines[0]
     );
-    let none = provefab::scheduler::dry_run(&f.config, &source, &FakeOracle::default())
+    let none = provefab::scheduler::dry_run(&f.config, &hub, &FakeOracle::default())
         .await
         .unwrap();
     assert!(
@@ -166,10 +146,9 @@ async fn review_i4_a_task_that_keeps_erroring_does_not_spin_and_once_ends() {
     .execute(&db)
     .await
     .unwrap();
-    let source = FakeSource(p.hub.issue.clone());
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -192,10 +171,9 @@ async fn review_i5_a_panicking_task_is_parked_for_a_person() {
         )
         .await,
     );
-    let source = FakeSource(p.hub.issue.clone());
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -230,18 +208,14 @@ async fn review_i6_stopping_cancels_running_stages_and_returns() {
         )
         .await,
     );
-    let source = FakeSource(p.hub.issue.clone());
     let forever = provefab::scheduler::RunOptions {
         workers: 1,
         once: false,
     };
     let stop = tokio::time::sleep(std::time::Duration::from_millis(500));
-    within(
-        10,
-        provefab::scheduler::run(p.clone(), &source, forever, stop),
-    )
-    .await
-    .unwrap();
+    within(10, provefab::scheduler::run(p.clone(), forever, stop))
+        .await
+        .unwrap();
     // The stage was cancelled, not finished: the task resumes after a restart.
     let t = p
         .store
@@ -272,10 +246,9 @@ async fn pending_github_comment_is_retried_on_next_poll() {
         )
         .await,
     );
-    let source = FakeSource(p.hub.issue.clone());
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -297,7 +270,7 @@ async fn pending_github_comment_is_retried_on_next_poll() {
 
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -311,7 +284,7 @@ async fn pending_github_comment_is_retried_on_next_poll() {
 
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -331,10 +304,9 @@ async fn polling_watches_open_prs() {
         )
         .await,
     );
-    let source = FakeSource(p.hub.issue.clone());
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -348,7 +320,7 @@ async fn polling_watches_open_prs() {
     };
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -363,7 +335,7 @@ async fn polling_watches_open_prs() {
     for _ in 0..3 {
         within(
             10,
-            provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+            provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
         )
         .await
         .unwrap();
@@ -394,12 +366,11 @@ async fn the_loop_refreshes_stale_prices_from_the_cache() {
     std::fs::write(p.paths.prices(), serde_json::to_string(&cached).unwrap()).unwrap();
     p.prices.write().unwrap().fetched_at = 0;
     let p = std::sync::Arc::new(p);
-    let source = FakeSource(p.hub.issue.clone());
     let opts = provefab::scheduler::RunOptions {
         workers: 1,
         once: true,
     };
-    provefab::scheduler::run(p.clone(), &source, opts, std::future::pending::<()>())
+    provefab::scheduler::run(p.clone(), opts, std::future::pending::<()>())
         .await
         .unwrap();
     assert_eq!(p.prices.read().unwrap().source, "seeded");
@@ -419,10 +390,9 @@ async fn post_merge_checks_advance_on_every_tick() {
         )
         .await,
     );
-    let source = FakeSource(p.hub.issue.clone());
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -444,7 +414,7 @@ async fn post_merge_checks_advance_on_every_tick() {
     for _ in 0..4 {
         within(
             10,
-            provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+            provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
         )
         .await
         .unwrap();
@@ -474,10 +444,9 @@ async fn post_merge_checks_advance_after_the_task_leaves_pr_open() {
         )
         .await,
     );
-    let source = FakeSource(p.hub.issue.clone());
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -497,7 +466,7 @@ async fn post_merge_checks_advance_after_the_task_leaves_pr_open() {
     };
     within(
         10,
-        provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
     )
     .await
     .unwrap();
@@ -516,7 +485,7 @@ async fn post_merge_checks_advance_after_the_task_leaves_pr_open() {
     for _ in 0..4 {
         within(
             10,
-            provefab::scheduler::run(p.clone(), &source, ONCE, std::future::pending::<()>()),
+            provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
         )
         .await
         .unwrap();

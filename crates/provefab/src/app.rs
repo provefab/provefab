@@ -12,7 +12,6 @@ use crate::commands::{self, Tools};
 use crate::config::{Auth, Config, WorkerKind};
 use crate::cooldown::Cooldowns;
 use crate::forge::{Gh, Git};
-use crate::intake::GhLabelPoller;
 use crate::paths::Paths;
 use crate::pipeline::Pipeline;
 use crate::policy::{OpenPrOnly, ReviewPolicy};
@@ -241,9 +240,8 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             }
             policy.check(&config).map_err(anyhow::Error::msg)?;
             let oracle = oracle(&config).await?;
-            let source = GhLabelPoller { gh: gh() };
             if dry_run {
-                for line in scheduler::dry_run(&config, &source, &oracle).await? {
+                for line in scheduler::dry_run(&config, &gh(), &oracle).await? {
                     println!("{line}");
                 }
                 return Ok(ExitCode::SUCCESS);
@@ -320,7 +318,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             let stop = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
-            scheduler::run(pipeline, &source, RunOptions { workers, once }, stop).await?;
+            scheduler::run(pipeline, RunOptions { workers, once }, stop).await?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Add { url } => {

@@ -1,40 +1,10 @@
 //! Issue intake (spec §3.3): labelled issues become tasks, and replies on
 //! `NeedsInfo` issues are selected for the reply check.
 
-use std::future::Future;
-
 use crate::config::RepoConfig;
-use crate::forge::{Comment, ForgeError, Gh, Issue, is_bot_comment};
+use crate::forge::{Comment, ForgeError, is_bot_comment};
+use crate::ports::Tracker;
 use crate::store::{NewIssue, Store, StoreError};
-
-/// Where issues come from. `gh` label polling today; webhooks later (spec D5).
-pub trait IssueSource {
-    fn open_issues(
-        &self,
-        repo: &RepoConfig,
-    ) -> impl Future<Output = Result<Vec<Issue>, ForgeError>> + Send;
-    fn comments(
-        &self,
-        repo: &RepoConfig,
-        number: u64,
-    ) -> impl Future<Output = Result<Vec<Comment>, ForgeError>> + Send;
-}
-
-/// Polls `gh issue list --label <label>`. The label is the authorization: only
-/// people with triage rights can apply it (spec §3.3).
-pub struct GhLabelPoller {
-    pub gh: Gh,
-}
-
-impl IssueSource for GhLabelPoller {
-    async fn open_issues(&self, repo: &RepoConfig) -> Result<Vec<Issue>, ForgeError> {
-        self.gh.labeled_issues(&repo.slug, &repo.label).await
-    }
-
-    async fn comments(&self, repo: &RepoConfig, number: u64) -> Result<Vec<Comment>, ForgeError> {
-        self.gh.comments(&repo.slug, number).await
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum IntakeError {
@@ -46,12 +16,12 @@ pub enum IntakeError {
 
 /// Queues every labelled open issue the store does not know yet; returns the new task ids.
 pub async fn poll(
-    source: &impl IssueSource,
+    source: &impl Tracker,
     repo: &RepoConfig,
     store: &Store,
 ) -> Result<Vec<i64>, IntakeError> {
     let mut added = Vec::new();
-    for issue in source.open_issues(repo).await? {
+    for issue in source.open_issues(&repo.slug, &repo.label).await? {
         let new = NewIssue {
             repo: repo.slug.clone(),
             number: issue.number,
@@ -87,18 +57,44 @@ pub fn new_replies(comments: &[Comment], issue_author: &str, since: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge::BOT_PREFIX;
+    use crate::forge::{BOT_PREFIX, Issue};
     use std::path::PathBuf;
     use std::time::Duration;
 
-    struct FakeSource(Vec<Issue>);
+    #[derive(Default)]
+    struct FakeSource {
+        issues: Vec<Issue>,
+        asked: std::sync::Mutex<Vec<(String, String)>>,
+    }
 
-    impl IssueSource for FakeSource {
-        async fn open_issues(&self, _repo: &RepoConfig) -> Result<Vec<Issue>, ForgeError> {
-            Ok(self.0.clone())
+    impl Tracker for FakeSource {
+        async fn open_issues(&self, slug: &str, label: &str) -> Result<Vec<Issue>, ForgeError> {
+            self.asked.lock().unwrap().push((slug.into(), label.into()));
+            Ok(self.issues.clone())
         }
-        async fn comments(&self, _repo: &RepoConfig, _n: u64) -> Result<Vec<Comment>, ForgeError> {
+        async fn issue(&self, _: &str, n: u64) -> Result<Issue, ForgeError> {
+            Ok(issue(n))
+        }
+        async fn comments(&self, _: &str, _: u64) -> Result<Vec<Comment>, ForgeError> {
             Ok(Vec::new())
+        }
+        async fn comment(&self, _: &str, _: u64, _: &str) -> Result<(), ForgeError> {
+            Ok(())
+        }
+        async fn edit_labels(
+            &self,
+            _: &str,
+            _: u64,
+            _: &[&str],
+            _: &[&str],
+        ) -> Result<(), ForgeError> {
+            Ok(())
+        }
+        async fn ensure_label(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), ForgeError> {
+            Ok(())
+        }
+        async fn issue_open(&self, _: &str, _: u64) -> Result<bool, ForgeError> {
+            Ok(true)
         }
     }
 
@@ -134,7 +130,10 @@ mod tests {
     async fn poll_queues_each_issue_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("f.db")).await.unwrap();
-        let source = FakeSource(vec![issue(1), issue(2)]);
+        let source = FakeSource {
+            issues: vec![issue(1), issue(2)],
+            ..Default::default()
+        };
         let first = poll(&source, &repo(), &store).await.unwrap();
         assert_eq!(first.len(), 2);
         let again = poll(&source, &repo(), &store).await.unwrap();
@@ -146,6 +145,18 @@ mod tests {
         assert_eq!(
             (t.repo.as_str(), t.issue_number, t.author.as_str()),
             ("o/r", 1, "alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_asks_the_tracker_for_the_repo_and_its_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("f.db")).await.unwrap();
+        let source = FakeSource::default();
+        poll(&source, &repo(), &store).await.unwrap();
+        assert_eq!(
+            *source.asked.lock().unwrap(),
+            vec![("o/r".to_string(), "provefab".to_string())]
         );
     }
 
