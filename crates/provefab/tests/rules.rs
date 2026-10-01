@@ -1313,3 +1313,52 @@ async fn signals_fail_when_a_proposals_state_cannot_be_read() {
     let err = p.maintenance(&repo).signals(0).await.unwrap_err();
     assert_eq!(err, format!("could not read {url}"));
 }
+
+/// M6: the file is built from what `rules_at_base` read; a rules file
+/// merged on the base since then is never reverted by the proposal.
+#[tokio::test]
+async fn propose_file_refuses_when_the_base_rules_changed_since_they_were_read() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    assert_eq!(tools.rules_at_base().await.unwrap(), None);
+    // A maintainer merges a rules file while the model drafts.
+    let other = person_clone(&f, "other", "main");
+    std::fs::create_dir_all(other.join(".provefab")).unwrap();
+    std::fs::write(other.join(".provefab/rules.md"), "## R1: By hand\n").unwrap();
+    git(&other, &["add", "-f", ".provefab/rules.md"]);
+    git(&other, &["commit", "-q", "-m", "rules"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    let err = tools
+        .propose_file(".provefab/rules.md", "## R1: One\n", "Rules", "Body", None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ".provefab/rules.md changed on the base branch of o/r since it was read, so Provefab pushed nothing"
+    );
+    assert_eq!(
+        git(&f.origin, &["branch", "--list", "provefab/rules"]),
+        "",
+        "nothing pushed"
+    );
+    assert!(p.hub.prs.lock().unwrap().is_empty());
+    // Read again, the same file is proposed on top of it.
+    assert_eq!(
+        tools.rules_at_base().await.unwrap().as_deref(),
+        Some("## R1: By hand")
+    );
+    tools
+        .propose_file(
+            ".provefab/rules.md",
+            "## R1: By hand\n\n## R2: Two\n",
+            "Rules",
+            "Body",
+            None,
+        )
+        .await
+        .unwrap();
+}

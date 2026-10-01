@@ -148,6 +148,9 @@ pub trait PeriodicTools: Send + Sync {
     /// Commits `content` as `path` on the branch `provefab/<file stem>`,
     /// rebuilt from the current base, pushes it and opens its pull request or
     /// updates the open one. Never merges. `Err` means nothing was pushed.
+    /// When `path` is the rules file and `rules_at_base` read it, a base
+    /// whose file has changed since is refused: the content was built from
+    /// the text read, and would revert the newer one (final review M6).
     /// `last_pushed` is the `sha` of the
     /// previous proposal (`None`: there is none); when the branch holds
     /// anything else, a person changed it, and nothing is pushed or edited

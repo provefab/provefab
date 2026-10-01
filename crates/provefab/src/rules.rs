@@ -320,6 +320,7 @@ where
             repo,
             started_at: now(),
             spent: Mutex::new(Spent::default()),
+            read: Mutex::new(None),
         }
     }
 
@@ -434,6 +435,9 @@ pub struct Maintenance<'a, R, O, H> {
     repo: &'a RepoConfig,
     started_at: i64,
     spent: Mutex<Spent>,
+    /// What `rules_at_base` last returned: `propose_file` refuses to commit
+    /// a file built from it on a base whose file differs (final review M6).
+    read: Mutex<Option<Option<String>>>,
 }
 
 /// Model calls not yet written with a run.
@@ -794,13 +798,16 @@ where
             Err(e) => return Err(failed(not_fetched(), e)),
         }
         let base = p.base_ref(repo).await;
-        p.git
+        let text = p
+            .git
             .show_file(&p.checkout(repo), &base, PATH)
             .await
             .map_err(|e| {
                 let said = format!("could not read {PATH} on the base branch of {}", repo.slug);
                 failed(said, e)
-            })
+            })?;
+        *self.read.lock().unwrap_or_else(PoisonError::into_inner) = Some(text.clone());
+        Ok(text)
     }
 
     /// A fresh empty directory under `<home>/maintenance/ask`, outside every
@@ -944,6 +951,23 @@ where
                         e,
                     )
                 })?;
+            let read = self
+                .read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(read) = read.filter(|_| path == PATH) {
+                let now = p.git.show_file(&checkout, &base, PATH).await.map_err(|e| {
+                    let said = format!("could not read {PATH} on the base branch of {}", repo.slug);
+                    failed(said, e)
+                })?;
+                if now != read {
+                    return Err(format!(
+                        "{PATH} changed on the base branch of {} since it was read, so Provefab pushed nothing",
+                        repo.slug
+                    ));
+                }
+            }
             // Pre-flight B1: only a branch Provefab left as it is, or none, is
             // replaced; the push's lease holds it to what is read here.
             let unread = |e| failed(format!("could not read {branch} on {}", repo.slug), e);
