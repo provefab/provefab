@@ -155,12 +155,11 @@ async fn a_same_provider_frontier_keeps_the_cross_provider_reviewer() {
     );
 }
 
-/// Jev's review risk already asks for frontier and the only frontier model
-/// shares the implementer's provider: the router falls back to it, so the
-/// PR says a frontier model reviewed, and why the risk rule could not pick
-/// one from another provider.
+/// Jev's review risk asks for frontier but the only frontier model shares the
+/// implementer's provider: the review keeps the cross-provider standard
+/// reviewer, and the route says why the frontier tier was not used.
 #[tokio::test]
-async fn a_frontier_review_from_jev_is_what_the_pr_states() {
+async fn a_frontier_review_from_jev_keeps_the_cross_provider_reviewer() {
     let f = fixture(&["test -f feature.txt"]);
     let oracle = FakeOracle {
         verdict: Some(Verdict {
@@ -172,14 +171,33 @@ async fn a_frontier_review_from_jev_is_what_the_pr_states() {
     let p = pipeline(&f, Box::new(risky), oracle, FakeHub::new("x")).await;
     let id = queue(&p).await;
     assert_eq!(p.drive(id).await.unwrap(), PrOpen);
-    assert_eq!(reviewers(&p), ["top-claude"], "{:?}", p.runner.stages());
-    let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+    assert_eq!(reviewers(&p), ["std-codex"], "{:?}", p.runner.stages());
+    let routes = p.store.recent_outputs(id, "route", 50).await.unwrap();
     assert!(
-        body.contains(
-            "- migrations: `migrations/0005.sql` · reviewer: frontier (no frontier reviewer from another provider is configured)\n"
-        ),
-        "{body}"
+        routes.iter().any(|r| r["why"].as_str().is_some_and(|w| {
+            w.contains("no frontier reviewer from another provider -> Standard")
+        })),
+        "{routes:?}"
     );
+    let body = p.hub.prs.lock().unwrap().last().unwrap().3.clone();
+    assert!(body.contains(NO_FRONTIER), "{body}");
+}
+
+#[tokio::test]
+async fn a_frontier_review_from_jev_uses_a_frontier_model_from_another_provider() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    with_codex_frontier(&mut f);
+    let oracle = FakeOracle {
+        verdict: Some(Verdict {
+            review_risk: Some(3.5),
+            ..verdict(TaskKind::Feature, 0.1)
+        }),
+        ..Default::default()
+    };
+    let p = pipeline(&f, Box::new(risky), oracle, FakeHub::new("x")).await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    assert_eq!(reviewers(&p), ["top-codex"], "{:?}", p.runner.stages());
 }
 
 #[tokio::test]

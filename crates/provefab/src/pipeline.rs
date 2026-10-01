@@ -1155,12 +1155,17 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let resolve = |t: Tier| resolve_tier(t, &self.config.models).unwrap_or(t);
         let decisions = self.store.routing_decisions(task.id).await?;
         let tiers = decisions.last().map(|d| d.2.clone());
-        let base = resolve(
-            tiers
-                .as_ref()
-                .and_then(|t| tier_of(t, stage))
-                .unwrap_or(Tier::Standard),
-        );
+        let jev_tier = tiers
+            .as_ref()
+            .and_then(|t| tier_of(t, stage))
+            .unwrap_or(Tier::Standard);
+        // Jev's frontier review keeps the cross-provider rule of the risk
+        // policy: no frontier reviewer from another provider, no frontier tier.
+        let base = if self.jev_frontier_downgrade(task, stage).await?.is_some() {
+            resolve(Tier::Standard)
+        } else {
+            resolve(jev_tier)
+        };
         let mut tier = if task.escalated {
             resolve(base.up())
         } else {
@@ -1644,6 +1649,44 @@ Please reply with what should happen, what happens instead, and how to reproduce
         Ok(TaskState::Queued)
     }
 
+    /// The routing note when Jev asked for a frontier review (`review_risk >=
+    /// 3.0`) that the catalog cannot give from another provider than the
+    /// implementer's: the review then uses the standard tier. Reads only. With
+    /// no implement run yet the implementer is unknown and the tier is kept.
+    async fn jev_frontier_downgrade(
+        &self,
+        task: &TaskRow,
+        stage: Stage,
+    ) -> Result<Option<String>, PipelineError> {
+        if stage != Stage::Review {
+            return Ok(None);
+        }
+        let decisions = self.store.routing_decisions(task.id).await?;
+        let Some((_, verdict, tiers, _)) = decisions.last() else {
+            return Ok(None);
+        };
+        let Some(r) = verdict
+            .as_ref()
+            .and_then(|v| v["review_risk"].as_f64())
+            .filter(|r| *r >= 3.0)
+        else {
+            return Ok(None);
+        };
+        if tier_of(tiers, stage) != Some(Tier::Frontier) {
+            return Ok(None);
+        }
+        let implementer = self.implementer_provider(task.id).await?;
+        Ok(
+            risk::risky_review_tier(&self.config.models, implementer.as_deref(), true)
+                .is_none()
+                .then(|| {
+                    format!(
+                        "review_risk {r:.2} >= 3.0 -> review Frontier, no frontier reviewer from another provider -> Standard"
+                    )
+                }),
+        )
+    }
+
     /// The implementer's provider, which the reviewer should differ from (spec §3.2).
     async fn implementer_provider(&self, id: i64) -> Result<Option<String>, PipelineError> {
         let runs = self.store.stage_runs(id).await?;
@@ -1816,11 +1859,17 @@ Please reply with what should happen, what happens instead, and how to reproduce
         watch: bool,
         mut slot: Slot<'_>,
     ) -> Result<Option<Result<Outcome, String>>, PipelineError> {
+        let mut why = self.route_why(model);
+        if stage == "review"
+            && let Some(note) = self.jev_frontier_downgrade(task, Stage::Review).await?
+        {
+            why = format!("{why}; {note}");
+        }
         self.store
             .record_output(
                 task.id,
                 "route",
-                &json!({"stage": stage, "model": model.id, "why": self.route_why(model)}),
+                &json!({"stage": stage, "model": model.id, "why": why}),
             )
             .await?;
         let started = now();
