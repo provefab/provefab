@@ -988,9 +988,14 @@ pub async fn doctor(
                 names.join(", ")
             );
             // Risk policy §7 (option 1): a same-provider frontier model never
-            // reviews its own provider's work, so it does not count.
-            if !crate::risk::cross_provider_frontier(&config.models) {
-                detail.push_str("; warning: no frontier model from a second provider, risky changes keep a standard cross-provider reviewer");
+            // reviews its own provider's work, so name each provider whose
+            // risky changes keep a standard reviewer.
+            let lone = crate::risk::providers_without_cross_frontier(&config.models);
+            if !lone.is_empty() {
+                detail.push_str(&format!(
+                    "; warning: risky changes implemented on {} keep a standard reviewer (no frontier model on another provider)",
+                    lone.join(", ")
+                ));
             }
             checks.push(Check {
                 name: format!("risk {}", repo.slug),
@@ -1220,7 +1225,7 @@ checks = ["./scripts/check-migration.sh"]
         assert!(
             risk.detail.starts_with("5 categories: ")
                 && risk.detail.ends_with(
-                    "; checks: 1; warning: no frontier model from a second provider, risky changes keep a standard cross-provider reviewer"
+                    "; checks: 1; warning: risky changes implemented on claude-code keep a standard reviewer (no frontier model on another provider)"
                 ),
             "{risk:?}"
         );
@@ -1228,6 +1233,19 @@ checks = ["./scripts/check-migration.sh"]
         two.models.push(
             toml::from_str("id = \"x\"\nworker = \"codex\"\nmodel = \"gpt\"\ntier = \"frontier\"")
                 .unwrap(),
+        );
+        // The only frontier model is codex's own: codex still has no reviewer.
+        let checks = doctor(&tools, &two, &Paths::new(d), None).await;
+        let risk = checks.iter().find(|c| c.name == "risk o/r").unwrap();
+        assert!(
+            risk.detail.ends_with("implemented on codex keep a standard reviewer (no frontier model on another provider)"),
+            "{risk:?}"
+        );
+        two.models.push(
+            toml::from_str(
+                "id = \"y\"\nworker = \"claude-code\"\nmodel = \"opus\"\ntier = \"frontier\"",
+            )
+            .unwrap(),
         );
         let checks = doctor(&tools, &two, &Paths::new(d), None).await;
         let risk = checks.iter().find(|c| c.name == "risk o/r").unwrap();

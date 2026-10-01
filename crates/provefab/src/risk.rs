@@ -288,12 +288,24 @@ pub fn risky_review_tier(
     .then_some(Tier::Frontier)
 }
 
-/// Some frontier model differs in provider from some standard model: a
-/// risky change implemented on standard can get a frontier reviewer from
-/// another provider (`provefab doctor`).
-pub fn cross_provider_frontier(catalog: &[ModelEntry]) -> bool {
-    let of = |t: Tier| catalog.iter().filter(move |m| m.tier == t);
-    of(Tier::Frontier).any(|f| of(Tier::Standard).any(|s| s.provider_key() != f.provider_key()))
+/// Providers, in catalog order, with no frontier model on another provider: a
+/// risky change implemented on one of them keeps a standard reviewer
+/// (`provefab doctor`). This matches `risky_review_tier`.
+pub fn providers_without_cross_frontier(catalog: &[ModelEntry]) -> Vec<String> {
+    let mut lone: Vec<String> = Vec::new();
+    for m in catalog {
+        let key = m.provider_key();
+        if lone.contains(&key) {
+            continue;
+        }
+        let has_cross = catalog
+            .iter()
+            .any(|f| f.tier == Tier::Frontier && f.provider_key() != key);
+        if !has_cross {
+            lone.push(key);
+        }
+    }
+    lone
 }
 
 #[cfg(test)]
@@ -463,13 +475,39 @@ mod tests {
         assert_eq!(risky_review_tier(&other, claude, false), None);
         // No implement run recorded: any frontier model differs from it.
         assert_eq!(risky_review_tier(&same, None, true), Some(Tier::Frontier));
-        assert!(!cross_provider_frontier(&same[..2]));
-        assert!(!cross_provider_frontier(&[
-            std_claude.clone(),
-            top_claude.clone()
-        ]));
-        assert!(cross_provider_frontier(&same));
-        assert!(cross_provider_frontier(&other));
+    }
+
+    #[test]
+    fn providers_without_cross_frontier_are_named_in_catalog_order() {
+        let std_claude = model("s", "claude-code", "standard");
+        let std_codex = model("c", "codex", "standard");
+        let top_claude = model("t", "claude-code", "frontier");
+        let top_codex = model("x", "codex", "frontier");
+        assert_eq!(
+            providers_without_cross_frontier(&[
+                std_claude.clone(),
+                std_codex.clone(),
+                top_claude.clone()
+            ]),
+            ["claude-code"]
+        );
+        assert!(
+            providers_without_cross_frontier(&[
+                std_claude.clone(),
+                std_codex.clone(),
+                top_claude,
+                top_codex.clone()
+            ])
+            .is_empty()
+        );
+        assert_eq!(
+            providers_without_cross_frontier(&[model("c", "codex", "standard"), top_codex]),
+            ["codex"]
+        );
+        assert_eq!(
+            providers_without_cross_frontier(&[std_claude, std_codex]),
+            ["claude-code", "codex"]
+        );
     }
 
     #[test]

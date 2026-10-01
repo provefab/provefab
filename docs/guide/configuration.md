@@ -154,7 +154,7 @@ Category names use lowercase letters, digits and `-`. `unknown` and `none` are r
 - `<name> is disabled`: the same built-in is in `disable` and in `categories`.
 - An unknown key under `[repos.risk]` or a category table is refused too.
 
-`provefab doctor` prints one `risk <slug>` line per repository: the category count and names, and how many checks were added. It ends with `; warning: no frontier model from a second provider, risky changes keep a standard cross-provider reviewer` when no frontier model has a provider different from one of your standard models. See [Usage](usage.md#risk-aware-changes) for what happens to a risky change.
+`provefab doctor` prints one `risk <slug>` line per repository: the category count and names, and how many checks were added. It ends with `; warning: risky changes implemented on <providers> keep a standard reviewer (no frontier model on another provider)` when, for one or more providers in your catalog, no frontier model is on another provider. Providers are listed in catalog order and comma-separated (for example `claude-code`, `codex`, `pi:<provider>`). See [Usage](usage.md#risk-aware-changes) for what happens to a risky change.
 
 ## `[limits]`
 
