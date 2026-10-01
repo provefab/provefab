@@ -573,9 +573,14 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
                 (file, None) if !file.is_empty() => file.clone(),
                 _ => "-".to_string(),
             };
+            let rule = f
+                .rule
+                .as_deref()
+                .map(|r| format!("{r} · "))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "  {} · {} · {place} · round {} · {}",
+                "  {} · {rule}{} · {place} · round {} · {}",
                 f.key,
                 f.severity,
                 f.round,
@@ -717,7 +722,7 @@ pub async fn export(
         line(serde_json::json!({
             "type": "finding", "task": t.id, "key": f.key, "pass": f.pass,
             "round": f.round, "reviewer_model": f.reviewer_model,
-            "severity": f.severity, "file": f.file, "line": f.line,
+            "severity": f.severity, "file": f.file, "line": f.line, "rule": f.rule,
             "text": if with_text { serde_json::Value::String(f.text.clone()) } else { redact_text(&f.text) },
             "disposition": d.map(|d| d.as_str()),
         }));

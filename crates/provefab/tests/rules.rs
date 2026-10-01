@@ -258,3 +258,106 @@ async fn a_rerun_prepare_on_a_moved_base_reloads_the_rules() {
     assert_eq!(loaded.len(), 2, "{:?}", kinds(&ev));
     assert_eq!(loaded[1].payload["numbers"], json!([5]));
 }
+
+/// A reviewer approving with three minor findings: one citing R2 (given to
+/// the review), one citing R3 (not given: its path is not changed), one
+/// citing nothing.
+fn citing(
+    m: &ModelEntry,
+    req: &StageRequest,
+    tx: &UnboundedSender<WorkerEvent>,
+) -> Option<StageResult> {
+    if stage_of(&req.prompt) != "review" {
+        return happy(m, req, tx);
+    }
+    done(Some(json!({"verdict": "approve", "findings": [
+        {"file": "feature.txt", "line": 1, "severity": "minor", "text": "no newline at the end", "rule": "r2"},
+        {"file": "feature.txt", "line": 1, "severity": "minor", "text": "an API error", "rule": "R3"},
+        {"file": "feature.txt", "line": null, "severity": "minor", "text": "naming", "rule": null}
+    ]})))
+}
+
+#[tokio::test]
+async fn a_finding_citing_a_given_rule_is_stored_and_shown_everywhere() {
+    let f = fixture(&["test -f feature.txt"]);
+    commit_rules(&f, RULES);
+    let p = pipeline(
+        &f,
+        Box::new(citing),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let review = prompt_of(&p.runner.calls(), "review");
+    assert!(review.contains(provefab::rules::REVIEW_ASK), "{review}");
+    let rules: Vec<(String, Option<String>)> = p
+        .store
+        .findings(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.key, f.rule))
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            ("F1".to_string(), Some("R2".to_string())),
+            ("F2".to_string(), None),
+            ("F3".to_string(), None)
+        ]
+    );
+    let body = p.hub.prs.lock().unwrap()[0].3.clone();
+    assert!(body.contains("\nRules: R1, R2\n"), "{body}");
+    assert!(
+        body.contains("- F1 · R2 · minor · `feature.txt:1` · no newline at the end ("),
+        "{body}"
+    );
+    assert!(
+        body.contains("- F2 · minor · `feature.txt:1` · an API error ("),
+        "{body}"
+    );
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    assert!(log.contains("F1 · R2 · minor · feature.txt:1"), "{log}");
+    let export = provefab::commands::export(&p.store, None, None, false)
+        .await
+        .unwrap();
+    let f1 = export
+        .lines()
+        .find(|l| l.contains("\"type\":\"finding\"") && l.contains("\"key\":\"F1\""))
+        .unwrap();
+    assert!(f1.contains("\"rule\":\"R2\""), "{f1}");
+}
+
+/// Spec §10 non-regression: no rules file, no rule anywhere.
+#[tokio::test]
+async fn without_rules_the_pr_body_and_notes_are_unchanged() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(citing),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let review = prompt_of(&p.runner.calls(), "review");
+    assert!(!review.contains(provefab::rules::REVIEW_ASK), "{review}");
+    assert!(
+        p.store
+            .findings(id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|f| f.rule.is_none()),
+        "a rule the review was not given is dropped"
+    );
+    let body = p.hub.prs.lock().unwrap()[0].3.clone();
+    assert!(!body.contains("Rules:"), "{body}");
+    assert!(
+        body.contains("- F1 · minor · `feature.txt:1` · no newline at the end ("),
+        "{body}"
+    );
+}

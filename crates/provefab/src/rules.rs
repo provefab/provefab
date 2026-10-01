@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::agents::StageRunner;
@@ -27,6 +27,8 @@ pub const MAX_TEXT: usize = 2000;
 pub const BUDGET: usize = 12_000;
 /// The block's title in every prompt (spec §5).
 pub const TITLE: &str = "Repository rules (approved by the maintainers of this repository)";
+/// What the review prompt adds after the block when it carries rules (spec §5).
+pub const REVIEW_ASK: &str = "When the change breaks one of these rules, report it as a finding with `rule` set to that rule's number (for example \"R3\"). Every other finding has `rule` null.\n";
 
 /// One rule of the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +376,31 @@ where
         }
         self.load_rules(task, repo, &base).await
     }
+
+    /// `R1, R3`: the rules the current round's review was given (plan
+    /// decision 10), `None` when it was given none.
+    pub(crate) async fn rules_given(
+        &self,
+        task: &TaskRow,
+    ) -> Result<Option<String>, PipelineError> {
+        let (pass, round) = (u64::from(pass_of(task)), u64::from(task.review_rounds));
+        let given = self
+            .store
+            .recent_outputs(task.id, "rules_given", u32::MAX)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|v| v["pass"].as_u64() == Some(pass) && v["round"].as_u64() == Some(round));
+        Ok(given.and_then(|v| {
+            let names: Vec<String> = v["numbers"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|n| format!("R{n}"))
+                .collect();
+            (!names.is_empty()).then(|| names.join(", "))
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -617,5 +644,43 @@ mod tests {
             invalid[0].payload["reason"],
             "could not read .provefab/rules.md at the base commit"
         );
+    }
+
+    /// The PR's `Rules:` line reads the current pass and round only: a later
+    /// round that selected no rules records nothing and shows no line, and a
+    /// round recorded twice reads its latest record.
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn rules_given_reads_the_current_pass_and_round_only() {
+        use crate::testkit::{FakeHub, FakeOracle, fixture, happy, pipeline, queue};
+        let f = fixture(&["true"]);
+        let p = pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await;
+        let id = queue(&p).await;
+        let task = p.store.task(id).await.unwrap().unwrap();
+        assert_eq!(p.rules_given(&task).await.unwrap(), None);
+        let (pass, round) = (pass_of(&task), task.review_rounds);
+        for numbers in [json!([1]), json!([1, 3])] {
+            p.store
+                .record_output(
+                    id,
+                    "rules_given",
+                    &json!({"pass": pass, "round": round, "numbers": numbers}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            p.rules_given(&task).await.unwrap().as_deref(),
+            Some("R1, R3")
+        );
+        p.store.bump_review_rounds(id).await.unwrap();
+        let later = p.store.task(id).await.unwrap().unwrap();
+        assert_eq!(p.rules_given(&later).await.unwrap(), None);
     }
 }

@@ -245,7 +245,12 @@ fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
             } else {
                 String::new()
             };
-            format!("- {key}{sev} · `{}{at}` · {}", f.file, f.text)
+            let rule = f
+                .rule
+                .as_deref()
+                .map(|r| format!("{r} · "))
+                .unwrap_or_default();
+            format!("- {key}{rule}{sev} · `{}{at}` · {}", f.file, f.text)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -366,8 +371,13 @@ fn review_notes(review: &ReviewOutput, final_round: &[FindingRow]) -> Option<Str
         .iter()
         .map(|f| {
             let at = f.line.map(|l| format!(":{l}")).unwrap_or_default();
+            let rule = f
+                .rule
+                .as_deref()
+                .map(|r| format!("{r} · "))
+                .unwrap_or_default();
             format!(
-                "- {} · {} · `{}{at}` · {} ({})",
+                "- {} · {rule}{} · `{}{at}` · {} ({})",
                 f.key, f.severity, f.file, f.text, f.reviewer_model
             )
         })
@@ -2418,7 +2428,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
             .filter(|f| f.severity == Severity::Blocking)
             .map(|f| {
                 let at = f.line.map(|l| format!(":{l}")).unwrap_or_default();
-                format!("- {}{at} {}", f.file, f.text)
+                let rule = f.rule.map(|r| format!(" ({r})")).unwrap_or_default();
+                format!("- {}{at}{rule} {}", f.file, f.text)
             })
             .collect();
         if !blocking.is_empty() {
@@ -2969,6 +2980,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let selected = crate::rules::select(&rules, Stage::Review, &changed);
         let (rules_block, omitted) = crate::rules::render(&selected, crate::rules::BUDGET);
         let given = crate::rules::numbers(&selected, omitted);
+        let rules_block = if given.is_empty() {
+            rules_block
+        } else {
+            format!("{rules_block}{}", crate::rules::REVIEW_ASK)
+        };
         if !given.is_empty() {
             self.store
                 .record_output(
@@ -3020,6 +3036,17 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Ok(r) => r,
             Err(reason) => return self.stage_failed(task, repo, "review", &reason).await,
         };
+        // Spec §5: a `rule` must name a rule this review was given; any other
+        // value is dropped and the finding stays (plan decision 9).
+        let mut review = review;
+        for f in &mut review.findings {
+            f.rule = f
+                .rule
+                .as_deref()
+                .and_then(crate::rules::rule_number)
+                .filter(|n| given.contains(n))
+                .map(|n| format!("R{n}"));
+        }
         let value = serde_json::to_value(&review).unwrap_or(Value::Null);
         let keys = self
             .store
@@ -3278,6 +3305,10 @@ Please reply with what should happen, what happens instead, and how to reproduce
             for (c, names) in risk_checks(&policy, &detected, &gates) {
                 b.push_str(&format!("- `{c}`: passed (risk: {})\n", names.join(", ")));
             }
+        }
+        // Spec §5: the rules the round's review was given; nothing without.
+        if let Some(given) = self.rules_given(task).await? {
+            b.push_str(&format!("\nRules: {given}\n"));
         }
         // Only a bugfix runs the repro before the fix, and only a failure of the
         // check itself (not a missing script) reproduces: never claim otherwise.
@@ -3654,6 +3685,43 @@ mod tests {
             format!(
                 "## Risk\n\n- unknown: the changed files could not be computed · reviewer: frontier{NO}\n\n"
             )
+        );
+    }
+
+    #[test]
+    fn review_notes_and_findings_text_show_the_rule_a_finding_cites() {
+        let review = ReviewOutput {
+            verdict: ReviewVerdict::Changes,
+            findings: vec![Finding {
+                file: "src/a.rs".into(),
+                line: Some(4),
+                severity: Severity::Blocking,
+                text: "uses anyhow".into(),
+                rule: Some("R3".into()),
+            }],
+        };
+        assert_eq!(
+            findings_text(&review, &["F2".to_string()]),
+            "- F2 · R3 · blocking · `src/a.rs:4` · uses anyhow"
+        );
+        let row = FindingRow {
+            id: 2,
+            task_id: 1,
+            key: "F2".into(),
+            pass: 1,
+            round: 0,
+            reviewer_model: "std-codex".into(),
+            severity: "blocking".into(),
+            file: "src/a.rs".into(),
+            line: Some(4),
+            text: "uses anyhow".into(),
+            rule: Some("R3".into()),
+            event_id: 1,
+        };
+        let notes = review_notes(&review, &[row]).unwrap();
+        assert!(
+            notes.contains("- F2 · R3 · blocking · `src/a.rs:4` · uses anyhow (std-codex)"),
+            "{notes}"
         );
     }
 
