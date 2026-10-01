@@ -31,7 +31,9 @@ const ISSUE: &str = concat!(
 );
 const COMMENTS: &str = "query($id: String!, $after: String) { issue(id: $id) { comments(first: 100, after: $after) { nodes { body createdAt user { id app } } pageInfo { hasNextPage endCursor } } } }";
 const COMMENT: &str = "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }";
-const UPDATE_LABELS: &str = "mutation($id: String!, $ids: [String!]!) { issueUpdate(id: $id, input: { labelIds: $ids }) { success } }";
+/// Added and removed ids, never the whole set (`labelIds`): a label a person
+/// adds between our read and this update survives.
+const UPDATE_LABELS: &str = "mutation($id: String!, $added: [String!]!, $removed: [String!]!) { issueUpdate(id: $id, input: { addedLabelIds: $added, removedLabelIds: $removed }) { success } }";
 const FIND_LABEL: &str = "query($name: String!) { issueLabels(filter: { name: { eq: $name } }) { nodes { id name team { id } } } }";
 const CREATE_LABEL: &str = "mutation($input: IssueLabelCreateInput!) { issueLabelCreate(input: $input) { success issueLabel { id } } }";
 const TEAM: &str = "query($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id } } }";
@@ -364,11 +366,12 @@ impl Tracker for Linear {
                 ))
             })
             .collect();
-        let mut ids: Vec<String> = current
+        let removed: Vec<String> = current
             .iter()
-            .filter(|(_, name)| !remove.contains(&name.as_str()))
+            .filter(|(_, name)| remove.contains(&name.as_str()))
             .map(|(id, _)| id.clone())
             .collect();
+        let mut added: Vec<String> = Vec::new();
         for name in add {
             if current.iter().any(|(_, n)| n == name) {
                 continue;
@@ -377,12 +380,18 @@ impl Tracker for Linear {
                 Some(id) => id,
                 None => self.create_label(name, "ededed", "Provefab").await?,
             };
-            if !ids.contains(&id) {
-                ids.push(id);
+            if !added.contains(&id) {
+                added.push(id);
             }
         }
+        if added.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
         let d = self
-            .query(UPDATE_LABELS, json!({"id": issue["id"], "ids": ids}))
+            .query(
+                UPDATE_LABELS,
+                json!({"id": issue["id"], "added": added, "removed": removed}),
+            )
             .await?;
         succeeded(&d, "issueUpdate")
     }
@@ -548,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_labels_resolves_names_and_sets_the_label_ids() {
+    async fn edit_labels_adds_and_removes_by_id_without_replacing_the_set() {
         let server = MockServer::start().await;
         on(
             &server,
@@ -566,7 +575,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(body_string_contains("issueUpdate"))
             .and(body_partial_json(
-                json!({"variables": {"id": "uuid-7", "ids": ["l-in-pr"]}}),
+                json!({"variables": {"id": "uuid-7", "added": ["l-in-pr"], "removed": ["l-trigger"]}}),
             ))
             .respond_with(data(json!({"issueUpdate": {"success": true}})))
             .expect(1)
@@ -576,6 +585,44 @@ mod tests {
             .edit_labels("acme/web", 7, &["provefab:in-pr"], &["provefab"])
             .await
             .unwrap();
+        let updates: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8(r.body.clone()).unwrap())
+            .filter(|b| b.contains("issueUpdate"))
+            .collect();
+        // A label a person adds meanwhile survives: the set is never replaced.
+        assert!(
+            updates.iter().all(|b| !b.contains("labelIds:")),
+            "{updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_labels_sends_nothing_when_there_is_nothing_to_change() {
+        let server = MockServer::start().await;
+        on(
+            &server,
+            "issue(id: $id) { id identifier",
+            data(json!({"issue": node(7, "started")})),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("issueUpdate"))
+            .respond_with(data(json!({"issueUpdate": {"success": true}})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let l = linear(&server);
+        l.edit_labels("acme/web", 7, &[], &[]).await.unwrap();
+        // Already there, and not there: no change to send.
+        l.edit_labels("acme/web", 7, &["provefab"], &["provefab:failed"])
+            .await
+            .unwrap();
+        let sent = server.received_requests().await.unwrap().len();
+        assert_eq!(sent, 1, "only the read of the second call");
     }
 
     #[tokio::test]
