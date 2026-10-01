@@ -27,6 +27,7 @@ pub mod record;
 pub mod risk;
 pub mod router;
 pub mod routing;
+pub mod rules;
 pub mod scheduler;
 pub mod service;
 pub mod stage;

@@ -1441,7 +1441,7 @@ checks = ["./scripts/check-migration.sh"]
         let risk = checks.iter().find(|c| c.name == "risk o/r").unwrap();
         assert!(risk.ok, "{risk:?}");
         assert!(
-            risk.detail.starts_with("5 categories: ")
+            risk.detail.starts_with("6 categories: ")
                 && risk.detail.ends_with(
                     "; checks: 1; warning: risky changes implemented on claude-code keep a standard reviewer (no frontier model on another provider)"
                 ),

@@ -82,7 +82,7 @@ fn seg_match(p: &[u8], s: &[u8]) -> bool {
     }
 }
 
-/// The five built-in categories (spec §3).
+/// The six built-in categories (risk policy spec §3, repository rules spec §6).
 pub fn builtins() -> Vec<Category> {
     let cat = |name: &str, paths: &[&str]| Category {
         name: name.into(),
@@ -123,7 +123,20 @@ pub fn builtins() -> Vec<Category> {
             "secrets-config",
             &["**/.env*", "**/*.pem", "**/*.key", "**/*secret*"],
         ),
+        cat("rules", &[crate::rules::PATH]),
     ]
+}
+
+/// Why a path pattern can never match: changed paths are relative and
+/// normalised. Shared with repository rules' `paths:` (rules spec §3).
+pub const UNMATCHABLE: &str =
+    "must be relative, without \"./\", a trailing \"/\" or empty segments";
+
+pub fn unmatchable(pattern: &str) -> bool {
+    pattern.starts_with('/')
+        || pattern.starts_with("./")
+        || pattern.ends_with('/')
+        || pattern.contains("//")
 }
 
 // `none` is Pro's calibration bucket for "no risk detected"; a category of
@@ -157,13 +170,8 @@ pub fn resolve(cfg: Option<&RiskConfig>) -> Result<Policy, String> {
         if cc.paths.iter().any(|p| p.trim().is_empty()) {
             return Err(format!("{name}: empty path"));
         }
-        // Changed paths are relative and normalised, so these can never match.
-        if let Some(p) = cc.paths.iter().find(|p| {
-            p.starts_with('/') || p.starts_with("./") || p.ends_with('/') || p.contains("//")
-        }) {
-            return Err(format!(
-                "{name}: path \"{p}\" must be relative, without \"./\", a trailing \"/\" or empty segments"
-            ));
+        if let Some(p) = cc.paths.iter().find(|p| unmatchable(p)) {
+            return Err(format!("{name}: path \"{p}\" {UNMATCHABLE}"));
         }
         if cc.checks.iter().any(|c| c.trim().is_empty()) {
             return Err(format!("{name}: empty check"));
@@ -360,6 +368,7 @@ mod tests {
                 "migrations",
                 "infrastructure",
                 "secrets-config",
+                "rules",
                 "auth"
             ]
         );
@@ -519,5 +528,19 @@ mod tests {
             &["migrations/1.sql".to_string(), "src/auth/x.rs".to_string()],
         );
         assert_eq!(p.checks(&d), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn the_rules_file_is_its_own_builtin_category() {
+        let p = resolve(None).unwrap();
+        let rules = [".provefab/rules.md".to_string()];
+        let d = classify(&p, &rules);
+        assert_eq!(
+            d.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
+            ["rules"]
+        );
+        assert!(p.needs_frontier(&d));
+        let off: RiskConfig = toml::from_str("disable = [\"rules\"]").unwrap();
+        assert!(classify(&resolve(Some(&off)).unwrap(), &rules).is_empty());
     }
 }

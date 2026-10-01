@@ -40,6 +40,7 @@ async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
             "provefab:risk-migrations",
             "provefab:risk-infrastructure",
             "provefab:risk-secrets-config",
+            "provefab:risk-rules",
             "provefab:risk-unknown"
         ]
     );
