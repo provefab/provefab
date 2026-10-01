@@ -56,6 +56,15 @@ impl CodexWorker {
         });
         // Execpolicy `.rules` files from the user or the repo must not widen what runs.
         push("--ignore-rules");
+        // Without tools, Codex's built-in web search and image viewer stay
+        // off as well (codex-rs: `web_search = "disabled"` registers no
+        // search tool; `features.view_image = false` no image viewer).
+        if req.tools == ToolProfile::NoTools {
+            for setting in ["web_search=\"disabled\"", "features.view_image=false"] {
+                push("-c");
+                push(setting);
+            }
+        }
         if req.output_schema.is_some() {
             a.push("--output-schema".into());
             a.push(req.session_dir.join("output-schema.json").into_os_string());
@@ -338,10 +347,17 @@ mod tests {
     /// refuses it; its sandbox stays read-only behind that.
     #[test]
     fn no_tools_is_read_only_and_tells_the_guard() {
-        let req = req(ToolProfile::NoTools, true);
-        let args = joined(worker().args(&req, "Answer"));
+        let none = req(ToolProfile::NoTools, true);
+        let args = joined(worker().args(&none, "Answer"));
         assert!(args.contains("--sandbox read-only"), "{args}");
-        let cmd = worker().command(&req, "Answer");
+        // Final review: Codex's own web search and image viewer stay off too.
+        assert!(
+            args.contains("-c web_search=\"disabled\" -c features.view_image=false"),
+            "{args}"
+        );
+        let review = joined(worker().args(&req(ToolProfile::ReadOnly, true), "R"));
+        assert!(!review.contains("web_search"), "{review}");
+        let cmd = worker().command(&none, "Answer");
         let set = cmd
             .as_std()
             .get_envs()
