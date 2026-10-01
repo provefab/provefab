@@ -373,10 +373,13 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SHORT_RETRY: u64 = 30;
 
 pub fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    let builder = reqwest::Client::builder().timeout(HTTP_TIMEOUT);
+    // Building a client reads the macOS system proxy settings, which takes
+    // seconds when many test processes do it at once and slowed the whole
+    // suite. Tests only call local mock servers; production keeps the proxy.
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// `text` with every credential replaced: an API may echo what it was sent.
