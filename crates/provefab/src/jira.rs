@@ -64,7 +64,12 @@ impl Jira {
         url: reqwest::Url,
         body: Option<&Value>,
     ) -> Result<String, ForgeError> {
-        let secrets = [self.auth.token.as_str(), self.auth.email.as_str()];
+        let basic = self.auth.basic();
+        let secrets = [
+            self.auth.token.as_str(),
+            self.auth.email.as_str(),
+            basic.as_str(),
+        ];
         let (status, retry_after, text) = send(SERVICE, &secrets, || {
             let r = self
                 .http
@@ -130,7 +135,8 @@ impl Jira {
 
 /// A person's comment; an app's (`accountType = "app"`) is skipped (plan decision 4).
 fn comment_of(c: &Value) -> Option<Comment> {
-    if c["author"]["accountType"].as_str() == Some("app") {
+    let account_type = c["author"]["accountType"].as_str();
+    if account_type == Some("app") {
         return None;
     }
     let created = c["created"].as_str()?;
@@ -140,8 +146,15 @@ fn comment_of(c: &Value) -> Option<Comment> {
     };
     Some(Comment {
         author: c["author"]["accountId"].as_str()?.to_string(),
-        // Only workspace members can comment on Jira (spec §8, decision 9).
-        association: "MEMBER".into(),
+        // A licensed account is a member; a Service Management customer (or an
+        // account of unknown type) is not, and answers only as the reporter
+        // (spec §8, decision 9 as amended in review).
+        association: if account_type == Some("atlassian") {
+            "MEMBER"
+        } else {
+            "NONE"
+        }
+        .into(),
         body: if c["body"].is_object() {
             from_adf(&c["body"])
         } else {
@@ -719,6 +732,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_atlassian_accounts_are_members() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-7/comment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "startAt": 0, "maxResults": 100, "total": 3,
+                "comments": [
+                    {"author": {"accountId": "acc-bob", "accountType": "atlassian"}, "body": adf("member"), "created": "2026-10-01T10:00:00.000+0200"},
+                    {"author": {"accountId": "acc-cust", "accountType": "customer"}, "body": adf("customer"), "created": "2026-10-01T10:01:00.000+0200"},
+                    {"author": {"accountId": "acc-anon"}, "body": adf("unknown"), "created": "2026-10-01T10:02:00.000+0200"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let comments = jira(&server).comments("acme/api", 7).await.unwrap();
+        let assoc: Vec<_> = comments
+            .iter()
+            .map(|c| (c.body.as_str(), c.association.as_str()))
+            .collect();
+        assert_eq!(
+            assoc,
+            [
+                ("member", "MEMBER"),
+                ("customer", "NONE"),
+                ("unknown", "NONE")
+            ]
+        );
+        // A customer who is not the reporter cannot answer; the reporter can.
+        let replies = new_replies(&comments, "acc-alice", None);
+        assert_eq!(
+            replies.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(),
+            ["member"]
+        );
+        let replies = new_replies(&comments, "acc-cust", None);
+        assert_eq!(
+            replies.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(),
+            ["member", "customer"]
+        );
+    }
+
+    #[tokio::test]
     async fn issue_and_issue_open_read_one_ticket() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -751,7 +805,9 @@ mod tests {
 
     #[tokio::test]
     async fn errors_are_permanent_or_transient_and_never_hold_credentials() {
-        let echo = json!({"errorMessages": [format!("nothing for {EMAIL} {SECRET}")]});
+        // The API may echo the Basic header value too.
+        let basic = "Ym90QGFjbWUudGVzdDp0b2stU0VDUkVULTEyMw==";
+        let echo = json!({"errorMessages": [format!("nothing for {EMAIL} {SECRET} {basic}")]});
         for (n, status, retry, permanent) in [
             (1u64, 401u16, None, true),
             (2, 403, None, true),
@@ -771,7 +827,10 @@ mod tests {
             let err = jira(&server).issue("acme/api", n).await.unwrap_err();
             assert_eq!(err.is_permanent(), permanent, "{status}: {err}");
             let shown = format!("{err} {err:?}");
-            assert!(!shown.contains(SECRET) && !shown.contains(EMAIL), "{shown}");
+            assert!(
+                !shown.contains(SECRET) && !shown.contains(EMAIL) && !shown.contains(basic),
+                "{shown}"
+            );
         }
     }
 

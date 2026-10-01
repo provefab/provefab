@@ -118,14 +118,39 @@ pub struct JiraAuth {
     pub token: String,
 }
 
+impl JiraAuth {
+    /// The value after `Basic ` in the Authorization header: base64 of
+    /// `email:token`. A secret too, so errors redact it.
+    pub fn basic(&self) -> String {
+        base64(format!("{}:{}", self.email, self.token).as_bytes())
+    }
+}
+
+/// Neither part is shown: the e-mail names the account the token unlocks.
 impl std::fmt::Debug for JiraAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "JiraAuth {{ email: {:?}, token: <redacted> }}",
-            self.email
-        )
+        f.write_str("JiraAuth { email: <redacted>, token: <redacted> }")
     }
+}
+
+/// Standard base64 with padding (RFC 4648), for [`JiraAuth::basic`] only.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// `security` with `args`: its stdout (and stderr, for attribute listings) on
@@ -416,7 +441,11 @@ pub fn http_error(
         _ => "request refused",
     };
     let mut message = what.to_string();
-    let said = server_messages(body);
+    // Redacted before it is cut, so a cut never leaves part of a secret.
+    let said: String = redact(&server_messages(body), secrets)
+        .chars()
+        .take(300)
+        .collect();
     if !said.is_empty() {
         message.push_str(": ");
         message.push_str(&said);
@@ -457,12 +486,13 @@ fn server_messages(body: &str) -> String {
             .flatten()
             .filter_map(|e| e["message"].as_str().map(str::to_string)),
     );
-    out.join("; ").chars().take(300).collect()
+    out.join("; ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::PathBuf;
 
     fn fake_security(dir: &Path, name: &str, script: &str) -> PathBuf {
@@ -653,5 +683,38 @@ esac"#;
         }
         let e = http_error("jira", 429, Some(120), "", &secrets);
         assert!(e.to_string().contains("retry after 120 s"), "{e}");
+    }
+
+    #[test]
+    fn secrets_are_redacted_before_the_message_is_cut() {
+        let secret = "tok-SECRET-123";
+        let body = json!({"errorMessages": [format!("{}{secret}", "x".repeat(295))]}).to_string();
+        let shown = http_error("jira", 400, None, &body, &[secret]).to_string();
+        for n in 3..=secret.len() {
+            assert!(!shown.contains(&secret[..n]), "{n}: {shown}");
+        }
+    }
+
+    #[test]
+    fn jira_auth_hides_both_parts_and_its_basic_value_is_the_header() {
+        let a = JiraAuth {
+            email: "bot@acme.test".into(),
+            token: "tok-SECRET-123".into(),
+        };
+        let shown = format!("{a:?}");
+        assert!(
+            !shown.contains("bot@acme.test") && !shown.contains("tok-SECRET-123"),
+            "{shown}"
+        );
+        assert_eq!(a.basic(), "Ym90QGFjbWUudGVzdDp0b2stU0VDUkVULTEyMw==");
+        for (raw, b64) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+        ] {
+            assert_eq!(base64(raw.as_bytes()), b64, "{raw}");
+        }
     }
 }
