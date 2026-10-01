@@ -534,13 +534,22 @@ const TOKEN_PREFIXES: &[&str] = &[
     "ghr_",
     "github_pat_",
     "glpat-",
-    "xoxb-",
-    "xoxp-",
+    // Every Slack kind: xoxa, xoxb, xoxe, xoxp, xoxr, xoxs.
+    "xox",
     "sk-",
     "akia",
 ];
 /// What the name of an assigned credential holds (`GH_TOKEN=...`).
 const CREDENTIAL_NAMES: &[&str] = &["token", "secret", "password", "passwd", "key", "auth"];
+/// Query parameters of a URL that carry a credential (`?api_key=...`).
+const CREDENTIAL_PARAMS: &[&str] = &[
+    "token",
+    "key",
+    "secret",
+    "password",
+    "access_token",
+    "api_key",
+];
 
 fn looks_like_credential(word: &str) -> bool {
     let w = word.trim_matches(|c: char| "\"'`()[]{}<>,;.".contains(c));
@@ -558,6 +567,13 @@ fn looks_like_credential(word: &str) -> bool {
     let userinfo = lower
         .split_once("://")
         .is_some_and(|(_, rest)| rest.split('/').next().is_some_and(|h| h.contains('@')));
+    let query = lower.contains("://")
+        && lower.split_once('?').is_some_and(|(_, q)| {
+            q.split(['&', '#']).any(|pair| {
+                pair.split_once('=')
+                    .is_some_and(|(k, v)| !v.is_empty() && CREDENTIAL_PARAMS.contains(&k))
+            })
+        });
     // Long, opaque and mixed case: a key, not a word or a (lowercase) sha.
     let opaque = w.len() >= 32
         && w.chars()
@@ -565,7 +581,7 @@ fn looks_like_credential(word: &str) -> bool {
         && w.chars().any(|c| c.is_ascii_uppercase())
         && w.chars().any(|c| c.is_ascii_lowercase())
         && w.chars().any(|c| c.is_ascii_digit());
-    prefixed || assigned || userinfo || opaque
+    prefixed || assigned || userinfo || query || opaque
 }
 
 impl<R, O, H> Maintenance<'_, R, O, H>
@@ -1263,6 +1279,20 @@ mod tests {
                 "x Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MEFCQ0RFRg y",
                 "x <redacted> y",
             ),
+            // Final review M8: credentials in a URL's query, every Slack kind.
+            (
+                "see https://api.x.com/v1?token=abc123 now",
+                "see <redacted> now",
+            ),
+            ("GET https://x.com/a?page=2&api_key=zzz", "GET <redacted>"),
+            ("https://x.com/?access_token=t", "<redacted>"),
+            ("https://x.com/?Secret=s&x=1", "<redacted>"),
+            ("https://x.com/?key=k", "<redacted>"),
+            ("https://x.com/?password=p", "<redacted>"),
+            ("slack xoxa-2-123456789012 here", "slack <redacted> here"),
+            ("xoxr-123456789012", "<redacted>"),
+            ("xoxs-123456789012", "<redacted>"),
+            ("xoxe-1-123456789012", "<redacted>"),
         ] {
             assert_eq!(redact_credentials(said), want, "{said}");
         }
@@ -1272,6 +1302,8 @@ mod tests {
             "commit 0123456789abcdef0123456789abcdef01234567 broke it",
             "the key: is the domain's word\n\n  indented",
             "see https://github.com/o/r/pull/41",
+            "see https://github.com/o/r/pulls?q=is%3Aopen&page=2",
+            "https://x.com/?token=",
         ] {
             assert_eq!(redact_credentials(prose), prose);
         }
