@@ -1073,3 +1073,42 @@ async fn propose_file_reports_its_push_when_the_pull_request_call_fails() {
         .unwrap();
     assert!(second.pr.is_ok(), "{second:?}");
 }
+
+#[tokio::test]
+async fn status_shows_the_last_run_per_repository_and_kind() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    for run in [
+        run_of("rules", None, None),
+        MaintenanceRun {
+            started_at: 5,
+            outcome: "proposed 2 changes".into(),
+            ..run_of("rules", Some("https://github.com/o/r/pull/90"), None)
+        },
+        MaintenanceRun {
+            outcome: "ok".into(),
+            ..run_of("periodic", None, None)
+        },
+    ] {
+        p.store.record_maintenance_run(&run).await.unwrap();
+    }
+    let status = provefab::commands::status(&p.store).await.unwrap();
+    assert!(
+        status.contains("maintenance o/r rules: proposed 2 changes (1970-01-01T00:00:05Z)  https://github.com/o/r/pull/90\n"),
+        "{status}"
+    );
+    assert!(
+        !status.contains("proposed 1 change"),
+        "only the last run: {status}"
+    );
+    assert!(
+        !status.contains("periodic"),
+        "an ok periodic call is bookkeeping: {status}"
+    );
+}

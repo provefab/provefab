@@ -494,3 +494,105 @@ async fn post_merge_checks_advance_after_the_task_leaves_pr_open() {
     let c = p.store.post_merge_checks(t.id).await.unwrap();
     assert_eq!(c[0].state, provefab::post_merge::CheckState::Passed);
 }
+
+/// A policy that counts its periodic calls, uses the tools, then fails.
+struct FailingPeriodic {
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl provefab::policy::ReviewPolicy for FailingPeriodic {
+    fn approvals_needed(&self, _: &provefab::config::RepoConfig) -> u8 {
+        1
+    }
+    fn after_pr_opened<'a>(
+        &'a self,
+        _: provefab::policy::PrOpened<'a>,
+    ) -> provefab::policy::BoxFuture<'a, Result<String, provefab::pipeline::PipelineError>> {
+        Box::pin(async { Ok("Opened.".to_string()) })
+    }
+    fn periodic<'a>(
+        &'a self,
+        _: &'a provefab::config::RepoConfig,
+        tools: &'a dyn provefab::policy::PeriodicTools,
+    ) -> provefab::policy::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tools.record_run("probe", "seen", None, None).await?;
+            Err("boom".to_string())
+        })
+    }
+}
+
+/// Review Focus 4.
+#[tokio::test]
+async fn the_policy_works_once_a_day_and_a_failure_never_stops_the_queue() {
+    use provefab::scheduler::PERIODIC;
+    let mut f = fixture(&["test -f feature.txt"]);
+    let policy = std::sync::Arc::new(FailingPeriodic {
+        calls: Default::default(),
+    });
+    f.policy = policy.clone();
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    // The last call was 25 hours ago: due at startup.
+    p.store
+        .record_maintenance_run(&provefab::store::MaintenanceRun {
+            id: 0,
+            repo: "o/r".into(),
+            kind: PERIODIC.into(),
+            started_at: provefab::store::now() - 90_000,
+            finished_at: None,
+            model_id: None,
+            cost_usd: None,
+            quota_units: None,
+            outcome: "ok".into(),
+            pr_url: None,
+            detail: None,
+        })
+        .await
+        .unwrap();
+    within(
+        30,
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    let calls = || policy.calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(calls(), 1);
+    let id = p
+        .store
+        .task_by_url("https://github.com/o/r/issues/7")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().state, PrOpen);
+    let last = p
+        .store
+        .last_maintenance_run("o/r", PERIODIC)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.outcome, "error: boom");
+    // Restarted within the day: not called again.
+    within(
+        30,
+        provefab::scheduler::run(p.clone(), ONCE, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls(), 1);
+    let status = provefab::commands::status(&p.store).await.unwrap();
+    assert!(
+        status.contains("maintenance o/r periodic: error: boom ("),
+        "{status}"
+    );
+    assert!(status.contains("maintenance o/r probe: seen ("), "{status}");
+}

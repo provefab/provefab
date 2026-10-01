@@ -491,7 +491,7 @@ fn failed(said: String, detail: impl std::fmt::Display) -> String {
 /// `<redacted>` (pre-flight S6). Signals carry what people and reviewers
 /// wrote to the model provider; `tracker::redact` needs the secrets it
 /// removes, and these are anyone's, so this goes by shape.
-fn redact_credentials(text: &str) -> String {
+pub(crate) fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut after_bearer = false;
     for piece in text.split_inclusive(char::is_whitespace) {

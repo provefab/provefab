@@ -302,6 +302,27 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
             .collect();
         let _ = writeln!(out, "post-merge checks: {}", parts.join(" · "));
     }
+    // Repository rules spec §7: the last maintenance run per repository and
+    // kind. The scheduler's own call is shown only when it failed.
+    let mut last: std::collections::BTreeMap<(String, String), crate::store::MaintenanceRun> =
+        std::collections::BTreeMap::new();
+    for r in store.maintenance_runs(None).await? {
+        last.insert((r.repo.to_lowercase(), r.kind.clone()), r);
+    }
+    for r in last.into_values() {
+        if r.kind == crate::scheduler::PERIODIC && r.outcome == "ok" {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "maintenance {} {}: {} ({}){}",
+            r.repo,
+            r.kind,
+            r.outcome,
+            crate::store::rfc3339(r.started_at),
+            r.pr_url.map(|u| format!("  {u}")).unwrap_or_default()
+        );
+    }
     Ok(out)
 }
 

@@ -323,6 +323,97 @@ fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()
     Ok(())
 }
 
+/// The pipeline `provefab run` drives; Provefab Pro's commands build the same
+/// one (repository rules plan decision 19).
+pub type RunPipeline = Pipeline<AgentRunner, Option<JevOracle>, crate::tracker::Routed>;
+
+/// Loads `provefab.toml` and builds the pipeline `run` uses, without the run
+/// lock, for a command that works next to the service.
+pub async fn open_pipeline(
+    paths: &Paths,
+    policy: Arc<dyn ReviewPolicy>,
+) -> anyhow::Result<RunPipeline> {
+    let config = load_config(paths)?;
+    let oracle = oracle(&config).await?;
+    let hub = routed(&config).await?;
+    let store = Store::open(&paths.db()).await?;
+    build_pipeline(paths, config, oracle, hub, store, policy).await
+}
+
+/// Spec §7: models whose worker is not signed in leave the catalog; then the
+/// plugins, the prices and the pipeline itself.
+async fn build_pipeline(
+    paths: &Paths,
+    mut config: Config,
+    oracle: Option<JevOracle>,
+    hub: crate::tracker::Routed,
+    store: Store,
+    policy: Arc<dyn ReviewPolicy>,
+) -> anyhow::Result<RunPipeline> {
+    let checks = commands::doctor(
+        &Tools::default(),
+        &config,
+        paths,
+        oracle.as_ref().map(|o| &o.client),
+    )
+    .await;
+    let failed = |name: &str| checks.iter().any(|c| c.name == name && !c.ok);
+    if let Some(c) = checks.iter().find(|c| c.name == "jev" && !c.ok) {
+        eprintln!(
+            "provefab: Jev does not answer ({}); fallbacks apply",
+            c.detail
+        );
+    }
+    // Each sign-in mode stands alone: a missing subscription login
+    // never removes the same vendor's API-key models (BYOK).
+    config.models.retain(|m| {
+        let gone = match (m.worker, m.auth) {
+            (WorkerKind::ClaudeCode, Auth::Subscription) => {
+                failed("claude") || failed("claude login")
+            }
+            (WorkerKind::ClaudeCode, Auth::ApiKey) => failed("claude") || failed("claude api key"),
+            (WorkerKind::Codex, Auth::Subscription) => {
+                failed("codex") || failed("codex login") || failed("codex guard hook")
+            }
+            (WorkerKind::Codex, Auth::ApiKey) => {
+                failed("codex") || failed("codex api login") || failed("codex api guard hook")
+            }
+            (WorkerKind::Pi, _) => failed("pi"),
+        };
+        if gone {
+            eprintln!(
+                "provefab: model {} removed: its worker is not ready (see `provefab doctor`)",
+                m.id
+            );
+        }
+        !gone
+    });
+    if config.models.is_empty() {
+        bail!("no model is usable; run `provefab doctor`");
+    }
+    let installed = plugins::install(&paths.plugins())?;
+    let exe = std::env::current_exe().context("locating Provefab binary")?;
+    // Up to 2 x 10 s offline before the service starts; then the cache or snapshot.
+    let prices = crate::prices::load(paths, config.routing.price_urls(), crate::store::now()).await;
+    Ok(Pipeline {
+        store,
+        runner: AgentRunner::new(paths, &installed, exe),
+        oracle,
+        hub,
+        git: Git {
+            program: "git".into(),
+        },
+        paths: paths.clone(),
+        config,
+        cooldowns: Mutex::new(Cooldowns::default()),
+        prices: std::sync::RwLock::new(prices),
+        price_attempt: std::sync::atomic::AtomicI64::new(0),
+        repo_locks: Mutex::new(std::collections::HashMap::new()),
+        budget: tokio::sync::Mutex::new(()),
+        policy,
+    })
+}
+
 async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
     let paths = Paths::from_env();
     match cmd {
@@ -332,7 +423,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             dry_run,
             once,
         } => {
-            let mut config = load_config(&paths)?;
+            let config = load_config(&paths)?;
             let policy = ext.policy.clone();
             for w in policy.warnings(&config) {
                 eprintln!("provefab: {w}");
@@ -351,72 +442,8 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             };
             let store = Store::open(&paths.db()).await?;
             commands::tracker_history(&store, &config).await?;
-            // Spec §7: models whose worker is not signed in leave the catalog.
-            let checks = commands::doctor(
-                &Tools::default(),
-                &config,
-                &paths,
-                oracle.as_ref().map(|o| &o.client),
-            )
-            .await;
-            let failed = |name: &str| checks.iter().any(|c| c.name == name && !c.ok);
-            if let Some(c) = checks.iter().find(|c| c.name == "jev" && !c.ok) {
-                eprintln!(
-                    "provefab: Jev does not answer ({}); fallbacks apply",
-                    c.detail
-                );
-            }
-            // Each sign-in mode stands alone: a missing subscription login
-            // never removes the same vendor's API-key models (BYOK).
-            config.models.retain(|m| {
-                let gone = match (m.worker, m.auth) {
-                    (WorkerKind::ClaudeCode, Auth::Subscription) => {
-                        failed("claude") || failed("claude login")
-                    }
-                    (WorkerKind::ClaudeCode, Auth::ApiKey) => {
-                        failed("claude") || failed("claude api key")
-                    }
-                    (WorkerKind::Codex, Auth::Subscription) => {
-                        failed("codex") || failed("codex login") || failed("codex guard hook")
-                    }
-                    (WorkerKind::Codex, Auth::ApiKey) => {
-                        failed("codex") || failed("codex api login") || failed("codex api guard hook")
-                    }
-                    (WorkerKind::Pi, _) => failed("pi"),
-                };
-                if gone {
-                    eprintln!(
-                        "provefab: model {} removed: its worker is not ready (see `provefab doctor`)",
-                        m.id
-                    );
-                }
-                !gone
-            });
-            if config.models.is_empty() {
-                bail!("no model is usable; run `provefab doctor`");
-            }
-            let installed = plugins::install(&paths.plugins())?;
-            let exe = std::env::current_exe().context("locating Provefab binary")?;
-            // Up to 2 x 10 s offline before the service starts; then the cache or snapshot.
-            let prices =
-                crate::prices::load(&paths, config.routing.price_urls(), crate::store::now()).await;
-            let pipeline = Arc::new(Pipeline {
-                store,
-                runner: AgentRunner::new(&paths, &installed, exe),
-                oracle,
-                hub,
-                git: Git {
-                    program: "git".into(),
-                },
-                paths: paths.clone(),
-                config,
-                cooldowns: Mutex::new(Cooldowns::default()),
-                prices: std::sync::RwLock::new(prices),
-                price_attempt: std::sync::atomic::AtomicI64::new(0),
-                repo_locks: Mutex::new(std::collections::HashMap::new()),
-                budget: tokio::sync::Mutex::new(()),
-                policy,
-            });
+            let pipeline =
+                Arc::new(build_pipeline(&paths, config, oracle, hub, store, policy).await?);
             let stop = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
