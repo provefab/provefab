@@ -150,7 +150,10 @@ pub trait PeriodicTools: Send + Sync {
     /// `last_pushed` is the `sha` of the
     /// previous proposal (`None`: there is none); when the branch holds
     /// anything else, a person changed it, and nothing is pushed or edited
-    /// (pre-flight B1).
+    /// (pre-flight B1), with an error starting with
+    /// `rules::CHANGED_BY_A_PERSON`. Two heads are not a person's change:
+    /// one already in the base, and Provefab's own proposal commit whose
+    /// push was never recorded, known by its trailers (final review I1).
     fn propose_file<'a>(
         &'a self,
         path: &'a str,

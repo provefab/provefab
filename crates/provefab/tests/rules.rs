@@ -1112,3 +1112,185 @@ async fn status_shows_the_last_run_per_repository_and_kind() {
         "an ok periodic call is bookkeeping: {status}"
     );
 }
+
+/// A clone of `origin` on `branch`, as a maintainer would have it.
+fn person_clone(f: &Fixture, name: &str, branch: &str) -> PathBuf {
+    let dir = f._dir.path().join(name);
+    git(
+        f._dir.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            branch,
+            f.origin.to_str().unwrap(),
+            name,
+        ],
+    );
+    git(&dir, &["config", "user.name", "p"]);
+    git(&dir, &["config", "user.email", "p@p"]);
+    dir
+}
+
+/// I1: a push that landed but was never recorded (an abort, a SIGTERM, a
+/// failed `record_run`) is Provefab's own commit, recognised from its
+/// trailers, so the next run replaces it instead of reporting a person.
+#[tokio::test]
+async fn propose_file_recognises_its_own_unrecorded_push() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let first = tools
+        .propose_file(".provefab/rules.md", "## R1: One\n", "Rules", "Body", None)
+        .await
+        .unwrap();
+    let message = git(&f.origin, &["log", "-1", "--format=%B", "provefab/rules"]);
+    assert!(
+        message.contains("Provefab-Proposal: .provefab/rules.md\n")
+            && message.contains(&format!(
+                "Provefab-Content-Sha256: {}",
+                provefab::rules::sha256_hex("## R1: One\n")
+            )),
+        "{message}"
+    );
+    // The run that pushed `second` never recorded it.
+    let second = tools
+        .propose_file(
+            ".provefab/rules.md",
+            "## R1: Two\n",
+            "Rules",
+            "Body",
+            Some(&first.sha),
+        )
+        .await
+        .unwrap();
+    for last_pushed in [Some(first.sha.as_str()), None] {
+        let again = tools
+            .propose_file(
+                ".provefab/rules.md",
+                "## R1: Three\n",
+                "Rules",
+                "Body",
+                last_pushed,
+            )
+            .await
+            .unwrap();
+        assert_ne!(again.sha, second.sha);
+        assert_eq!(again.sha, git(&f.origin, &["rev-parse", "provefab/rules"]));
+    }
+}
+
+/// I1: a push that reached `origin` though git reported an error is the
+/// pushed commit, not a person's.
+#[tokio::test]
+async fn propose_file_accepts_a_push_that_landed_with_an_error() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let mut p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    // Real git, then a failure for every push (a connection lost after the update).
+    let wrapper = f._dir.path().join("git-push-fails");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\ngit \"$@\"; s=$?\ncase \" $* \" in *\" push \"*) echo 'connection reset' >&2; exit 1;; esac\nexit $s\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    p.git = Git { program: wrapper };
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let pushed = tools
+        .propose_file(".provefab/rules.md", "## R1: One\n", "Rules", "Body", None)
+        .await
+        .unwrap();
+    assert_eq!(pushed.sha, git(&f.origin, &["rev-parse", "provefab/rules"]));
+    assert!(pushed.pr.is_ok(), "{pushed:?}");
+}
+
+/// I1: a maintainer who amends Provefab's commit keeps its trailers but
+/// not its content: refused.
+#[tokio::test]
+async fn propose_file_refuses_a_maintainers_amend() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let ours = tools
+        .propose_file(".provefab/rules.md", "## R1: One\n", "Rules", "Body", None)
+        .await
+        .unwrap();
+    let human = person_clone(&f, "human", "provefab/rules");
+    std::fs::write(human.join(".provefab/rules.md"), "## R1: One, reworded\n").unwrap();
+    git(&human, &["commit", "-q", "-a", "--amend", "--no-edit"]);
+    git(&human, &["push", "-q", "-f", "origin", "provefab/rules"]);
+    let theirs = git(&f.origin, &["rev-parse", "provefab/rules"]);
+    for last_pushed in [Some(ours.sha.as_str()), None] {
+        let err = tools
+            .propose_file(
+                ".provefab/rules.md",
+                "## R1: Two\n",
+                "Rules",
+                "Body",
+                last_pushed,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with(provefab::rules::CHANGED_BY_A_PERSON),
+            "{err}"
+        );
+        assert_eq!(git(&f.origin, &["rev-parse", "provefab/rules"]), theirs);
+    }
+}
+
+/// I1: a branch whose head is already in the base (merged, the branch
+/// kept) loses nothing when it is rebuilt, even with a person's commit.
+#[tokio::test]
+async fn propose_file_rebuilds_a_merged_branch_that_was_kept() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let ours = tools
+        .propose_file(".provefab/rules.md", "## R1: One\n", "Rules", "Body", None)
+        .await
+        .unwrap();
+    let human = person_clone(&f, "human", "provefab/rules");
+    std::fs::write(human.join(".provefab/rules.md"), "## R1: One, reworded\n").unwrap();
+    git(&human, &["commit", "-q", "-am", "reword"]);
+    git(&human, &["push", "-q", "origin", "provefab/rules"]);
+    // Merged into main; the branch stays.
+    git(&human, &["fetch", "-q", "origin", "main"]);
+    git(&human, &["checkout", "-q", "-b", "m", "origin/main"]);
+    git(
+        &human,
+        &["merge", "-q", "--no-ff", "-m", "merge", "provefab/rules"],
+    );
+    git(&human, &["push", "-q", "origin", "m:main"]);
+    let again = tools
+        .propose_file(
+            ".provefab/rules.md",
+            "## R1: One, reworded\n\n## R2: Two\n",
+            "Rules",
+            "Body",
+            Some(&ours.sha),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.sha, git(&f.origin, &["rev-parse", "provefab/rules"]));
+    assert_eq!(
+        git(&f.origin, &["rev-parse", "provefab/rules^"]),
+        git(&f.origin, &["rev-parse", "main"]),
+        "rebuilt on the base"
+    );
+}

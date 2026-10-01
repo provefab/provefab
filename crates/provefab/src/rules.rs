@@ -470,10 +470,20 @@ fn plus(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     }
 }
 
+/// How `propose_file`'s error starts when a person changed the proposal
+/// branch (pre-flight B1): nothing was pushed, and every later call is
+/// refused the same way until the branch is deleted or its head is merged.
+pub const CHANGED_BY_A_PERSON: &str = "a person changed the branch ";
+
+/// The trailers of a proposal commit (final review I1): the file it
+/// proposes and the hex SHA-256 of the content Provefab wrote there.
+const TRAILER_PATH: &str = "Provefab-Proposal: ";
+const TRAILER_SHA256: &str = "Provefab-Content-Sha256: ";
+
 /// Why `propose_file` left a branch alone (pre-flight B1).
 fn changed_by_a_person(branch: &str) -> String {
     format!(
-        "a person changed the branch {branch} after Provefab pushed it, so Provefab pushed nothing and left its pull request as it is"
+        "{CHANGED_BY_A_PERSON}{branch} after Provefab pushed it, so Provefab pushed nothing and left its pull request as it is"
     )
 }
 
@@ -920,16 +930,6 @@ where
                 Ok(false) => return Err(not_fetched()),
                 Err(e) => return Err(failed(not_fetched(), e)),
             }
-            // Pre-flight B1: only a branch Provefab left as it is, or none, is
-            // replaced; the push's lease holds it to what is read here.
-            let remote = p
-                .git
-                .remote_branch_sha(&checkout, &branch)
-                .await
-                .map_err(|e| failed(format!("could not read {branch} on {}", repo.slug), e))?;
-            if remote.is_some() && remote.as_deref() != last_pushed {
-                return Err(changed_by_a_person(&branch));
-            }
             let base = p
                 .git
                 .rev_parse(&checkout, &p.base_ref(repo).await)
@@ -940,6 +940,23 @@ where
                         e,
                     )
                 })?;
+            // Pre-flight B1: only a branch Provefab left as it is, or none, is
+            // replaced; the push's lease holds it to what is read here.
+            let unread = |e| failed(format!("could not read {branch} on {}", repo.slug), e);
+            let remote = p
+                .git
+                .remote_branch_sha(&checkout, &branch)
+                .await
+                .map_err(unread)?;
+            if let Some(head) = remote.as_deref()
+                && Some(head) != last_pushed
+                && !self
+                    .replaceable(&checkout, &branch, head, path, &base)
+                    .await
+                    .map_err(unread)?
+            {
+                return Err(changed_by_a_person(&branch));
+            }
             p.git
                 .worktree_fresh_detached(&checkout, &wt, &base)
                 .await
@@ -974,6 +991,55 @@ where
         Ok(Proposal { sha, pr })
     }
 
+    /// Whether the branch's `head`, which is not the commit the caller last
+    /// recorded, loses nothing when replaced (final review I1): it is
+    /// already in `base` (merged, the branch kept), or it is Provefab's own
+    /// proposal commit whose push was never recorded (an abort, a failed
+    /// `record_run`): one parent in `base`, only `path` changed, and the
+    /// trailers name `path` and the hash of the file it holds. A
+    /// maintainer's amend keeps the trailers but not the hash.
+    async fn replaceable(
+        &self,
+        checkout: &Path,
+        branch: &str,
+        head: &str,
+        path: &str,
+        base: &str,
+    ) -> Result<bool, crate::forge::ForgeError> {
+        let git = &self.p.git;
+        // The checkout was fetched just now; a push since then is fetched here.
+        if !git.has_commit(checkout, head).await? {
+            git.fetch_branch(checkout, branch).await?;
+            if !git.has_commit(checkout, head).await? {
+                return Ok(false);
+            }
+        }
+        if git.is_ancestor(checkout, head, base).await? {
+            return Ok(true);
+        }
+        if git.parent_count(checkout, head).await? != 1 {
+            return Ok(false);
+        }
+        let parent = git.rev_parse(checkout, &format!("{head}^")).await?;
+        if !git.is_ancestor(checkout, &parent, base).await?
+            || git.paths_between(checkout, &parent, head).await? != [path]
+        {
+            return Ok(false);
+        }
+        let message = git.commit_message(checkout, head).await?;
+        let trailer = |key: &str| {
+            message
+                .lines()
+                .rev()
+                .find_map(|l| l.strip_prefix(key).map(str::trim))
+                .map(str::to_string)
+        };
+        let (Some(named), Some(hash)) = (trailer(TRAILER_PATH), trailer(TRAILER_SHA256)) else {
+            return Ok(false);
+        };
+        Ok(named == path && git.blob_sha256(checkout, head, path).await? == Some(hash))
+    }
+
     /// Writes and commits the file, then pushes it to `branch` while `origin`
     /// still holds `remote` there. The new commit's sha.
     async fn commit_and_push(
@@ -993,13 +1059,28 @@ where
         }
         .and_then(|()| std::fs::write(&file, content));
         written.map_err(|e| failed(format!("could not write {path}"), e))?;
+        let message = format!(
+            "{message}\n\n{TRAILER_PATH}{path}\n{TRAILER_SHA256}{}",
+            sha256_hex(content)
+        );
         let sha = git
-            .commit_file(wt, path, message)
+            .commit_file(wt, path, &message)
             .await
             .map_err(|e| failed(format!("could not commit {path}"), e))?
             .ok_or_else(|| format!("{path} on {} already reads like this", repo.base))?;
         if let Err(e) = git.push_lease(wt, branch, remote).await {
             let now = git.remote_branch_sha(&self.p.checkout(repo), branch).await;
+            // The push landed and only its answer was lost (final review I1).
+            if now
+                .as_ref()
+                .is_ok_and(|now| now.as_deref() == Some(sha.as_str()))
+            {
+                failed(
+                    format!("the push of {branch} reported an error but landed"),
+                    e,
+                );
+                return Ok(sha);
+            }
             if now.as_ref().is_ok_and(|now| now.as_deref() != remote) {
                 return Err(failed(changed_by_a_person(branch), e));
             }

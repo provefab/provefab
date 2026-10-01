@@ -118,6 +118,18 @@ async fn run_with_timeout(
     stdin: Option<&str>,
     timeout: Duration,
 ) -> Result<String, ForgeError> {
+    let out = run_bytes(program, cwd, args, stdin, timeout).await?;
+    Ok(String::from_utf8_lossy(&out).trim_end().to_string())
+}
+
+/// `run_with_timeout`'s stdout as the bytes the command wrote.
+async fn run_bytes(
+    program: &Path,
+    cwd: Option<&Path>,
+    args: &[&str],
+    stdin: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<u8>, ForgeError> {
     let shown = args.join(" ");
     let name = program.display().to_string();
     let mut cmd = Command::new(program);
@@ -177,7 +189,7 @@ async fn run_with_timeout(
             stderr: tail.trim().to_string(),
         });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    Ok(out.stdout)
 }
 
 /// `provefab/<issue>-<slug of the title>`, at most 60 characters. `issue` is
@@ -506,6 +518,82 @@ impl Git {
             &["push", "--no-verify", &lease, "origin", &refspec],
         )
         .await?;
+        Ok(())
+    }
+
+    /// `rev`'s full commit message.
+    pub async fn commit_message(&self, repo: &Path, rev: &str) -> Result<String, ForgeError> {
+        self.git(repo, &["log", "-1", "--format=%B", rev, "--"])
+            .await
+    }
+
+    /// The paths that differ between two commits.
+    pub async fn paths_between(
+        &self,
+        repo: &Path,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, ForgeError> {
+        let out = self
+            .git(
+                repo,
+                &["diff", "--no-renames", "--name-only", from, to, "--"],
+            )
+            .await?;
+        Ok(out.lines().map(str::to_string).collect())
+    }
+
+    /// Hex SHA-256 of `path`'s bytes as committed at `rev`, `None` when that
+    /// commit has no such file.
+    pub async fn blob_sha256(
+        &self,
+        repo: &Path,
+        rev: &str,
+        path: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        use sha2::{Digest, Sha256};
+        let listed = self
+            .git(repo, &["ls-tree", "--name-only", rev, "--", path])
+            .await?;
+        if listed.trim() != path {
+            return Ok(None);
+        }
+        let spec = format!("{rev}:{path}");
+        let args = ["-c", "core.hooksPath=/dev/null", "cat-file", "blob", &spec];
+        let bytes = run_bytes(&self.program, Some(repo), &args, None, RUN_TIMEOUT).await?;
+        Ok(Some(
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        ))
+    }
+
+    /// Whether the repository holds the commit `sha`.
+    pub async fn has_commit(&self, repo: &Path, sha: &str) -> Result<bool, ForgeError> {
+        match self
+            .git(
+                repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{sha}^{{commit}}"),
+                ],
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(ForgeError::Failed { code: Some(1), .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Fetches one branch of `origin` (its objects, and `origin/<branch>`).
+    pub async fn fetch_branch(&self, repo: &Path, branch: &str) -> Result<(), ForgeError> {
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        self.git(repo, &["fetch", "--quiet", "origin", &refspec])
+            .await?;
         Ok(())
     }
 
