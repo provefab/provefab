@@ -87,7 +87,7 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 |---|---|---|
 | `slug` | required | `owner/name` on GitHub, where the code and the pull requests are. |
 | `local_path` | none | Your local clone. **Optional**: without it, Provefab clones the repository into `~/.provefab/repos/<owner>/<name>`. Either way it runs `git fetch` before every pass and starts from `origin/<base>`. |
-| `label` | `provefab` | The label that triggers Provefab. Only people who can triage the repository can set it: it is the authorization. The derived labels (`<label>:in-pr`, `:needs-info`, `:failed`, `:merged`) are created at startup. The risk labels (`<label>:risk-<category>`, including `:risk-unknown`) are created at startup too. |
+| `label` | `provefab` | The label that triggers Provefab. Only people who can triage the repository can set it: it is the authorization. The derived labels (`<label>:in-pr`, `:needs-info`, `:failed`, `:merged`) are created at startup on GitHub and Linear. The risk labels (`<label>:risk-<category>`, including `:risk-unknown`) are created at startup too. Jira labels are free text and need no creation. |
 | `base` | `main` | Branch work starts from, and pull requests target. |
 | `poll_interval` | `3m` | How often the repository is polled. |
 | `trust_pi_project` | `false` | Pi only: load the repository's Pi config (avoid for a repository you do not control). |
@@ -169,6 +169,8 @@ Absent, the repository's issues are its GitHub issues. Setup, labels and limits:
 | `project` | none | Jira and Linear, required: the project or team key, `[A-Z][A-Z0-9_]*`, as in `ENG-123`. |
 
 Refused at load: an unknown `kind` or key (credentials never go in this file), `site` outside Jira, `project` with `github`, and, for Jira, a `label` containing whitespace.
+
+Switch a repository's `kind` (or its `project`) only when the repository has no task history that could collide: `provefab run` and `provefab add` refuse to start while a task in progress, or an update still to send, belongs to the previous tracker. A new ticket whose number matches an earlier task of the repository is skipped with a log line. See [Jira and Linear](trackers.md#limits).
 
 ## `[limits]`
 

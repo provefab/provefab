@@ -72,7 +72,7 @@ Then put the `provefab` label on an issue. Provefab picks it up at its next poll
 | follow the service live | `tail -f ~/.provefab/logs/run.log` |
 | stop the service | `provefab service uninstall` |
 
-Provefab talks to you on GitHub, in issue comments that always start with *Posted by Provefab*. Labels track progress:
+Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in comments that always start with *Posted by Provefab*, and opens the pull request on GitHub. Labels track progress:
 
 | Label | Meaning |
 |---|---|

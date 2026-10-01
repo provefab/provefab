@@ -6,7 +6,7 @@ It works like GitHub issues: a label hands a ticket to Provefab, Provefab report
 
 ## Setup
 
-One Jira project or one Linear team per repository. Several repositories may share a project, each with its own label.
+One Jira project or one Linear team per repository. Several repositories may share a project, each with its own label: a ticket must carry only one of their labels (with both, it is queued in both repositories).
 
 ### Jira Cloud
 
@@ -81,6 +81,6 @@ A ticket's text is data for the agents, never instructions.
 - Jira Cloud only (not Jira Data Center), polling only (no webhooks).
 - A ticket cannot choose its repository by itself: the project or team is configured per repository, and a shared project is split by label.
 - Renaming a Jira project key or a Linear team key needs `project` updated in `provefab.toml`.
-- Switch a repository's tracker only when it has no task in progress (`provefab status`).
+- Switching a repository's tracker (or its project) is supported only for a repository with no task history that could collide. `provefab run` and `provefab add` refuse to start while a task in progress, or an update still to send, belongs to the previous tracker: restore it until those tasks finish. Afterwards, a ticket whose number matches an earlier task of that repository (ENG-12 after GitHub issue #12) is skipped with a log line naming both, and `provefab add` refuses it. Keeping both apart needs a change of the task store, planned for a later version.
 - A bad token, missing access or a ticket that no longer exists stops the task (`needs_you`, with the reason in `provefab log`). Timeouts (HTTP 408), rate limits (429) and server errors (5xx) are retried like a failing `gh` call; a rate limit that asks to wait 30 seconds or less is waited out once. Other 4xx errors are permanent.
 - Tokens, e-mails and keys are removed from every error message before it is shown or stored.

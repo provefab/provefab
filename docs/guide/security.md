@@ -7,8 +7,7 @@ Provefab runs code written by agents, in repositories whose content (issues, com
 - **The label is the authorization.** Only people who can triage the repository can set `provefab`.
 - **Read an issue before you label it.** The label is your approval to spend agent time on that issue's text. On a public repository, anyone can write an issue; never label one you have not read.
 - Only **the issue author and collaborators** can steer a task: answers to questions, comments on a closed PR, reviews. Other people's comments, and Provefab's own, are ignored.
-
-- **On Jira and Linear**, the label is the authorization too, and any workspace member may answer a question (only members can comment there). Provefab's Jira token or Linear key stays in the Keychain or your environment, never in `provefab.toml`, and never appears in an error, a log or a comment. Ticket text is untrusted data, like issue text.
+- **On Jira and Linear**, the label is the authorization too. A question is answered by the ticket's reporter or by a workspace member: a licensed Atlassian account on Jira, any user on Linear (guests included for now). Jira Service Management customers can comment on a ticket, but they do not count as members: only the one who reported it is heard. Provefab's Jira token or Linear key stays in the Keychain or your environment, never in `provefab.toml`, and never appears in an error, a log or a comment. Ticket text is untrusted data, like issue text.
 
 ## What agents cannot do
 
