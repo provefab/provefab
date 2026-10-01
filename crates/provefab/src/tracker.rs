@@ -609,9 +609,11 @@ impl Remote {
         Ok(Some(match t.kind {
             TrackerKind::Github => return Ok(None),
             TrackerKind::Jira => {
-                let site = t.site.as_deref().unwrap_or_default();
-                let auth = jira_auth(security, site, env).await?;
-                Remote::Jira(Jira::new(&format!("https://{site}"), site, project, auth))
+                // Host names are case-insensitive; `provefab login jira`
+                // stores the Keychain item under the lower-case site.
+                let site = t.site.as_deref().unwrap_or_default().to_lowercase();
+                let auth = jira_auth(security, &site, env).await?;
+                Remote::Jira(Jira::new(&format!("https://{site}"), &site, project, auth))
             }
             TrackerKind::Linear => Remote::Linear(Linear::new(
                 crate::linear::API,
@@ -1070,6 +1072,24 @@ esac"#;
                 .await,
             Err(ForgeError::Spawn { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_jira_site_in_upper_case_uses_the_lower_case_keychain_item_and_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let security = fake_security(dir.path(), "security", KEYCHAIN);
+        let t = TrackerConfig {
+            kind: TrackerKind::Jira,
+            site: Some("Acme.Atlassian.net".into()),
+            project: Some("ENG".into()),
+        };
+        assert_eq!(validate(&t, "provefab"), Ok(()));
+        let remote = Remote::from_tracker(&t, &security, &env_of(&[]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&remote, Some(Remote::Jira(j)) if j.api == "https://acme.atlassian.net" && j.site == "acme.atlassian.net")
+        );
     }
 
     const CONFIG: &str = "[jev]\nmodel = \"jev-1.13\"\n\n[[models]]\nid = \"m\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\n\n[[repos]]\nslug = \"acme/api\"\ngates = [\"make\"]\n[repos.tracker]\nkind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"ENG\"\n\n[[repos]]\nslug = \"acme/web\"\ngates = [\"make\"]\n[repos.tracker]\nkind = \"linear\"\nproject = \"WEB\"\n\n[[repos]]\nslug = \"o/r\"\ngates = [\"make\"]\n";
