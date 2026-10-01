@@ -280,7 +280,6 @@ async fn a_task_that_disagrees_with_its_repository_tracker_stops_run_and_add() {
     on_project(&mut p, "OPS");
     assert!(tracker_history(&p.store, &p.config).await.is_err());
     // A terminal task alone does not block; its pending effect does.
-    on_project(&mut p, "OPS");
     p.store.transition(id, Failed, "test").await.unwrap();
     assert!(tracker_history(&p.store, &p.config).await.is_ok());
     p.store
@@ -377,4 +376,44 @@ async fn add_refuses_a_stored_task_of_the_same_number_from_another_tracker() {
     assert!(err.contains("ENG-7") && err.contains("#7"), "{err}");
     assert_eq!(p.store.task(id).await.unwrap().unwrap().state, Failed);
     assert!(hub.labels.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_task_still_watched_with_an_open_or_merged_pr_stops_run_after_a_switch() {
+    use provefab::commands::tracker_history;
+    let f = fixture(&["true"]);
+    let mut p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    // GitHub tasks; the repository then moves to Jira.
+    let mut ids = Vec::new();
+    for n in 1..=6 {
+        ids.push(queue_n(&p, n, "t").await);
+    }
+    on_project(&mut p, "ENG");
+    let cases: [(TaskState, Option<&str>, bool); 6] = [
+        (PrOpen, None, true),
+        (PrOpen, Some("merged"), true),
+        (PrOpen, Some("done"), true),
+        (PrOpen, Some("archived"), false),
+        (Failed, None, false),
+        (NeedsYou, None, false),
+    ];
+    // One task at a time: the others are parked as Failed.
+    for &id in &ids {
+        p.store.transition(id, Failed, "test").await.unwrap();
+    }
+    for (&id, (state, pr_state, refused)) in ids.iter().zip(cases) {
+        p.store.transition(id, state, "test").await.unwrap();
+        if let Some(s) = pr_state {
+            p.store.set_pr_state(id, s).await.unwrap();
+        }
+        let got = tracker_history(&p.store, &p.config).await;
+        assert_eq!(got.is_err(), refused, "{state:?} {pr_state:?}: {got:?}");
+        p.store.transition(id, Failed, "test").await.unwrap();
+    }
 }

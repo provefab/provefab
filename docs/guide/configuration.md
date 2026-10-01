@@ -170,7 +170,7 @@ Absent, the repository's issues are its GitHub issues. Setup, labels and limits:
 
 Refused at load: an unknown `kind` or key (credentials never go in this file), `site` outside Jira, `project` with `github`, and, for Jira, a `label` containing whitespace.
 
-Switch a repository's `kind` (or its `project`) only when the repository has no task history that could collide: `provefab run` and `provefab add` refuse to start while a task in progress, or an update still to send, belongs to the previous tracker. A new ticket whose number matches an earlier task of the repository is skipped with a log line. See [Jira and Linear](trackers.md#limits).
+Switch a repository's `kind` (or its `project`) only when the repository has no task history that could collide: `provefab run` and `provefab add` refuse to start while a task in progress (including one whose pull request is still watched), or an update still to send, belongs to the previous tracker. A new ticket whose number matches an earlier task of the repository is skipped with a log line. See [Jira and Linear](trackers.md#limits).
 
 ## `[limits]`
 

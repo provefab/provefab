@@ -61,10 +61,22 @@ pub fn parse_issue_url(url: &str) -> Option<(String, u64)> {
     }
 }
 
-/// Refuses to start when a configured repository has a task in progress, or
-/// a pending tracker effect, whose issue does not fit the repository's
-/// tracker any more: its comments and labels would reach another issue with
-/// the same number (final review I2). Checked by `provefab run` and `add`.
+/// Whether the task may still comment on or label its ticket. Not
+/// `TaskState::is_terminal`: a `pr_open` task is watched (open PR, then the
+/// post-merge window with `pr_state` merged or done) until `pr_state` is
+/// `archived`.
+fn still_touches_tracker(task: &crate::store::TaskRow) -> bool {
+    match task.state {
+        TaskState::Failed | TaskState::NeedsYou => false,
+        TaskState::PrOpen => task.pr_state.as_deref() != Some("archived"),
+        _ => true,
+    }
+}
+
+/// Refuses to start when a configured repository has a task that can still
+/// touch its ticket, or a pending tracker effect, whose issue does not fit
+/// the repository's tracker any more: its comments and labels would reach
+/// another issue with the same number (final review I2). Checked by `provefab run` and `add`.
 pub async fn tracker_history(store: &Store, config: &Config) -> Result<(), CommandError> {
     let pending: HashSet<i64> = store
         .pending_github()
@@ -74,7 +86,7 @@ pub async fn tracker_history(store: &Store, config: &Config) -> Result<(), Comma
         .collect();
     let mut lines = Vec::new();
     for task in store.tasks_in(&TaskState::ALL).await? {
-        if task.state.is_terminal() && !pending.contains(&task.id) {
+        if !still_touches_tracker(&task) && !pending.contains(&task.id) {
             continue;
         }
         let Some(repo) = config
@@ -85,7 +97,7 @@ pub async fn tracker_history(store: &Store, config: &Config) -> Result<(), Comma
             continue;
         };
         if let Some(why) = crate::tracker::key_mismatch(task.issue_key.as_deref(), Some(repo)) {
-            let what = if task.state.is_terminal() {
+            let what = if !still_touches_tracker(&task) {
                 "has tracker updates still to send"
             } else {
                 task.state.as_str()
