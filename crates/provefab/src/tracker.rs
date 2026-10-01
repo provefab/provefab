@@ -226,6 +226,42 @@ pub async fn linear_key(security: &Path, env: Env<'_>) -> Result<String, String>
     })
 }
 
+/// How Provefab names an issue: `#123` on GitHub, its key (`ENG-123`) on a tracker.
+pub fn issue_ref(number: u64, key: Option<&str>) -> String {
+    match key {
+        Some(k) => k.to_string(),
+        None => format!("#{number}"),
+    }
+}
+
+/// An issue with its repository: `o/r#123`, or `o/r ENG-123`.
+pub fn repo_ref(slug: &str, number: u64, key: Option<&str>) -> String {
+    match key {
+        Some(k) => format!("{slug} {k}"),
+        None => format!("{slug}#{number}"),
+    }
+}
+
+/// The pull request title: the issue title, prefixed with a ticket's key so
+/// the Jira and Linear GitHub integrations link it (spec §4).
+pub fn pr_title(title: &str, key: Option<&str>) -> String {
+    match key {
+        Some(k) => format!("{k}: {title}"),
+        None => title.to_string(),
+    }
+}
+
+/// The pull request body's first line (spec §4). `Fixes ENG-123` lets Linear's
+/// own GitHub integration close the ticket on merge if the team enabled it;
+/// Provefab never changes a status itself.
+pub fn pr_first_line(kind: TrackerKind, number: u64, key: Option<&str>, url: &str) -> String {
+    match (key, kind) {
+        (None, _) => format!("Closes #{number}."),
+        (Some(k), TrackerKind::Linear) => format!("Issue: [{k}]({url}). Fixes {k}"),
+        (Some(k), _) => format!("Issue: [{k}]({url})."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +365,32 @@ esac"#;
         let missing = fake_security(dir.path(), "missing", "exit 44");
         let err = linear_key(&missing, &env_of(&[])).await.unwrap_err();
         assert!(err.contains("provefab login linear"), "{err}");
+    }
+
+    #[test]
+    fn references_titles_and_first_lines() {
+        assert_eq!(issue_ref(7, None), "#7");
+        assert_eq!(issue_ref(7, Some("ENG-7")), "ENG-7");
+        assert_eq!(repo_ref("o/r", 7, None), "o/r#7");
+        assert_eq!(repo_ref("o/r", 7, Some("ENG-7")), "o/r ENG-7");
+        assert_eq!(pr_title("Fix it", None), "Fix it");
+        assert_eq!(pr_title("Fix it", Some("ENG-7")), "ENG-7: Fix it");
+        let gh = "https://github.com/o/r/issues/7";
+        assert_eq!(
+            pr_first_line(TrackerKind::Github, 7, None, gh),
+            "Closes #7."
+        );
+        let jira = "https://acme.atlassian.net/browse/ENG-7";
+        assert_eq!(
+            pr_first_line(TrackerKind::Jira, 7, Some("ENG-7"), jira),
+            "Issue: [ENG-7](https://acme.atlassian.net/browse/ENG-7)."
+        );
+        let linear = "https://linear.app/acme/issue/ENG-7/fix-it";
+        assert_eq!(
+            pr_first_line(TrackerKind::Linear, 7, Some("ENG-7"), linear),
+            "Issue: [ENG-7](https://linear.app/acme/issue/ENG-7/fix-it). Fixes ENG-7"
+        );
+        // A task queued from GitHub before the repository moved keeps its closing line.
+        assert_eq!(pr_first_line(TrackerKind::Jira, 7, None, gh), "Closes #7.");
     }
 }

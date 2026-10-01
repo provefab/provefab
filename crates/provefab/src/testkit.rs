@@ -275,6 +275,7 @@ impl FakeHub {
                 url: "https://github.com/o/r/issues/7".into(),
                 author: "alice".into(),
                 labels: vec!["provefab".into()],
+                key: None,
             },
             comments: Mutex::new(Vec::new()),
             posted: Mutex::new(Vec::new()),
@@ -667,8 +668,30 @@ pub async fn queue_n<R: StageRunner + Sync, O: Oracle + Sync, H: Hub + Sync>(
         .add_issue(&NewIssue {
             repo: "o/r".into(),
             number,
+            issue_key: None,
             url: format!("https://github.com/o/r/issues/{number}"),
             title: title.into(),
+            author: "alice".into(),
+        })
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Queues a Jira or Linear ticket: `number` with its `key` (`ENG-7`).
+pub async fn queue_ticket<R: StageRunner + Sync, O: Oracle + Sync, H: Hub + Sync>(
+    p: &Pipeline<R, O, H>,
+    number: u64,
+    key: &str,
+    url: &str,
+) -> i64 {
+    p.store
+        .add_issue(&NewIssue {
+            repo: "o/r".into(),
+            number,
+            issue_key: Some(key.into()),
+            url: url.into(),
+            title: "Add a feature file".into(),
             author: "alice".into(),
         })
         .await

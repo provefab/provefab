@@ -360,7 +360,11 @@ pub async fn dry_run<O: Oracle, T: Tracker>(
                 repo_size_kb: None,
             };
             let verdict = oracle.classify(&ctx).await;
-            let head = format!("{}#{} {}", repo.slug, issue.number, issue.title);
+            let head = format!(
+                "{} {}",
+                crate::tracker::repo_ref(&repo.slug, issue.number, issue.key.as_deref()),
+                issue.title
+            );
             let line = match &verdict {
                 Some(v) if v.underspecified > config.jev.underspecified_threshold => format!(
                     "{head}: would ask for more information (underspecified {:.2})",

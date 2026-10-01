@@ -486,7 +486,11 @@ pub async fn start_pass<H: Hub>(
 /// pass after a requeue, so a new pass never builds on (or force-pushes over)
 /// the rejected one (D46).
 fn task_branch(task: &TaskRow) -> String {
-    let base = branch_name(task.issue_number, &task.title);
+    let id = task
+        .issue_key
+        .clone()
+        .unwrap_or_else(|| task.issue_number.to_string());
+    let base = branch_name(&id, &task.title);
     if task.reopen_count == 0 {
         base
     } else {
@@ -1507,9 +1511,14 @@ Please reply with what should happen, what happens instead, and how to reproduce
             }
             Ok(_) => Ok(task.state),
             Err(e) => {
+                // `repo.slug` as configured, as before (GitHub output unchanged).
                 eprintln!(
-                    "provefab: could not read {}#{}: {e}",
-                    repo.slug, task.issue_number
+                    "provefab: could not read {}: {e}",
+                    crate::tracker::repo_ref(
+                        &repo.slug,
+                        task.issue_number,
+                        task.issue_key.as_deref()
+                    )
                 );
                 Ok(task.state)
             }
@@ -2130,11 +2139,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
         };
         let (title, body) = self.issue_text(task.id).await?;
         let kind = task.kind.unwrap_or(TaskKind::Feature);
-        let number = task.issue_number.to_string();
+        let reference = task.reference();
         let prompt = render(
             Template::Plan,
             &[
-                ("number", &number),
+                ("ref", &reference),
                 ("title", &title),
                 ("kind", kind.as_str()),
                 ("body", &body),
@@ -2409,11 +2418,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
             .map(|g| format!("`{g}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        let number = task.issue_number.to_string();
+        let reference = task.reference();
         let prompt = render(
             Template::Implement,
             &[
-                ("number", &number),
+                ("ref", &reference),
                 ("title", &title),
                 ("body", &body),
                 ("plan", &plan_str),
@@ -2582,8 +2591,10 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return Ok(state);
         }
         let message = format!(
-            "{}\n\nProvefab task {}, issue #{}.",
-            task.title, task.id, task.issue_number
+            "{}\n\nProvefab task {}, issue {}.",
+            task.title,
+            task.id,
+            task.reference()
         );
         let base = self.pass_base(task, repo).await?;
         let changed = match self.git.commit_all(&wt, &message).await {
@@ -2869,13 +2880,13 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let (title, body) = self.issue_text(task.id).await?;
         let plan = self.plan_output(task.id).await?;
         let plan_str = plan.as_ref().map(plan_text).unwrap_or_default();
-        let number = task.issue_number.to_string();
+        let reference = task.reference();
         let diff = truncate(&diff, DIFF_LIMIT);
         let base_shown = format!("{} at {}", repo.base, &base[..base.len().min(12)]);
         let prompt = render(
             Template::Review,
             &[
-                ("number", &number),
+                ("ref", &reference),
                 ("title", &title),
                 ("body", &body),
                 ("plan", &plan_str),
@@ -3116,7 +3127,15 @@ Please reply with what should happen, what happens instead, and how to reproduce
         review: &ReviewOutput,
         plan: Option<&PlanOutput>,
     ) -> Result<String, PipelineError> {
-        let mut b = format!("Closes #{}.\n\n", task.issue_number);
+        let mut b = format!(
+            "{}\n\n",
+            crate::tracker::pr_first_line(
+                repo.tracker_kind(),
+                task.issue_number,
+                task.issue_key.as_deref(),
+                &task.issue_url,
+            )
+        );
         if let Some(p) = plan {
             b.push_str(&format!("## Plan\n\n{}\n\n", p.summary));
         }
@@ -3229,9 +3248,10 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return self.failed(task, repo, "push failed", &e).await;
         }
         let body = self.pr_body(task, repo, wt, review, plan).await?;
+        let title = crate::tracker::pr_title(&task.title, task.issue_key.as_deref());
         let url = match self
             .hub
-            .pr_create(&repo.slug, &branch, &repo.base, &task.title, &body)
+            .pr_create(&repo.slug, &branch, &repo.base, &title, &body)
             .await
         {
             Ok(u) => u,

@@ -44,6 +44,8 @@ pub enum StoreError {
 pub struct NewIssue {
     pub repo: String,
     pub number: u64,
+    /// The ticket key on Jira or Linear; None on GitHub.
+    pub issue_key: Option<String>,
     pub url: String,
     pub title: String,
     pub author: String,
@@ -54,6 +56,7 @@ pub struct TaskRow {
     pub id: i64,
     pub repo: String,
     pub issue_number: u64,
+    pub issue_key: Option<String>,
     pub issue_url: String,
     pub title: String,
     pub author: String,
@@ -68,6 +71,18 @@ pub struct TaskRow {
     pub reopen_count: u32,
     /// The retry ladder moved the implement stage up one tier (spec §3.2).
     pub escalated: bool,
+}
+
+impl TaskRow {
+    /// `#123` or `ENG-123` (issue trackers spec §4).
+    pub fn reference(&self) -> String {
+        crate::tracker::issue_ref(self.issue_number, self.issue_key.as_deref())
+    }
+
+    /// `o/r#123` or `o/r ENG-123`.
+    pub fn repo_reference(&self) -> String {
+        crate::tracker::repo_ref(&self.repo, self.issue_number, self.issue_key.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,13 +242,14 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let t = now();
         let inserted = sqlx::query(
-            "INSERT INTO tasks (repo, issue_number, issue_url, title, author, state, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO tasks (repo, issue_number, issue_key, issue_url, title, author, state, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (repo, issue_number) DO NOTHING",
         )
         // GitHub slugs are case-insensitive; (repo, number) is the issue's identity.
         .bind(issue.repo.to_lowercase())
         .bind(issue.number as i64)
+        .bind(&issue.issue_key)
         .bind(&issue.url)
         .bind(&issue.title)
         .bind(&issue.author)
@@ -1288,6 +1304,7 @@ fn task_row(r: &SqliteRow) -> Result<TaskRow, StoreError> {
         id: r.get("id"),
         repo: r.get("repo"),
         issue_number: r.get::<i64, _>("issue_number") as u64,
+        issue_key: r.get("issue_key"),
         issue_url: r.get("issue_url"),
         title: r.get("title"),
         author: r.get("author"),
@@ -1561,6 +1578,7 @@ mod tests {
                 "9f9cca5cfdefacd436e685a2daf6b99f3a4d7104dbda6fd6c5df338adc59f1379ec0d15f86887d96c4ec23b3c1e3eaa5",
                 "daca2e3a57485b3a91ce46779913c341fec2ab5c757e523088b9c89a9fe3683a62f86b83b3adf5775babc4a8fb17ac49",
                 "5f568cb3d17aaf248e9f208ef39268d14393dd87157e348b5946549ebf4a359aedf16a05374529315b4dba8d461e9832",
+                "9c8911c912d3be8612dc10a06a802d318765a37df1c1c8a2449ba1063b3bdeb54242a9e943d29922b51f9c99350a0b3b",
             ]
         );
     }
@@ -1570,6 +1588,7 @@ mod tests {
         NewIssue {
             repo: "o/r".into(),
             number: n,
+            issue_key: None,
             url: format!("https://github.com/o/r/issues/{n}"),
             title: format!("Issue {n}"),
             author: "alice".into(),
@@ -1580,6 +1599,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("provefab.db")).await.unwrap();
         (dir, s)
+    }
+
+    #[tokio::test]
+    async fn a_ticket_key_is_stored_and_shown() {
+        let (_d, s) = store().await;
+        let jira = s
+            .add_issue(&NewIssue {
+                issue_key: Some("ENG-7".into()),
+                url: "https://acme.atlassian.net/browse/ENG-7".into(),
+                ..issue(7)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let t = s.task(jira).await.unwrap().unwrap();
+        assert_eq!(t.issue_key.as_deref(), Some("ENG-7"));
+        assert_eq!(
+            (t.reference(), t.repo_reference()),
+            ("ENG-7".into(), "o/r ENG-7".into())
+        );
+        let gh = s.add_issue(&issue(8)).await.unwrap().unwrap();
+        let t = s.task(gh).await.unwrap().unwrap();
+        assert_eq!(
+            (t.issue_key.clone(), t.reference(), t.repo_reference()),
+            (None, "#8".into(), "o/r#8".into())
+        );
     }
 
     use crate::record::{Event, MergedBy};

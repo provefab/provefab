@@ -19,8 +19,15 @@ pub const LEGACY_BOT_PREFIX: &str =
     "*Posted by the software factory (automated), not typed by a person.*";
 
 /// Whether a comment was posted by Provefab, under its current or former name.
+/// Compared without Markdown emphasis: a Jira ADF round trip drops the
+/// asterisks of the bot line (issue trackers spec §8).
 pub fn is_bot_comment(body: &str) -> bool {
-    body.starts_with(BOT_PREFIX) || body.starts_with(LEGACY_BOT_PREFIX)
+    let plain = |s: &str| s.replace(['*', '_'], "");
+    let start: String = body.trim_start().chars().take(200).collect();
+    let start = plain(&start);
+    [BOT_PREFIX, LEGACY_BOT_PREFIX]
+        .iter()
+        .any(|p| start.starts_with(&plain(p)))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,8 +161,9 @@ async fn run_with_timeout(
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
-/// `provefab/<issue>-<slug of the title>`, at most 60 characters.
-pub fn branch_name(issue: u64, title: &str) -> String {
+/// `provefab/<issue>-<slug of the title>`, at most 60 characters. `issue` is
+/// the number on GitHub, the key (`ENG-123`, upper case) on a tracker.
+pub fn branch_name(issue: &str, title: &str) -> String {
     let mut slug = String::new();
     for c in title.to_lowercase().chars() {
         if c.is_ascii_alphanumeric() {
@@ -711,6 +719,9 @@ pub struct Issue {
     pub url: String,
     pub author: String,
     pub labels: Vec<String>,
+    /// The ticket key on Jira or Linear (`ENG-123`); `None` on GitHub.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -839,6 +850,7 @@ impl Gh {
                         .flatten()
                         .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
                         .collect(),
+                    key: None,
                 })
             })
             .collect())
@@ -886,6 +898,7 @@ impl Gh {
                 .flatten()
                 .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
                 .collect(),
+            key: None,
         })
     }
 
@@ -1221,13 +1234,36 @@ mod tests {
     #[test]
     fn branch_names_are_short_and_safe() {
         assert_eq!(
-            branch_name(42, "Fix: crash when `config` is empty!"),
+            branch_name("42", "Fix: crash when `config` is empty!"),
             "provefab/42-fix-crash-when-config-is-empty"
         );
-        let long = branch_name(7, &"word ".repeat(40));
+        let long = branch_name("7", &"word ".repeat(40));
         assert!(long.len() <= 60, "{long}");
         assert!(!long.ends_with('-'), "{long}");
-        assert_eq!(branch_name(3, "日本語"), "provefab/3-");
+        assert_eq!(branch_name("3", "日本語"), "provefab/3-");
+    }
+
+    #[test]
+    fn ticket_branches_keep_the_key_in_upper_case() {
+        assert_eq!(
+            branch_name("ENG-123", "Fix: crash"),
+            "provefab/ENG-123-fix-crash"
+        );
+    }
+
+    /// A Jira ADF round trip drops the asterisks of the bot line, and Linear
+    /// may rewrite `*x*` as `_x_` (issue trackers spec §8).
+    #[test]
+    fn bot_comments_are_recognised_without_their_emphasis() {
+        assert!(is_bot_comment(
+            "Posted by Provefab (automated), not typed by a person.\n\nWhich version?"
+        ));
+        assert!(is_bot_comment(
+            "_Posted by Provefab (automated), not typed by a person._\n\nhi"
+        ));
+        assert!(is_bot_comment(&format!("  {BOT_PREFIX}\n\nhi")));
+        assert!(!is_bot_comment("Posted by Provefab, I think"));
+        assert!(!is_bot_comment("It is version 2."));
     }
 
     /// Comments posted before the rename carry the old prefix; they are still
@@ -1565,6 +1601,7 @@ mod tests {
                 url: "https://github.com/o/r/issues/7".into(),
                 author: "alice".into(),
                 labels: vec!["provefab".into()],
+                key: None,
             }]
         );
         let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();

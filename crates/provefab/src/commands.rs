@@ -69,6 +69,7 @@ pub async fn add<H: Hub>(
     let new = NewIssue {
         repo: repo.slug.clone(),
         number,
+        issue_key: issue.key.clone(),
         url: issue.url.clone(),
         title: issue.title.clone(),
         author: issue.author.clone(),
@@ -128,10 +129,9 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
         let why = why.lines().next().unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:>4}  {}#{}  {:<12} {}{}",
+            "{:>4}  {}  {:<12} {}{}",
             t.id,
-            t.repo,
-            t.issue_number,
+            t.repo_reference(),
             t.state.as_str(),
             why,
             t.pr_url.map(|u| format!("  {u}")).unwrap_or_default(),
@@ -281,10 +281,9 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
 pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
     let t = store.task(id).await?.ok_or(CommandError::UnknownTask(id))?;
     let mut out = format!(
-        "task {} {}#{} \"{}\" ({})\nstate {}  kind {}  attempts {}  review rounds {}{}\n",
+        "task {} {} \"{}\" ({})\nstate {}  kind {}  attempts {}  review rounds {}{}\n",
         t.id,
-        t.repo,
-        t.issue_number,
+        t.repo_reference(),
         t.title,
         t.issue_url,
         t.state.as_str(),
@@ -528,7 +527,7 @@ pub async fn export(
     for (t, e) in events {
         line(serde_json::json!({
             "type": "event", "task": t.id, "repo": t.repo, "issue": t.issue_number,
-            "seq": e.seq, "kind": e.kind, "source": e.source,
+            "issue_key": t.issue_key, "seq": e.seq, "kind": e.kind, "source": e.source,
             "schema_version": e.schema_version, "at": e.at,
             "payload": if with_text { e.payload.clone() } else { redact_event(&e) },
         }));
@@ -552,7 +551,7 @@ pub async fn prune(store: &Store, before: &str, yes: bool) -> Result<String, Com
     let tasks = store.prunable_tasks(at).await?;
     let mut out = String::new();
     for t in &tasks {
-        let _ = writeln!(out, "task {} {}#{}", t.id, t.repo, t.issue_number);
+        let _ = writeln!(out, "task {} {}", t.id, t.repo_reference());
     }
     if yes {
         let ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();

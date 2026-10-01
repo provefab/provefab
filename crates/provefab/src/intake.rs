@@ -25,6 +25,7 @@ pub async fn poll(
         let new = NewIssue {
             repo: repo.slug.clone(),
             number: issue.number,
+            issue_key: issue.key,
             url: issue.url,
             title: issue.title,
             author: issue.author,
@@ -124,6 +125,7 @@ mod tests {
             url: format!("https://github.com/o/r/issues/{n}"),
             author: "alice".into(),
             labels: vec!["provefab".into()],
+            key: None,
         }
     }
 

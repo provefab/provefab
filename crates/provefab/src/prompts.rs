@@ -85,7 +85,7 @@ mod tests {
         let p = render(
             Template::Implement,
             &[
-                ("number", "7"),
+                ("ref", "#7"),
                 ("title", "Crash"),
                 ("body", "b"),
                 ("plan", "p"),
