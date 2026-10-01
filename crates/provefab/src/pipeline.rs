@@ -1101,7 +1101,12 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Ok(()) => true,
             Err(e) => {
                 // Offline or no `origin`: branch from what is there, and say so.
-                eprintln!("provefab: could not fetch {}: {e}", repo.slug);
+                // The error can quote a remote URL with its credentials.
+                eprintln!(
+                    "provefab: could not fetch {}: {}",
+                    repo.slug,
+                    crate::rules::redact_credentials(&e.to_string())
+                );
                 false
             }
         };
