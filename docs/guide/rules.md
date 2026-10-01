@@ -9,7 +9,7 @@ Rules guide the agents. They do not guarantee correct code: the checks (`gates`)
 ```markdown
 # Our conventions
 
-Anything before the first rule is an introduction for people; Provefab ignores it.
+Anything before the first rule is an introduction for people; Provefab ignores it, except a heading that starts with `## R` and a digit, which is read as a rule heading.
 
 ## R3: Errors in the API layer use ApiError, never anyhow
 paths: src/api/**
@@ -38,7 +38,7 @@ Rules go after the issue and the diff, under the title "Repository rules (approv
 
 ## The reviewer's check
 
-The reviewer reports a change that breaks one of the rules it was given as a finding that cites it. A citation of a rule the review was not given is dropped; the finding stays, without the rule. The pull request's review notes show it as `F2 · R3 · ...`, `provefab log` and `provefab export` show the rule, and the pull request's Checks section ends with `Rules: R1, R3`, the rules the review was given. Answer such a finding like any other (`/provefab F2 rejected: ...`): your decisions are part of the record.
+The reviewer reports a change that breaks one of the rules it was given as a finding that cites it. A citation of a rule the review was not given is dropped; the finding stays, without the rule. The pull request's review notes show it as `F2 · R3 · ...`, `provefab log` and `provefab export` show the rule, and the pull request's Checks section includes a `Rules: R1, R3` line, the rules the review was given (a Reproduction line may follow it). Answer such a finding like any other (`/provefab F2 rejected: ...`): your decisions are part of the record.
 
 ## Changing the rules
 
@@ -52,7 +52,7 @@ Provefab Pro can propose rules from your team's decisions, at most once a week p
 
 `provefab log <id>` shows `rules_loaded` (the rule numbers, and how many the budget left out of the plan prompt) or `rules_invalid` (the reason). A pass can show the line more than once when its base is pinned again; the last one is the one in force.
 
-Known limit: a rule that was merged and removed again before any task read it leaves no trace in a task's log.
+Known limits: a rule that was merged and removed again before any task read it leaves no trace in a task's log. `provefab prune` deletes the record of the tasks it removes, so the number of a removed rule that no remaining pass loaded can be forgotten, and Provefab Pro could propose that number again.
 
 ## Security
 
