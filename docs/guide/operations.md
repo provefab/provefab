@@ -85,6 +85,7 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do.
 | `another provefab run is already working` | the service already runs | `provefab service uninstall` before a manual pass |
 | `price <id>: no price` in `doctor` | the model matched no known price (a new model, a typo, or a Pi provider models.dev does not list); it still runs, ranked after priced models, and its cost is not counted | set `price_id = "provider/model"`, or `price_in` and `price_out` |
 | `prices: snapshot` or an old cache in `doctor` | the machine could not reach models.dev or LiteLLM | nothing to do: routing uses the cache or the built-in prices; the service tries again an hour later |
+| `rules <slug> FAIL` in `doctor` | `.provefab/rules.md` is invalid (the line says why) or could not be read; tasks run without rules meanwhile | fix the file in a pull request and merge it (see [Repository rules](rules.md)); `doctor` reads the base branch as last fetched |
 | `[repos.merge] is read by Provefab Pro` warning | the config asks for auto-merge | expected with this binary: PRs open and wait for you |
 
 To dig into a task:

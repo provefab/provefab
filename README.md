@@ -18,7 +18,9 @@ Provefab keeps a local record of what each change observed, claimed and decided,
 
 Changes that touch CI, dependencies, migrations, infrastructure, secret-looking files or paths you name get stricter review: extra checks, a frontier reviewer from another provider when one is configured, a Risk section in the PR and a label on the issue (see [Configuration](docs/guide/configuration.md#reposrisk-risk-aware-policy)).
 
-The pull request then waits for your click. Optionally set `post_merge_checks` per repository: after a Provefab PR merges, Provefab runs your commands on the merged commit; on failure it can open a human-reviewed revert PR (unless a later commit already fixed it), but only when the reverted tree passes the same checks. It never merges a revert automatically. This checks repository commands, not deployed production health. Provefab Pro adds a second reviewer on another model, merge policies (auto-merge small, tested changes under fail-closed conditions), cost reports per repository and model, and reviewer calibration reports; it is not in this repository.
+A repository can keep its conventions in `.provefab/rules.md`: every stage gets them and the reviewer reports a change that breaks one (see [Repository rules](docs/guide/rules.md)).
+
+The pull request then waits for your click. Optionally set `post_merge_checks` per repository: after a Provefab PR merges, Provefab runs your commands on the merged commit; on failure it can open a human-reviewed revert PR (unless a later commit already fixed it), but only when the reverted tree passes the same checks. It never merges a revert automatically. This checks repository commands, not deployed production health. Provefab Pro adds a second reviewer on another model, merge policies (auto-merge small, tested changes under fail-closed conditions), cost reports per repository and model, reviewer calibration reports, and rule proposals drafted from your decisions; it is not in this repository.
 
 ## Quick start
 
@@ -30,7 +32,7 @@ Requirements: macOS, `git` and `gh` (signed in with `gh auth login`), and at lea
 #       provefab-<version>-macos-universal.zip from the Releases page, unzip, then
 sudo install -m 755 provefab /usr/local/bin/provefab
 #    b. from source, with Rust 1.96 or newer:
-cargo install --git https://github.com/provefab/provefab --tag v0.3.0 --locked provefab
+cargo install --git https://github.com/provefab/provefab --tag v0.4.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
 provefab login claude        # Claude plan login, in ~/.provefab/claude
@@ -87,6 +89,7 @@ Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in commen
 
 - [Configuration](docs/guide/configuration.md): every field of `provefab.toml`, with its default.
 - [Usage](docs/guide/usage.md): writing issues that land, answering Provefab, restarting, reading states.
+- [Repository rules](docs/guide/rules.md): conventions in `.provefab/rules.md`, given to every stage and checked by the reviewer.
 - [Jira and Linear](docs/guide/trackers.md) (beta): issues from a Jira Cloud project or a Linear team, pull requests on GitHub.
 - [Operations](docs/guide/operations.md): the service, logs, budgets, troubleshooting.
 - [Security](docs/guide/security.md): what agents can and cannot do, and who can trigger Provefab.

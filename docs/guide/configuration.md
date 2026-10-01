@@ -115,6 +115,9 @@ Provefab classifies each round's changed files by path into risk categories. A r
 | `migrations` | `**/migrations/**`, `**/*.sql` |
 | `infrastructure` | `**/Dockerfile*`, `**/*.tf`, `k8s/**`, `helm/**`, `**/docker-compose*.yml` |
 | `secrets-config` | `**/.env*`, `**/*.pem`, `**/*.key`, `**/*secret*` |
+| `rules` | `.provefab/rules.md` (see [Repository rules](rules.md)) |
+
+Provefab never commits `.provefab/` in a task's pull request, so the `rules` category marks a change to the rules made by other means; disable it like any built-in.
 
 **Patterns.** `/`-separated, anchored at the repository root, case-sensitive. `**` matches any number of segments (including none), `*` any run of characters inside one segment, everything else literally. `.gitlab-ci.yml` matches only the root file; write `**/<name>` for any directory. For a rename, both the old and the new path count.
 

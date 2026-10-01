@@ -5,14 +5,14 @@
 1. **You set the `provefab` label** on an open issue. It is the only authorization Provefab needs. Only people who can triage the repository can set a label. On Jira or Linear, the label goes on the ticket (see [Jira and Linear](trackers.md)).
 2. **Classification.** Jev reads the title, body and labels. It estimates the kind (bugfix, feature, refactor, docs, test, chore), the difficulty, the scope, and whether the issue is too vague.
 3. **A question, if the issue is vague.** Provefab asks in a comment and sets `provefab:needs-info`. Answer with a comment, as the issue author or a collaborator. If the answer is enough, the task resumes, and your answer is added to the issue text every stage reads.
-4. **Plan** (read-only tools). For a bugfix, the plan must give a **reproduction command** that fails before the fix. If it already passes, Provefab stops: the bug is not reproduced.
+4. **Plan** (read-only tools). For a bugfix, the plan must give a **reproduction command** that fails before the fix. If it already passes, Provefab stops: the bug is not reproduced. The plan sees your [repository rules](rules.md), if any.
 5. **Implementation.** The agent changes the code in an isolated worktree. The guard filters every tool call.
 6. **Checks.** Your `gates` commands run, plus the reproduction command for a bugfix. On failure, Provefab:
    - triages the cause with Jev;
    - retries;
    - moves to a stronger model;
    - stops if nothing works.
-7. **Review** by a different model provider than the implementer's. If it asks for changes, the implementer gets all of them, earlier rounds included, and must write a test for each. When Jev asks for a frontier review (a high review risk), the review runs on the frontier tier only if your catalog has a frontier model from another provider than the implementer's; otherwise the usual cross-provider standard reviewer stays. `provefab log` shows the reason under `routes:`.
+7. **Review** by a different model provider than the implementer's. If it asks for changes, the implementer gets all of them, earlier rounds included, and must write a test for each. When Jev asks for a frontier review (a high review risk), the review runs on the frontier tier only if your catalog has a frontier model from another provider than the implementer's; otherwise the usual cross-provider standard reviewer stays. `provefab log` shows the reason under `routes:`. The review checks the change against the rules it was given; a finding that cites one shows the rule, for example `F2 · R3`.
 8. **Pull request.** Provefab commits, pushes and opens the PR. Its text lists the checks, the routing, and any deleted or disabled tests. It comments on the issue and sets `provefab:in-pr`. For a Jira or Linear ticket, the branch is `provefab/ENG-123-<title>`, the title starts with `ENG-123:` and the body links the ticket. The PR then waits for your review.
 9. **Optional post-merge verification.** If you set `post_merge_checks`, Provefab runs them on the exact commit its PR produced on the base branch. A failing command is rerun once on a fresh checkout; if it passes then, the run counts as passed and the command is reported as flaky. On a confirmed failure, Provefab runs the same checks on the current base: if they pass, a later commit already fixed it and no revert is proposed. Otherwise Provefab prepares a revert on the current base and opens a revert PR only if the reverted tree passes the same checks. Every merge is verified. A revert is never proposed for a multi-commit PR a person merged by squash or rebase (Provefab cannot tell the two apart); a merge commit is reverted as one commit. In that case its failure is reported and a human decides. Revert conflicts, failing revert checks, and a base branch that keeps moving also require a human. Provefab never merges a revert PR. These are repository commands, not production monitoring.
 
@@ -95,12 +95,17 @@ Each finding in the PR's **Review notes** has a key (`F1`, `F2`...). To record w
 - **routes:** for each stage, the model it ran on and why, for example `review -> sonnet-sub: subscription, quota weight 1.0 (prefer subscription)`.
 - **stage runs:** every stage, with its model, outcome, turns, tokens (`in/out`, then `(+cache read/write)` when the model cached), cost, check score and session directory (full transcript). The cost is in dollars for a model signed in by API key (`cost $0.0123`) and in quota units for a subscription (`quota 0.42`: millions of tokens times the model's quota weight). A `total:` line sums the task.
 The pull request's **Routing** section lists the model of each stage and ends with the task's cost, for example `Cost: $0.4210 API · 1.20 quota units.` A part that is zero is left out.
+- **record:** `rules_loaded pass N: R1, R3` (the rules the pass read from its base commit, and how many the budget left out of the plan prompt) or `rules_invalid pass N: <reason>` (the task ran without rules). A finding citing a rule shows it after its key: `F2 · R3 · blocking · ...`.
 - **post-merge checks:** state, failure kind, merged SHA, base tip, revert commit, revert PR link, failed commands and flaky commands. Session directories for `post-merge`, `post-merge-base` (the same checks on the current base tip) and `revert-check` in **stage runs** contain command results.
 - **last plan / review / failure:** the latest structured answers.
 
 ## Measuring
 
 `provefab stats` sums up each repository: how many issues became pull requests, how many were merged (automatically or by a person), closed or reopened after a merge, post-merge check outcomes and revert PRs, the median time from issue to pull request, and which reviewers approved the merged ones. Automatic merges are counted from the version that introduced the command on.
+
+## Maintenance runs
+
+`provefab run` gives the edition's policy a daily call per repository, the first tick after midnight local time (and at startup when the last call is a day old). The free edition does nothing then. `provefab status` ends with the last maintenance run per repository and kind, for example `maintenance acme/api rules: proposed 2 changes (2026-10-05T00:00:04Z)  <pull request>`, and with the daily call itself only when it failed.
 
 ## Trying it safely
 

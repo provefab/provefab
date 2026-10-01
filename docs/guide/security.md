@@ -25,6 +25,8 @@ Agents do not have push credentials either:
 
 The checks (`gates`) run with the same protections.
 
+**Repository rules** (`.provefab/rules.md`, see [Repository rules](rules.md)) are instructions to the agents, read from the base branch, and stay under the guard: a rule cannot allow a tool call the guard refuses. On a public repository, review pull requests that change that file closely.
+
 **Only Provefab commits and pushes**, with your permissions. Its own git calls never run the repository's hooks: an agent could have written them.
 
 Claude Code and Codex run **unmodified**, with your own plan login or your own API key, in separate config directories per sign-in mode. Codex never trusts the repository: its project config is ignored.
@@ -38,6 +40,8 @@ Jev classifies issues and routes stages. It can stop an agent going in circles, 
 ## Pull requests and merging
 
 This binary never merges. Every pull request waits for a person, and its text lists the checks that ran and any test the change deletes or disables.
+
+Periodic work (Provefab Pro's rule proposals) runs one model call in an empty directory outside every checkout, with no tools: the guard refuses every tool call (`provefab guard --no-tools`), so the model gets only its prompt. That prompt can carry what people wrote on the repository, which is why it gets no tools. What goes to the model provider is the comment and review text, with credential-looking strings removed, and never command output. Its pull requests are never merged automatically. Provefab pushes a proposal branch only while the branch is as Provefab last left it (a leased push): if a person commits to it, Provefab pushes nothing more there until the pull request is merged or closed or the branch is deleted, so a maintainer's edit is never overwritten.
 
 Provefab Pro adds merge policies. Ready to merge is the default; auto-merge is opt-in, needs a second reviewer on a different model, and conditions that all fail closed: checks passed, reproduction really failed for a bugfix, no test weakened, a test added or changed, no excluded path touched (`.github/**` by default), no detected risk category unless `allow_risk` lists it (never `unknown`), a size cap, an unchanged base, and a merge pinned to the checked commit. **Public repositories are never auto-merged by default**, since anyone can write their issues; a second model is not a defence against a crafted issue.
 
