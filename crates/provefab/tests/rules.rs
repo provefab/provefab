@@ -361,3 +361,39 @@ async fn without_rules_the_pr_body_and_notes_are_unchanged() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn doctor_prints_the_rules_of_each_repository() {
+    use provefab::commands::{Check, Tools, rules_checks};
+    let f = fixture(&["true"]);
+    let paths = Paths::new(&f.home);
+    let tools = Tools::default();
+    let hub = FakeHub::new("x");
+    let line = |checks: Vec<Check>| checks.into_iter().find(|c| c.name == "rules o/r").unwrap();
+    let none = line(rules_checks(&tools, &f.config, &paths, &hub).await);
+    assert_eq!((none.ok, none.detail.as_str()), (true, "none"));
+    commit_rules(&f, RULES);
+    let three = line(rules_checks(&tools, &f.config, &paths, &hub).await);
+    assert_eq!((three.ok, three.detail.as_str()), (true, "3 rules on main"));
+    hub.public.store(true, std::sync::atomic::Ordering::SeqCst);
+    let public = line(rules_checks(&tools, &f.config, &paths, &hub).await);
+    assert_eq!(
+        public.detail,
+        "3 rules on main; rules are instructions to the agents: review pull requests that change .provefab/rules.md closely"
+    );
+    hub.public.store(false, std::sync::atomic::Ordering::SeqCst);
+    commit_rules(&f, "## R0: Zero\n");
+    let bad = line(rules_checks(&tools, &f.config, &paths, &hub).await);
+    assert!(!bad.ok);
+    assert_eq!(
+        bad.detail,
+        "invalid, tasks run without rules: line 1: a rule heading is `## R<number>: <summary>`, the number from 1, without leading zeros"
+    );
+    let mut managed = f.config.clone();
+    managed.repos[0].local_path = None;
+    let later = line(rules_checks(&tools, &managed, &paths, &hub).await);
+    assert_eq!(
+        (later.ok, later.detail.as_str()),
+        (true, "none yet: the repository is cloned on its first task")
+    );
+}

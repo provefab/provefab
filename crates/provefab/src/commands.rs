@@ -13,7 +13,7 @@ use tokio::process::Command;
 use crate::config::{Config, RepoConfig};
 use crate::forge::{ForgeError, Git};
 use crate::paths::Paths;
-use crate::ports::Hub;
+use crate::ports::{Forge, Hub};
 use crate::post_merge::CheckState;
 use crate::record::{Event, MergedBy, StoredEvent, parse_date, redact_event, redact_text};
 use crate::store::{NewIssue, Store, StoreError};
@@ -1256,6 +1256,53 @@ pub async fn tracker_checks(
                 .map(|d| format!("{what}: {d}"))
                 .map_err(|e| format!("{what}: {e}")),
         ));
+    }
+    checks
+}
+
+/// One `rules <slug>` line per repository (repository rules spec §8): the
+/// rules on the base branch as last fetched (doctor never fetches), `none`,
+/// or why the file is invalid. On a public repository, or one whose
+/// visibility cannot be read, the line says the rules steer the agents.
+pub async fn rules_checks(
+    tools: &Tools,
+    config: &Config,
+    paths: &Paths,
+    forge: &impl Forge,
+) -> Vec<Check> {
+    const PUBLIC_NOTE: &str = "; rules are instructions to the agents: review pull requests that change .provefab/rules.md closely";
+    let git = Git {
+        program: tools.git.clone(),
+    };
+    let mut checks = Vec::new();
+    for repo in &config.repos {
+        let checkout = repo.path_in(&paths.home);
+        let (ok, mut detail) = if !checkout.join(".git").exists() {
+            (
+                true,
+                "none yet: the repository is cloned on its first task".to_string(),
+            )
+        } else {
+            let base = git.base_ref(&checkout, &repo.base).await;
+            match git.show_file(&checkout, &base, crate::rules::PATH).await {
+                Ok(None) => (true, "none".to_string()),
+                Ok(Some(text)) => match crate::rules::parse(&text) {
+                    Ok(rules) if rules.len() == 1 => (true, format!("1 rule on {}", repo.base)),
+                    Ok(rules) => (true, format!("{} rules on {}", rules.len(), repo.base)),
+                    Err(e) => (false, format!("invalid, tasks run without rules: {e}")),
+                },
+                // Fixed text: raw git output may carry paths or credentials.
+                Err(_) => (false, format!("could not read {}", crate::rules::PATH)),
+            }
+        };
+        if forge.repo_is_public(&repo.slug).await.unwrap_or(true) {
+            detail.push_str(PUBLIC_NOTE);
+        }
+        checks.push(Check {
+            name: format!("rules {}", repo.slug),
+            ok,
+            detail,
+        });
     }
     checks
 }

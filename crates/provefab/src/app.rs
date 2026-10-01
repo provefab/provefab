@@ -477,6 +477,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 commands::tracker_checks(&Tools::default(), &config, &crate::tracker::process_env)
                     .await,
             );
+            checks.extend(commands::rules_checks(&Tools::default(), &config, &paths, &gh()).await);
             let mut ok = policy_ok;
             for c in &checks {
                 // The Jev key is optional: its absence is reported, not fatal.
