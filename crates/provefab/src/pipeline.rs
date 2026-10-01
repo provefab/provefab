@@ -39,6 +39,9 @@ const REPLY_THRESHOLD: f64 = 0.7;
 const MAX_ATTEMPTS: u32 = 4;
 /// The review prompt carries the diff up to this many characters.
 const DIFF_LIMIT: usize = 60_000;
+/// The `file` of a finding made from a person's comment on a closed pull
+/// request (D52): periodic work reads these as change requests.
+pub(crate) const PR_COMMENT_FILE: &str = "(pull request comment)";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -1047,7 +1050,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
 
     /// What the task branches from and diffs against: `origin/<base>` once
     /// fetched, else the local `<base>` (D48).
-    async fn base_ref(&self, repo: &RepoConfig) -> String {
+    pub(crate) async fn base_ref(&self, repo: &RepoConfig) -> String {
         self.git.base_ref(&self.checkout(repo), &repo.base).await
     }
 
@@ -1089,7 +1092,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// A managed repo is cloned on first use; every repo is fetched before a
     /// new pass branches, so it starts from the latest base (D48). Returns
     /// whether the fetch succeeded.
-    async fn refresh_checkout(&self, repo: &RepoConfig) -> Result<bool, ForgeError> {
+    pub(crate) async fn refresh_checkout(&self, repo: &RepoConfig) -> Result<bool, ForgeError> {
         let checkout = self.checkout(repo);
         if repo.managed() && !checkout.join(".git").exists() {
             self.hub.repo_clone(&repo.slug, &checkout).await?;
@@ -1346,7 +1349,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                     .map(|c| (c, crate::record::strip_commands(&c.body)))
                     .filter(|(_, body)| !body.is_empty())
                     .map(|(c, body)| Finding {
-                        file: "(pull request comment)".into(),
+                        file: PR_COMMENT_FILE.into(),
                         line: None,
                         severity: Severity::Blocking,
                         text: format!("{} wrote: {}", c.author, body),

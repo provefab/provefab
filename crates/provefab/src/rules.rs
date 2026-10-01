@@ -3,19 +3,25 @@
 //! commit, given to the stages and checked by the reviewer. The format,
 //! selection and rendering are pure.
 
+use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Mutex;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::agents::StageRunner;
 use crate::config::RepoConfig;
-use crate::pipeline::{Pipeline, PipelineError, pass_of};
+use crate::forge::PrState;
+use crate::pipeline::{PR_COMMENT_FILE, Pipeline, PipelineError, pass_of};
+use crate::policy::{BoxFuture, PeriodicTools, Signal, SignalKind};
 use crate::ports::{Hub, Oracle};
-use crate::record::Event;
+use crate::post_merge::CheckState;
+use crate::record::{Disposition, Event};
 use crate::risk::{UNMATCHABLE, glob_match, unmatchable};
-use crate::store::{TaskRow, Write};
-use crate::task::Stage;
+use crate::stage::ReviewOutput;
+use crate::store::{MaintenanceRun, TaskRow, Write, now};
+use crate::task::{Stage, TaskState};
 
 /// Where a repository keeps its rules, from its root (spec §1).
 pub const PATH: &str = ".provefab/rules.md";
@@ -299,6 +305,17 @@ where
     O: Oracle + Sync,
     H: Hub + Sync,
 {
+    /// The core's periodic tools for `repo` (spec §7), for the scheduler and
+    /// for Provefab Pro's commands. Its runs start now.
+    pub fn maintenance<'a>(&'a self, repo: &'a RepoConfig) -> Maintenance<'a, R, O, H> {
+        Maintenance {
+            p: self,
+            repo,
+            started_at: now(),
+            spent: Mutex::new(Spent::default()),
+        }
+    }
+
     /// Reads the pass's rules at `base` in the repository's checkout (spec
     /// §4) and records them: the `rules` output its stages read (plan
     /// decision 2), with `rules_loaded` or `rules_invalid`. A missing file
@@ -403,9 +420,492 @@ where
     }
 }
 
+/// The core's `PeriodicTools` for one repository (spec §7). The cost of
+/// its model calls waits here until a run is recorded (plan decision 15).
+pub struct Maintenance<'a, R, O, H> {
+    p: &'a Pipeline<R, O, H>,
+    repo: &'a RepoConfig,
+    started_at: i64,
+    spent: Mutex<Spent>,
+}
+
+/// Model calls not yet written with a run.
+#[derive(Debug, Default)]
+struct Spent {
+    model_id: Option<String>,
+    cost_usd: Option<f64>,
+    quota_units: Option<f64>,
+}
+
+/// `41` for `https://github.com/o/r/pull/41`.
+fn pr_number(url: &str) -> Option<u64> {
+    url.rsplit_once("/pull/")?
+        .1
+        .split(['/', '#', '?'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// `pr#<n>/<what>` for a pull request URL, else `task#<id>/<what>`.
+fn signal_id(task: &TaskRow, url: &str, what: &str) -> String {
+    match pr_number(url) {
+        Some(n) => format!("pr#{n}/{what}"),
+        None => format!("task#{}/{what}", task.id),
+    }
+}
+
+/// A tool's error is fixed text (pre-flight S1): the detail, which can hold
+/// a path or a token, goes to the log only, redacted.
+fn failed(said: String, detail: impl std::fmt::Display) -> String {
+    eprintln!(
+        "provefab: {said}: {}",
+        redact_credentials(&detail.to_string())
+    );
+    said
+}
+
+/// `text` with every word that looks like a credential replaced by
+/// `<redacted>` (pre-flight S6). Signals carry what people and reviewers
+/// wrote to the model provider; `tracker::redact` needs the secrets it
+/// removes, and these are anyone's, so this goes by shape.
+fn redact_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut after_bearer = false;
+    for piece in text.split_inclusive(char::is_whitespace) {
+        let word = piece.trim_end_matches(char::is_whitespace);
+        if word.is_empty() {
+            out.push_str(piece);
+            continue;
+        }
+        if after_bearer || looks_like_credential(word) {
+            out.push_str("<redacted>");
+        } else {
+            out.push_str(word);
+        }
+        out.push_str(&piece[word.len()..]);
+        after_bearer = word.eq_ignore_ascii_case("bearer");
+    }
+    out
+}
+
+/// Token prefixes of GitHub, GitLab, Slack, AWS and the model providers.
+const TOKEN_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "sk-",
+    "akia",
+];
+/// What the name of an assigned credential holds (`GH_TOKEN=...`).
+const CREDENTIAL_NAMES: &[&str] = &["token", "secret", "password", "passwd", "key", "auth"];
+
+fn looks_like_credential(word: &str) -> bool {
+    let w = word.trim_matches(|c: char| "\"'`()[]{}<>,;.".contains(c));
+    let lower = w.to_ascii_lowercase();
+    let prefixed = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .any(|part| {
+            TOKEN_PREFIXES
+                .iter()
+                .any(|p| part.starts_with(p) && part.len() >= p.len() + 12)
+        });
+    let assigned = lower.split_once(['=', ':']).is_some_and(|(name, value)| {
+        !value.is_empty() && CREDENTIAL_NAMES.iter().any(|n| name.contains(n))
+    });
+    let userinfo = lower
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.split('/').next().is_some_and(|h| h.contains('@')));
+    // Long, opaque and mixed case: a key, not a word or a (lowercase) sha.
+    let opaque = w.len() >= 32
+        && w.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-+/=".contains(c))
+        && w.chars().any(|c| c.is_ascii_uppercase())
+        && w.chars().any(|c| c.is_ascii_lowercase())
+        && w.chars().any(|c| c.is_ascii_digit());
+    prefixed || assigned || userinfo || opaque
+}
+
+impl<R, O, H> Maintenance<'_, R, O, H>
+where
+    R: StageRunner + Sync,
+    O: Oracle + Sync,
+    H: Hub + Sync,
+{
+    /// Plan decision 17.
+    async fn collect(&self, since: i64) -> Result<Vec<Signal>, PipelineError> {
+        let (p, slug) = (self.p, &self.repo.slug);
+        let policy = crate::risk::resolve(self.repo.risk.as_ref()).unwrap_or_default();
+        let configured: HashSet<&str> = self
+            .repo
+            .gates
+            .iter()
+            .chain(policy.categories.iter().flat_map(|c| &c.checks))
+            .map(String::as_str)
+            .collect();
+        let mut out = Vec::new();
+        for task in p.store.tasks_in(&TaskState::ALL).await? {
+            if !task.repo.eq_ignore_ascii_case(slug) {
+                continue;
+            }
+            let events = p.store.events(task.id).await?;
+            let typed: Vec<(i64, Event)> = events
+                .iter()
+                .filter_map(|e| Some((e.at, e.typed()?)))
+                .collect();
+            let fallback = task
+                .pr_url
+                .clone()
+                .unwrap_or_else(|| task.issue_url.clone());
+            let pr_of_pass = |pass: u32| {
+                typed.iter().find_map(|(_, e)| match e {
+                    Event::PrOpened { url, pass: n, .. } if *n == pass => Some(url.clone()),
+                    _ => None,
+                })
+            };
+            let pr_before = |at: i64| {
+                typed.iter().rev().find_map(|(t, e)| match e {
+                    Event::PrOpened { url, .. } if *t <= at => Some(url.clone()),
+                    _ => None,
+                })
+            };
+            for f in p.store.findings(task.id).await? {
+                let reviewed = events
+                    .iter()
+                    .find(|e| e.id == f.event_id)
+                    .map_or(0, |e| e.at);
+                let decided = typed.iter().rev().find_map(|(at, e)| match e {
+                    Event::FindingDisposition {
+                        finding,
+                        disposition,
+                        reason,
+                        ..
+                    } if *finding == f.key => Some((*at, *disposition, reason.clone())),
+                    _ => None,
+                });
+                let rule = f.rule.as_deref().and_then(rule_number);
+                let refused = decided.as_ref().is_some_and(|(_, d, _)| {
+                    matches!(d, Disposition::Rejected | Disposition::Waived)
+                });
+                let at = decided
+                    .as_ref()
+                    .map_or(reviewed, |(a, _, _)| (*a).max(reviewed));
+                if !(refused || rule.is_some()) || at < since {
+                    continue;
+                }
+                let url = pr_of_pass(f.pass).unwrap_or_else(|| fallback.clone());
+                let (disposition, reason) = match decided {
+                    Some((_, d, r)) => (Some(d), r),
+                    None => (None, None),
+                };
+                out.push(Signal {
+                    id: signal_id(&task, &url, &f.key),
+                    at,
+                    url,
+                    kind: SignalKind::Finding {
+                        key: f.key.clone(),
+                        file: redact_credentials(&f.file),
+                        text: redact_credentials(&f.text),
+                        rule,
+                        disposition,
+                        reason: reason.as_deref().map(redact_credentials),
+                    },
+                });
+            }
+            for (at, v) in p.store.outputs_since(task.id, "review", since).await? {
+                let Ok(review) = serde_json::from_value::<ReviewOutput>(v) else {
+                    continue;
+                };
+                let url = pr_before(at).unwrap_or_else(|| fallback.clone());
+                let asked = review
+                    .findings
+                    .into_iter()
+                    .filter(|f| f.file == PR_COMMENT_FILE);
+                for (i, f) in asked.enumerate() {
+                    out.push(Signal {
+                        id: signal_id(&task, &url, &format!("c{}", i + 1)),
+                        at,
+                        url: url.clone(),
+                        kind: SignalKind::ChangeRequest {
+                            text: redact_credentials(&f.text),
+                        },
+                    });
+                }
+            }
+            // Configured commands only: the plan's reproduction command, the
+            // last gate, is model-written and never leaves the machine.
+            let (mut failing, mut last): (Vec<String>, i64) = (Vec::new(), 0);
+            for (at, e) in typed.iter().filter(|(at, _)| *at >= since) {
+                match e {
+                    Event::GatesRun { results, .. } => {
+                        for r in results.iter().filter(|r| !r.passed) {
+                            let command = redact_credentials(&r.command);
+                            if configured.contains(r.command.as_str())
+                                && !failing.contains(&command)
+                            {
+                                failing.push(command);
+                                last = last.max(*at);
+                            }
+                        }
+                    }
+                    Event::PostMerge {
+                        check_id, state, ..
+                    } if state == CheckState::RevertOpen.as_str() => {
+                        out.push(Signal {
+                            id: format!("task#{}/revert-{check_id}", task.id),
+                            at: *at,
+                            url: fallback.clone(),
+                            kind: SignalKind::Revert,
+                        });
+                    }
+                    Event::IssueReopened { previous_pass } => out.push(Signal {
+                        id: format!("task#{}/reopen-{previous_pass}", task.id),
+                        at: *at,
+                        url: task.issue_url.clone(),
+                        kind: SignalKind::Reopen,
+                    }),
+                    _ => {}
+                }
+            }
+            if !failing.is_empty() {
+                out.push(Signal {
+                    id: format!("task#{}/gates", task.id),
+                    at: last,
+                    url: fallback.clone(),
+                    kind: SignalKind::GateFailure { commands: failing },
+                });
+            }
+        }
+        // Every earlier periodic pull request that is merged or closed, whatever its age.
+        let mut seen = HashSet::new();
+        for run in p
+            .store
+            .maintenance_runs(Some(slug))
+            .await?
+            .into_iter()
+            .rev()
+        {
+            let Some(url) = run.pr_url.clone() else {
+                continue;
+            };
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            let merged = match p.hub.pr_status(slug, &url).await {
+                Ok(s) => match s.state {
+                    PrState::Merged => true,
+                    PrState::Closed => false,
+                    PrState::Open => continue,
+                },
+                Err(e) => {
+                    failed(format!("could not read {url}"), e);
+                    continue;
+                }
+            };
+            let what = if merged { "merged" } else { "closed" };
+            out.push(Signal {
+                id: format!("pr#{}/{what}", pr_number(&url).unwrap_or_default()),
+                at: run.finished_at.unwrap_or(run.started_at),
+                url,
+                kind: SignalKind::Proposal {
+                    kind: run.kind,
+                    merged,
+                    detail: run.detail,
+                },
+            });
+        }
+        out.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
+        Ok(out)
+    }
+
+    async fn highest(&self) -> Result<u32, PipelineError> {
+        let mut high = 0;
+        for task in self.p.store.tasks_in(&TaskState::ALL).await? {
+            if !task.repo.eq_ignore_ascii_case(&self.repo.slug) {
+                continue;
+            }
+            for e in self.p.store.events(task.id).await? {
+                if e.kind == "rules_loaded"
+                    && let Some(Event::RulesLoaded { numbers, .. }) = e.typed()
+                {
+                    high = numbers.into_iter().fold(high, u32::max);
+                }
+            }
+            for f in self.p.store.findings(task.id).await? {
+                if let Some(n) = f.rule.as_deref().and_then(rule_number) {
+                    high = high.max(n);
+                }
+            }
+        }
+        Ok(high)
+    }
+
+    async fn base_rules(&self) -> Result<Option<String>, String> {
+        let (p, repo) = (self.p, self.repo);
+        let lock = p.repo_lock(repo);
+        let _guard = lock.lock().await;
+        let not_fetched = || format!("could not fetch {}", repo.slug);
+        match p.refresh_checkout(repo).await {
+            Ok(true) => {}
+            // `refresh_checkout` logged why.
+            Ok(false) => return Err(not_fetched()),
+            Err(e) => return Err(failed(not_fetched(), e)),
+        }
+        let base = p.base_ref(repo).await;
+        p.git
+            .show_file(&p.checkout(repo), &base, PATH)
+            .await
+            .map_err(|e| {
+                let said = format!("could not read {PATH} on the base branch of {}", repo.slug);
+                failed(said, e)
+            })
+    }
+
+    async fn record(
+        &self,
+        kind: &str,
+        outcome: &str,
+        pr_url: Option<&str>,
+        detail: Option<&Value>,
+    ) -> Result<(), String> {
+        let spent = std::mem::take(
+            &mut *self
+                .spent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let run = MaintenanceRun {
+            id: 0,
+            repo: self.repo.slug.clone(),
+            kind: kind.into(),
+            started_at: self.started_at,
+            finished_at: Some(now()),
+            model_id: spent.model_id,
+            cost_usd: spent.cost_usd,
+            quota_units: spent.quota_units,
+            outcome: outcome.into(),
+            pr_url: pr_url.map(Into::into),
+            detail: detail.cloned(),
+        };
+        self.p
+            .store
+            .record_maintenance_run(&run)
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                failed(
+                    format!("could not record the {kind} run of {}", run.repo),
+                    e,
+                )
+            })
+    }
+}
+
+impl<R, O, H> PeriodicTools for Maintenance<'_, R, O, H>
+where
+    R: StageRunner + Sync,
+    O: Oracle + Sync,
+    H: Hub + Sync,
+{
+    fn signals(&self, since: i64) -> BoxFuture<'_, Result<Vec<Signal>, String>> {
+        Box::pin(async move {
+            self.collect(since).await.map_err(|e| {
+                failed(
+                    format!("could not read the record of {}", self.repo.slug),
+                    e,
+                )
+            })
+        })
+    }
+
+    fn highest_rule_number(&self) -> BoxFuture<'_, Result<u32, String>> {
+        Box::pin(async move {
+            self.highest().await.map_err(|e| {
+                failed(
+                    format!("could not read the record of {}", self.repo.slug),
+                    e,
+                )
+            })
+        })
+    }
+
+    fn rules_at_base(&self) -> BoxFuture<'_, Result<Option<String>, String>> {
+        Box::pin(self.base_rules())
+    }
+
+    fn last_run<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<Option<MaintenanceRun>, String>> {
+        Box::pin(async move {
+            self.p
+                .store
+                .last_maintenance_run(&self.repo.slug, kind)
+                .await
+                .map_err(|e| {
+                    failed(
+                        format!("could not read the {kind} runs of {}", self.repo.slug),
+                        e,
+                    )
+                })
+        })
+    }
+
+    fn record_run<'a>(
+        &'a self,
+        kind: &'a str,
+        outcome: &'a str,
+        pr_url: Option<&'a str>,
+        detail: Option<&'a Value>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(self.record(kind, outcome, pr_url, detail))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_looking_words_are_redacted_and_prose_is_not() {
+        for (said, want) in [
+            ("use GH_TOKEN=ghp_abcdefghijklmnop0123", "use <redacted>"),
+            (
+                "key `sk-ant-api03-abcdefghijklmn` leaked",
+                "key <redacted> leaked",
+            ),
+            (
+                "Authorization: Bearer abc.def",
+                "Authorization: Bearer <redacted>",
+            ),
+            (
+                "clone https://me:pw@github.com/o/r\nnow",
+                "clone <redacted>\nnow",
+            ),
+            ("aws AKIAIOSFODNN7EXAMPLE1 here", "aws <redacted> here"),
+            (
+                "x Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MEFCQ0RFRg y",
+                "x <redacted> y",
+            ),
+        ] {
+            assert_eq!(redact_credentials(said), want, "{said}");
+        }
+        for prose in [
+            "use the existing helper, not anyhow",
+            "the task-runner and sk-learn stay",
+            "commit 0123456789abcdef0123456789abcdef01234567 broke it",
+            "the key: is the domain's word\n\n  indented",
+            "see https://github.com/o/r/pull/41",
+        ] {
+            assert_eq!(redact_credentials(prose), prose);
+        }
+    }
 
     const FILE: &str = "# Our rules\n\nA human introduction.\n\n## About\n\nIgnored too.\n\n## R3: Errors in the API layer use ApiError, never anyhow\npaths: src/api/**, src/web/*.rs\nsources: PR #41 F2 (rejected), PR #57 (closed with a change request)\n\nReturn `ApiError` from handlers; `anyhow` stays in the CLI.\n\n## R7: Keep pull requests small\n\nOne change per pull request.\n### Why\nReviews stay short.\n";
 

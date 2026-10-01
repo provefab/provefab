@@ -1,7 +1,11 @@
 #![cfg(feature = "testkit")]
 //! Repository rules (docs/specs/2026-10-01-repo-rules-design.md).
 
+use provefab::policy::{PeriodicTools, SignalKind};
+use provefab::record::{Disposition, Event, GateEntry};
 use provefab::rules::TITLE;
+use provefab::stage::{Finding, Severity};
+use provefab::store::{MaintenanceRun, Write};
 use provefab::testkit::*;
 
 /// Commits `text` as the repository's rules on `main` and pushes it, as a
@@ -396,4 +400,367 @@ async fn doctor_prints_the_rules_of_each_repository() {
         (later.ok, later.detail.as_str()),
         (true, "none yet: the repository is cloned on its first task")
     );
+}
+
+fn run_of(kind: &str, pr_url: Option<&str>, detail: Option<Value>) -> MaintenanceRun {
+    MaintenanceRun {
+        id: 0,
+        repo: "o/r".into(),
+        kind: kind.into(),
+        started_at: 1,
+        finished_at: Some(2),
+        model_id: None,
+        cost_usd: None,
+        quota_units: None,
+        outcome: "proposed 1 change".into(),
+        pr_url: pr_url.map(Into::into),
+        detail,
+    }
+}
+
+#[tokio::test]
+async fn signals_hold_the_repository_record_since_a_time() {
+    let f = fixture(&["make test"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    let s = &p.store;
+    let pr = "https://github.com/o/r/pull/41";
+    s.write_with_events(
+        id,
+        Write::Nothing,
+        &[Event::PrOpened {
+            url: pr.into(),
+            head: None,
+            base: "main".into(),
+            pass: 1,
+        }],
+    )
+    .await
+    .unwrap();
+    let finding = |text: &str, rule: Option<&str>| Finding {
+        file: "src/a.rs".into(),
+        line: Some(3),
+        severity: Severity::Minor,
+        text: text.into(),
+        rule: rule.map(Into::into),
+    };
+    s.record_review(
+        id,
+        &json!({}),
+        "std-codex",
+        1,
+        0,
+        "approve",
+        &[
+            finding("uses anyhow", Some("R3")),
+            finding("rename x", None),
+            finding("typo", None),
+        ],
+    )
+    .await
+    .unwrap();
+    for (key, d, reason) in [
+        ("F2", Disposition::Rejected, Some("x is the domain's word")),
+        ("F3", Disposition::Accepted, None),
+    ] {
+        s.record_human(
+            id,
+            &Event::FindingDisposition {
+                finding: key.into(),
+                disposition: d,
+                reason: reason.map(Into::into),
+                login: "alice".into(),
+                association: "OWNER".into(),
+                comment: format!("alice@{key}"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let gate = |command: &str| GateEntry {
+        command: command.into(),
+        exit: Some(1),
+        timed_out: false,
+        passed: false,
+        output_ref: "/s".into(),
+    };
+    s.write_with_events(
+        id,
+        Write::Nothing,
+        &[
+            Event::GatesRun {
+                stage: "gates".into(),
+                round: 0,
+                results: vec![gate("make test"), gate("grep SENTINEL_42 x")],
+            },
+            Event::IssueReopened { previous_pass: 1 },
+            Event::PostMerge {
+                check_id: 5,
+                state: "revert_open".into(),
+                failure_kind: None,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    s.record_output(
+        id,
+        "review",
+        &json!({"verdict": "changes", "findings": [{"file": "(pull request comment)", "line": null,
+            "severity": "blocking", "text": "alice wrote: use the existing helper"}]}),
+    )
+    .await
+    .unwrap();
+    let refused = json!({"changes": [{"action": "add", "rule": 4, "summary": "s", "sources": []}]});
+    s.record_maintenance_run(&run_of(
+        "rules",
+        Some("https://github.com/o/r/pull/90"),
+        Some(refused.clone()),
+    ))
+    .await
+    .unwrap();
+    let closed = provefab::forge::PrStatus {
+        state: provefab::forge::PrState::Closed,
+        comments: vec![],
+        head_sha: None,
+        merge_sha: None,
+        base_ref: None,
+        commit_count: None,
+    };
+    p.hub
+        .pr_statuses
+        .lock()
+        .unwrap()
+        .insert("https://github.com/o/r/pull/90".into(), closed);
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let signals = tools.signals(0).await.unwrap();
+    let ids: Vec<&str> = signals.iter().map(|s| s.id.as_str()).collect();
+    for want in [
+        "pr#41/F1",
+        "pr#41/F2",
+        "pr#41/c1",
+        "task#1/gates",
+        "task#1/reopen-1",
+        "task#1/revert-5",
+        "pr#90/closed",
+    ] {
+        assert!(ids.contains(&want), "{want} missing from {ids:?}");
+    }
+    assert!(
+        !ids.contains(&"pr#41/F3"),
+        "accepted and citing no rule: {ids:?}"
+    );
+    let get = |id: &str| signals.iter().find(|s| s.id == id).unwrap();
+    assert_eq!(get("pr#41/F1").url, pr);
+    assert!(matches!(
+        &get("pr#41/F1").kind,
+        SignalKind::Finding {
+            rule: Some(3),
+            disposition: None,
+            ..
+        }
+    ));
+    assert!(matches!(&get("pr#41/F2").kind,
+        SignalKind::Finding { disposition: Some(Disposition::Rejected), reason: Some(r), .. } if r == "x is the domain's word"));
+    assert!(matches!(&get("pr#41/c1").kind,
+        SignalKind::ChangeRequest { text } if text == "alice wrote: use the existing helper"));
+    // Model-written commands never leave the machine; configured ones do.
+    assert_eq!(
+        get("task#1/gates").kind,
+        SignalKind::GateFailure {
+            commands: vec!["make test".into()]
+        }
+    );
+    assert!(!format!("{signals:?}").contains("SENTINEL_42"));
+    assert_eq!(
+        get("pr#90/closed").kind,
+        SignalKind::Proposal {
+            kind: "rules".into(),
+            merged: false,
+            detail: Some(refused)
+        }
+    );
+    // Later than everything: only the periodic pull request's outcome, whatever its age.
+    let later = tools.signals(provefab::store::now() + 100).await.unwrap();
+    assert_eq!(
+        later.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["pr#90/closed"]
+    );
+}
+
+#[tokio::test]
+async fn the_highest_rule_number_counts_loaded_and_cited_rules() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    let repo = f.config.repos[0].clone();
+    assert_eq!(p.maintenance(&repo).highest_rule_number().await.unwrap(), 0);
+    p.store
+        .write_with_events(
+            id,
+            Write::Nothing,
+            &[Event::RulesLoaded {
+                pass: 1,
+                numbers: vec![1, 4],
+                sha256: "s".into(),
+                omitted: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    let cited = Finding {
+        file: "a".into(),
+        line: None,
+        severity: Severity::Minor,
+        text: "t".into(),
+        rule: Some("R7".into()),
+    };
+    p.store
+        .record_review(id, &json!({}), "m", 1, 0, "approve", &[cited])
+        .await
+        .unwrap();
+    assert_eq!(p.maintenance(&repo).highest_rule_number().await.unwrap(), 7);
+}
+
+#[tokio::test]
+async fn runs_are_recorded_and_read_back_per_kind() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    assert!(tools.last_run("rules").await.unwrap().is_none());
+    let detail = json!({"highest": 3});
+    tools
+        .record_run(
+            "rules",
+            "proposed 1 change",
+            Some("https://github.com/o/r/pull/90"),
+            Some(&detail),
+        )
+        .await
+        .unwrap();
+    let run = tools.last_run("rules").await.unwrap().unwrap();
+    assert_eq!(run.outcome, "proposed 1 change");
+    assert_eq!(
+        run.pr_url.as_deref(),
+        Some("https://github.com/o/r/pull/90")
+    );
+    assert_eq!(run.detail, Some(detail));
+    assert!(run.finished_at.is_some_and(|t| t >= run.started_at));
+    assert_eq!(
+        (run.model_id, run.cost_usd, run.quota_units),
+        (None, None, None)
+    );
+    assert!(tools.last_run("other").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn rules_at_base_fetches_the_base_branch_first() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    assert_eq!(tools.rules_at_base().await.unwrap(), None);
+    // Merged elsewhere: only a fetch can see it.
+    let other = f._dir.path().join("other");
+    git(
+        f._dir.path(),
+        &[
+            "clone",
+            "-q",
+            f.origin.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(other.join(".provefab")).unwrap();
+    std::fs::write(
+        other.join(".provefab/rules.md"),
+        "## R1: Pushed elsewhere\n",
+    )
+    .unwrap();
+    git(&other, &["add", "-f", ".provefab/rules.md"]);
+    git(&other, &["commit", "-q", "-m", "rules"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    assert_eq!(
+        tools.rules_at_base().await.unwrap().as_deref(),
+        Some("## R1: Pushed elsewhere")
+    );
+}
+
+/// A fake whose clone fails with a credential in its error (S1).
+#[tokio::test]
+async fn rules_at_base_errors_are_fixed_text() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.clone_error.lock().unwrap() =
+        Some("fatal: https://x:token=ghp_SECRET@github.com/o/r denied".into());
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let mut repo = f.config.repos[0].clone();
+    repo.local_path = None;
+    let err = p.maintenance(&repo).rules_at_base().await.unwrap_err();
+    assert_eq!(err, "could not fetch o/r");
+    assert!(!err.contains("ghp_SECRET"), "{err}");
+    // git's own error names the missing base, here a token.
+    let mut repo = f.config.repos[0].clone();
+    repo.base = "token=ghp_SECRET".into();
+    let err = p.maintenance(&repo).rules_at_base().await.unwrap_err();
+    assert_eq!(
+        err,
+        "could not read .provefab/rules.md on the base branch of o/r"
+    );
+}
+
+#[tokio::test]
+async fn signals_redact_credential_looking_text() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    let finding = Finding {
+        file: "src/a.rs".into(),
+        line: None,
+        severity: Severity::Minor,
+        text: "the test sets GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345 inline".into(),
+        rule: Some("R2".into()),
+    };
+    p.store
+        .record_review(id, &json!({}), "m", 1, 0, "approve", &[finding])
+        .await
+        .unwrap();
+    let repo = f.config.repos[0].clone();
+    let signals = p.maintenance(&repo).signals(0).await.unwrap();
+    let SignalKind::Finding { text, .. } = &signals[0].kind else {
+        panic!("{signals:?}");
+    };
+    assert_eq!(text, "the test sets <redacted> inline");
 }

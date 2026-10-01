@@ -238,6 +238,8 @@ pub struct FakeHub {
     pub ensure_fails_once: Mutex<Vec<String>>,
     /// Where `repo_clone` clones from (a local path standing in for GitHub).
     pub clone_from: Mutex<Option<PathBuf>>,
+    /// While set, `repo_clone` fails with this stderr (gh's own words).
+    pub clone_error: Mutex<Option<String>>,
     /// What `pr_status` answers (open, no comments, until a test changes it).
     pub pr_status: Mutex<crate::forge::PrStatus>,
     pub issue_is_open: std::sync::atomic::AtomicBool,
@@ -289,6 +291,7 @@ impl FakeHub {
             ensure_fails_once: Mutex::new(Vec::new()),
             comments_down: Default::default(),
             clone_from: Mutex::new(None),
+            clone_error: Mutex::new(None),
             pr_status: Mutex::new(crate::forge::PrStatus {
                 state: crate::forge::PrState::Open,
                 comments: Vec::new(),
@@ -495,6 +498,14 @@ impl Forge for FakeHub {
         Ok(self.public.load(std::sync::atomic::Ordering::SeqCst))
     }
     async fn repo_clone(&self, _: &str, dest: &Path) -> Result<(), ForgeError> {
+        if let Some(stderr) = self.clone_error.lock().unwrap().clone() {
+            return Err(ForgeError::Failed {
+                program: "gh".into(),
+                args: "repo clone".into(),
+                code: Some(1),
+                stderr,
+            });
+        }
         let Some(src) = self.clone_from.lock().unwrap().clone() else {
             return Err(ForgeError::Parse(
                 "gh repo clone".into(),

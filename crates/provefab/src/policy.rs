@@ -5,10 +5,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use serde_json::Value;
+
 use crate::config::{Config, RepoConfig};
 use crate::forge::{Change, ForgeError};
 use crate::pipeline::PipelineError;
-use crate::store::TaskRow;
+use crate::record::Disposition;
+use crate::store::{MaintenanceRun, TaskRow};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -65,6 +68,77 @@ pub struct PrOpened<'a> {
     pub tools: &'a dyn MergeTools,
 }
 
+/// One fact of a repository's record that periodic work reads (repository
+/// rules spec §7). Its text is what people and reviewers wrote, with
+/// credential-looking words redacted (pre-flight S6); command output and
+/// model-written commands are never in it (plan decision 17).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Signal {
+    /// Stable across calls: `pr#41/F2`, `pr#41/c1`, `task#12/gates`,
+    /// `task#12/revert-3`, `task#12/reopen-1`, `pr#90/closed`.
+    pub id: String,
+    /// When it happened (unix seconds).
+    pub at: i64,
+    /// The pull request it is about, else the issue.
+    pub url: String,
+    pub kind: SignalKind,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SignalKind {
+    /// A finding people rejected or waived, or any finding citing a rule.
+    Finding {
+        key: String,
+        file: String,
+        text: String,
+        rule: Option<u32>,
+        disposition: Option<Disposition>,
+        reason: Option<String>,
+    },
+    /// What a person asked for on a pull request closed without merging.
+    ChangeRequest { text: String },
+    /// Configured checks (gates, risk checks) that failed in the task.
+    GateFailure { commands: Vec<String> },
+    /// A post-merge check opened a revert of the task's change.
+    Revert,
+    /// The issue was reopened after its pull request merged.
+    Reopen,
+    /// An earlier periodic pull request, merged or closed without merging.
+    Proposal {
+        kind: String,
+        merged: bool,
+        detail: Option<Value>,
+    },
+}
+
+/// What the core lends a policy's periodic work for one repository
+/// (repository rules spec §7). Errors are fixed text; the detail goes to
+/// the log only, redacted (pre-flight S1).
+pub trait PeriodicTools: Send + Sync {
+    /// The repository's signals since `since` (unix seconds), plus the
+    /// outcome of every earlier periodic pull request, whatever its age.
+    fn signals(&self, since: i64) -> BoxFuture<'_, Result<Vec<Signal>, String>>;
+    /// The highest rule number the record saw: loaded by a pass or cited by a finding.
+    fn highest_rule_number(&self) -> BoxFuture<'_, Result<u32, String>>;
+    /// `.provefab/rules.md` on the base branch, fetched first; `None` when absent.
+    fn rules_at_base(&self) -> BoxFuture<'_, Result<Option<String>, String>>;
+    /// The latest run of `kind` for this repository.
+    fn last_run<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<Option<MaintenanceRun>, String>>;
+    /// Records a run of `kind` with the cost of the model calls made since
+    /// the last record; `detail` is the policy's own JSON, never shown.
+    fn record_run<'a>(
+        &'a self,
+        kind: &'a str,
+        outcome: &'a str,
+        pr_url: Option<&'a str>,
+        detail: Option<&'a Value>,
+    ) -> BoxFuture<'a, Result<(), String>>;
+}
+
 pub trait ReviewPolicy: Send + Sync {
     /// Approvals from distinct models the current head needs before the PR opens.
     fn approvals_needed(&self, repo: &RepoConfig) -> u8;
@@ -80,6 +154,16 @@ pub trait ReviewPolicy: Send + Sync {
     /// A config this policy cannot run with.
     fn check(&self, _config: &Config) -> Result<(), String> {
         Ok(())
+    }
+    /// Daily work for one repository (repository rules spec §7): called by
+    /// the scheduler once a day, never twice at once for a repository. An
+    /// `Err` is logged and recorded; the service goes on.
+    fn periodic<'a>(
+        &'a self,
+        _repo: &'a RepoConfig,
+        _tools: &'a dyn PeriodicTools,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
