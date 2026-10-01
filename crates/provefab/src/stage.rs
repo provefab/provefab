@@ -41,6 +41,10 @@ pub struct Finding {
     pub line: Option<u32>,
     pub severity: Severity,
     pub text: String,
+    /// The repository rule this finding reports a violation of (`"R3"`), or
+    /// null (repository rules spec §5). Absent from answers stored before it.
+    #[serde(default)]
+    pub rule: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -95,6 +99,28 @@ fn strip_formats(v: &mut Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Review Focus 3: an answer stored before rules existed still reads.
+    #[test]
+    fn a_finding_may_cite_a_rule_and_older_answers_still_read() {
+        assert!(
+            output_schema::<ReviewOutput>()
+                .to_string()
+                .contains("\"rule\"")
+        );
+        let old: ReviewOutput = serde_json::from_value(json!({
+            "verdict": "approve",
+            "findings": [{"file": "a.rs", "line": null, "severity": "minor", "text": "t"}]
+        }))
+        .unwrap();
+        assert_eq!(old.findings[0].rule, None);
+        let new: ReviewOutput = serde_json::from_value(json!({
+            "verdict": "approve",
+            "findings": [{"file": "a.rs", "line": 1, "severity": "minor", "text": "t", "rule": "R3"}]
+        }))
+        .unwrap();
+        assert_eq!(new.findings[0].rule.as_deref(), Some("R3"));
+    }
 
     fn keys(v: &Value, out: &mut Vec<String>) {
         match v {

@@ -1334,6 +1334,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                         line: None,
                         severity: Severity::Blocking,
                         text: format!("{} wrote: {}", c.author, body),
+                        rule: None,
                     })
                     .collect();
                 // The state change comes first; `pr_state` only after it, so a
@@ -3617,6 +3618,7 @@ mod tests {
                 line: Some(4),
                 severity: Severity::Minor,
                 text: "typo".into(),
+                rule: None,
             }],
         };
         let row = FindingRow {
@@ -3630,6 +3632,7 @@ mod tests {
             file: "src/a.rs".into(),
             line: Some(4),
             text: "typo".into(),
+            rule: None,
             event_id: 1,
         };
         let keyed = review_notes(&review, &[row]).unwrap();

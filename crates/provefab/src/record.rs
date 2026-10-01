@@ -734,5 +734,7 @@ pub struct FindingRow {
     pub file: String,
     pub line: Option<u32>,
     pub text: String,
+    /// The rule the finding cites (`R3`), checked against the rules its review was given.
+    pub rule: Option<String>,
     pub event_id: i64,
 }

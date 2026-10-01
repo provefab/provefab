@@ -149,6 +149,24 @@ pub enum NoticeTarget {
     Pr,
 }
 
+/// One row of `maintenance_runs` (repository rules spec §7): the scheduler's
+/// daily call (`periodic`) or a run a policy recorded (Pro: `rules`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaintenanceRun {
+    pub id: i64,
+    pub repo: String,
+    pub kind: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub model_id: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub quota_units: Option<f64>,
+    pub outcome: String,
+    pub pr_url: Option<String>,
+    /// The policy's own JSON about the run; never shown (plan decision 12).
+    pub detail: Option<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageRunRecord {
     pub task_id: i64,
@@ -932,8 +950,8 @@ impl Store {
         .await?;
         for (k, f) in keys.iter().zip(findings) {
             sqlx::query(
-                "INSERT INTO findings (task_id, key, pass, round, reviewer_model, severity, file, line, text, event_id) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO findings (task_id, key, pass, round, reviewer_model, severity, file, line, text, event_id, rule) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(task_id)
             .bind(k)
@@ -945,6 +963,7 @@ impl Store {
             .bind(f.line)
             .bind(&f.text)
             .bind(event_id)
+            .bind(&f.rule)
             .execute(&mut *tx)
             .await?;
         }
@@ -1200,6 +1219,85 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Appends one maintenance run; returns its id (`run.id` is ignored).
+    pub async fn record_maintenance_run(&self, run: &MaintenanceRun) -> Result<i64, StoreError> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO maintenance_runs (repo, kind, started_at, finished_at, model_id, cost_usd, quota_units, outcome, pr_url, detail) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(&run.repo)
+        .bind(&run.kind)
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(&run.model_id)
+        .bind(run.cost_usd)
+        .bind(run.quota_units)
+        .bind(&run.outcome)
+        .bind(&run.pr_url)
+        .bind(run.detail.as_ref().map(Value::to_string))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// The latest run of `kind` for `repo` (any case).
+    pub async fn last_maintenance_run(
+        &self,
+        repo: &str,
+        kind: &str,
+    ) -> Result<Option<MaintenanceRun>, StoreError> {
+        let row = sqlx::query(
+            "SELECT * FROM maintenance_runs WHERE LOWER(repo) = LOWER(?) AND kind = ? \
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+        )
+        .bind(repo)
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(maintenance_run).transpose()
+    }
+
+    /// Every maintenance run, oldest first, optionally of one repository (any case).
+    pub async fn maintenance_runs(
+        &self,
+        repo: Option<&str>,
+    ) -> Result<Vec<MaintenanceRun>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM maintenance_runs WHERE ? IS NULL OR LOWER(repo) = LOWER(?) \
+             ORDER BY started_at, id",
+        )
+        .bind(repo)
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(maintenance_run).collect()
+    }
+
+    /// The outputs of `kind` recorded at or after `since`, oldest first, each
+    /// with when it was recorded.
+    pub async fn outputs_since(
+        &self,
+        id: i64,
+        kind: &str,
+        since: i64,
+    ) -> Result<Vec<(i64, Value)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT at, json FROM stage_outputs WHERE task_id = ? AND kind = ? AND at >= ? ORDER BY id",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| -> Result<(i64, Value), StoreError> {
+                let s: String = r.get("json");
+                let v = serde_json::from_str(&s).map_err(|_| StoreError::Corrupt(s))?;
+                Ok((r.get("at"), v))
+            })
+            .collect()
     }
 
     /// The newest output of `kind`, if any.
@@ -1465,8 +1563,28 @@ fn finding_row(r: &SqliteRow) -> FindingRow {
         file: r.get("file"),
         line: r.get::<Option<i64>, _>("line").map(|l| l as u32),
         text: r.get("text"),
+        rule: r.get("rule"),
         event_id: r.get("event_id"),
     }
+}
+
+fn maintenance_run(r: &SqliteRow) -> Result<MaintenanceRun, StoreError> {
+    let detail: Option<String> = r.get("detail");
+    Ok(MaintenanceRun {
+        id: r.get("id"),
+        repo: r.get("repo"),
+        kind: r.get("kind"),
+        started_at: r.get("started_at"),
+        finished_at: r.get("finished_at"),
+        model_id: r.get("model_id"),
+        cost_usd: r.get("cost_usd"),
+        quota_units: r.get("quota_units"),
+        outcome: r.get("outcome"),
+        pr_url: r.get("pr_url"),
+        detail: detail
+            .map(|d| serde_json::from_str(&d).map_err(|_| StoreError::Corrupt(d)))
+            .transpose()?,
+    })
 }
 
 async fn infer_findings(
@@ -1593,7 +1711,110 @@ mod tests {
                 "daca2e3a57485b3a91ce46779913c341fec2ab5c757e523088b9c89a9fe3683a62f86b83b3adf5775babc4a8fb17ac49",
                 "5f568cb3d17aaf248e9f208ef39268d14393dd87157e348b5946549ebf4a359aedf16a05374529315b4dba8d461e9832",
                 "9c8911c912d3be8612dc10a06a802d318765a37df1c1c8a2449ba1063b3bdeb54242a9e943d29922b51f9c99350a0b3b",
+                "de68e76b6d0a8bee1058b97821d70b7d78434d938cef56bcf13d9a1d42aaf30b9bac8bf2e103104949b747230190b5e9",
             ]
+        );
+    }
+    #[tokio::test]
+    async fn a_finding_keeps_the_rule_it_cites() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(1)).await.unwrap().unwrap();
+        let cited = crate::stage::Finding {
+            file: "a.rs".into(),
+            line: None,
+            severity: crate::stage::Severity::Minor,
+            text: "t".into(),
+            rule: Some("R3".into()),
+        };
+        let plain = crate::stage::Finding {
+            rule: None,
+            ..cited.clone()
+        };
+        s.record_review(id, &json!({}), "m", 1, 0, "approve", &[cited, plain])
+            .await
+            .unwrap();
+        let rules: Vec<Option<String>> = s
+            .findings(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.rule)
+            .collect();
+        assert_eq!(rules, [Some("R3".to_string()), None]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_runs_are_kept_per_repository_and_kind() {
+        let (_d, s) = store().await;
+        let run = |kind: &str, at: i64| MaintenanceRun {
+            id: 0,
+            repo: "O/R".into(),
+            kind: kind.into(),
+            started_at: at,
+            finished_at: Some(at + 5),
+            model_id: Some("std-claude".into()),
+            cost_usd: None,
+            quota_units: Some(0.5),
+            outcome: "ok".into(),
+            pr_url: None,
+            detail: Some(json!({"highest": 4})),
+        };
+        s.record_maintenance_run(&run("rules", 10)).await.unwrap();
+        s.record_maintenance_run(&run("rules", 30)).await.unwrap();
+        s.record_maintenance_run(&run("periodic", 20))
+            .await
+            .unwrap();
+        let last = s
+            .last_maintenance_run("o/r", "rules")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                last.started_at,
+                last.finished_at,
+                last.quota_units,
+                last.detail
+            ),
+            (30, Some(35), Some(0.5), Some(json!({"highest": 4})))
+        );
+        assert!(
+            s.last_maintenance_run("o/r", "other")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.last_maintenance_run("x/y", "rules")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let all = s.maintenance_runs(Some("o/r")).await.unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.started_at).collect::<Vec<_>>(),
+            [10, 20, 30]
+        );
+        assert_eq!(s.maintenance_runs(None).await.unwrap().len(), 3);
+        assert!(s.maintenance_runs(Some("x/y")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn outputs_since_says_when_each_was_recorded() {
+        let (_d, s) = store().await;
+        let id = s.add_issue(&issue(1)).await.unwrap().unwrap();
+        s.record_output(id, "review", &json!({"n": 1}))
+            .await
+            .unwrap();
+        let got = s.outputs_since(id, "review", 0).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, json!({"n": 1}));
+        assert!(got[0].0 > 0);
+        assert!(
+            s.outputs_since(id, "review", now() + 60)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
     use serde_json::json;
@@ -2067,6 +2288,7 @@ mod tests {
             line: None,
             severity: crate::stage::Severity::Minor,
             text: "t".into(),
+            rule: None,
         };
         for pass in [1, 2] {
             s.record_review(
