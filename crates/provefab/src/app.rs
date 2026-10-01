@@ -78,7 +78,8 @@ enum Cmd {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// One-time sign-in for a worker, in Provefab's own config directory.
+    /// One-time sign-in for a worker, in Provefab's own config directory, or the
+    /// credentials of a Jira site or a Linear workspace (stored in the Keychain).
     Login {
         #[arg(value_enum)]
         worker: LoginWorker,
@@ -86,6 +87,9 @@ enum Cmd {
         /// (used by catalog models with `auth = "api_key"`).
         #[arg(long)]
         api_key: bool,
+        /// Jira only: the site host name, such as acme.atlassian.net.
+        #[arg(long)]
+        site: Option<String>,
     },
     /// Internal: check one agent tool call (JSON on stdin) against the guard policy.
     Guard {
@@ -114,6 +118,10 @@ enum ServiceAction {
 enum LoginWorker {
     Claude,
     Codex,
+    /// Jira Cloud: account e-mail and API token, per site.
+    Jira,
+    /// Linear: a personal API key.
+    Linear,
 }
 
 /// A command Provefab Pro adds to the CLI.
@@ -222,6 +230,69 @@ fn gh() -> Gh {
     Gh {
         program: "gh".into(),
     }
+}
+
+/// `provefab login jira --site <site>` and `provefab login linear` (spec §5):
+/// the token is typed at the Keychain's own prompt, so it never passes through
+/// Provefab or a command line. The Jira e-mail is kept as the item's comment.
+fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()> {
+    use crate::tracker::{JIRA_KEYCHAIN_SERVICE, LINEAR_KEYCHAIN_SERVICE, is_host};
+    let mut args: Vec<String> = vec!["add-generic-password".into(), "-U".into(), "-s".into()];
+    let done = match worker {
+        LoginWorker::Jira => {
+            let Some(site) = site.map(|s| s.trim().to_lowercase()).filter(|s| is_host(s)) else {
+                bail!(
+                    "give the Jira site as a host name: provefab login jira --site acme.atlassian.net"
+                );
+            };
+            print!("Atlassian account e-mail for {site}: ");
+            std::io::stdout().flush()?;
+            let mut email = String::new();
+            std::io::stdin().read_line(&mut email)?;
+            let email = email.trim().to_string();
+            if !email.contains('@') {
+                bail!("an account e-mail address is required");
+            }
+            args.extend([
+                JIRA_KEYCHAIN_SERVICE.into(),
+                "-a".into(),
+                site.clone(),
+                "-j".into(),
+                email,
+            ]);
+            println!(
+                "Enter your Jira API token at the Keychain prompt (create one at https://id.atlassian.com/manage-profile/security/api-tokens)."
+            );
+            format!("stored; repositories with kind = \"jira\" and site = \"{site}\" use it")
+        }
+        LoginWorker::Linear => {
+            if site.is_some() {
+                bail!("--site is for `provefab login jira` only");
+            }
+            args.extend([
+                LINEAR_KEYCHAIN_SERVICE.into(),
+                "-a".into(),
+                "provefab".into(),
+            ]);
+            println!(
+                "Enter a Linear personal API key (from Linear's settings) at the Keychain prompt."
+            );
+            "stored; repositories with kind = \"linear\" use it".to_string()
+        }
+        LoginWorker::Claude | LoginWorker::Codex => {
+            unreachable!("worker logins are handled in dispatch")
+        }
+    };
+    args.push("-w".into());
+    let status = std::process::Command::new("security")
+        .args(&args)
+        .status()
+        .context("running security")?;
+    if !status.success() {
+        bail!("could not store the credential in the Keychain");
+    }
+    println!("{done}");
+    Ok(())
 }
 
 async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
@@ -427,8 +498,23 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Login {
+            worker: worker @ (LoginWorker::Jira | LoginWorker::Linear),
+            api_key,
+            site,
+        } => {
+            if api_key {
+                bail!(
+                    "--api-key is for claude and codex; tracker logins always store an API token"
+                );
+            }
+            tracker_login(worker, site)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Login { site: Some(_), .. } => bail!("--site is for `provefab login jira` only"),
+        Cmd::Login {
             worker,
             api_key: true,
+            ..
         } => {
             match worker {
                 LoginWorker::Claude => {
@@ -474,6 +560,9 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                         dir.display()
                     );
                 }
+                LoginWorker::Jira | LoginWorker::Linear => {
+                    unreachable!("tracker logins are handled above")
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -481,11 +570,17 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             let (program, var, dir) = match worker {
                 LoginWorker::Claude => ("claude", "CLAUDE_CONFIG_DIR", paths.claude_config()),
                 LoginWorker::Codex => ("codex", "CODEX_HOME", paths.codex_home()),
+                LoginWorker::Jira | LoginWorker::Linear => {
+                    unreachable!("tracker logins are handled above")
+                }
             };
             std::fs::create_dir_all(&dir)?;
             let args: &[&str] = match worker {
                 LoginWorker::Claude => &["auth", "login"],
                 LoginWorker::Codex => &["login"],
+                LoginWorker::Jira | LoginWorker::Linear => {
+                    unreachable!("tracker logins are handled above")
+                }
             };
             let status = std::process::Command::new(program)
                 .args(args)

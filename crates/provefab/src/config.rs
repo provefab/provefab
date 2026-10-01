@@ -149,6 +149,9 @@ pub struct RepoConfig {
     /// `[repos.risk]`: risk categories and their consequences. Absent: built-ins.
     #[serde(default)]
     pub risk: Option<crate::risk::RiskConfig>,
+    /// `[repos.tracker]`: where issues come from. Absent: GitHub (issue trackers spec §5).
+    #[serde(default)]
+    pub tracker: Option<crate::tracker::TrackerConfig>,
 }
 
 impl RepoConfig {
@@ -169,6 +172,11 @@ impl RepoConfig {
                 .unwrap_or_else(|| local.clone()),
             Err(_) => local.clone(),
         }
+    }
+
+    /// The repository's issue tracker, GitHub unless `[repos.tracker]` says otherwise.
+    pub fn tracker_kind(&self) -> crate::tracker::TrackerKind {
+        self.tracker.as_ref().map(|t| t.kind).unwrap_or_default()
     }
 
     /// `path_in` the default provefab home (`PROVEFAB_HOME`, else `~/.provefab`).
@@ -313,6 +321,8 @@ pub enum ConfigError {
     ZeroConcurrency(String),
     #[error("{0}: [repos.risk]: {1}")]
     Risk(String, String),
+    #[error("{0}: [repos.tracker]: {1}")]
+    Tracker(String, String),
     #[error("provefab.toml: repo `{0}` is not `owner/name`")]
     BadSlug(String),
     #[error("provefab.toml: repo `{0}` is listed twice")]
@@ -380,6 +390,10 @@ impl Config {
             // An empty label could match every open issue (the label is the authorization).
             if r.label.trim().is_empty() {
                 return Err(ConfigError::EmptyField(r.slug.clone(), "label"));
+            }
+            if let Some(t) = &r.tracker {
+                crate::tracker::validate(t, &r.label)
+                    .map_err(|e| ConfigError::Tracker(r.slug.clone(), e))?;
             }
             if r.base.trim().is_empty() {
                 return Err(ConfigError::EmptyField(r.slug.clone(), "base"));
@@ -547,6 +561,52 @@ review_rounds = 2
         assert!(matches!(
             Config::from_toml_str(&format!("{base}[repos.risk]\ndisable = [\"nope\"]\n")),
             Err(ConfigError::Risk(_, _))
+        ));
+    }
+
+    #[test]
+    fn tracker_table_is_optional_and_validated() {
+        use crate::tracker::TrackerKind;
+        let base = format!("{BASE}[[repos]]\nslug = \"o/r\"\ngates = [\"make\"]\n");
+        let c = Config::from_toml_str(&base).unwrap();
+        assert_eq!(c.repos[0].tracker, None);
+        assert_eq!(c.repos[0].tracker_kind(), TrackerKind::Github);
+        let with = |t: &str| Config::from_toml_str(&format!("{base}[repos.tracker]\n{t}"));
+        let jira =
+            with("kind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"ENG\"\n").unwrap();
+        assert_eq!(jira.repos[0].tracker_kind(), TrackerKind::Jira);
+        let linear = with("kind = \"linear\"\nproject = \"ENG_2\"\n").unwrap();
+        assert_eq!(linear.repos[0].tracker_kind(), TrackerKind::Linear);
+        for bad in [
+            "kind = \"jira\"\nproject = \"ENG\"\n",
+            "kind = \"jira\"\nsite = \"https://acme.atlassian.net\"\nproject = \"ENG\"\n",
+            "kind = \"jira\"\nsite = \"acme.atlassian.net/jira\"\nproject = \"ENG\"\n",
+            "kind = \"jira\"\nsite = \"acme.atlassian.net\"\n",
+            "kind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"eng\"\n",
+            "kind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"1ENG\"\n",
+            "kind = \"linear\"\nsite = \"linear.app\"\nproject = \"ENG\"\n",
+            "kind = \"linear\"\nproject = \"EN G\"\n",
+            "kind = \"github\"\nproject = \"ENG\"\n",
+        ] {
+            assert!(
+                matches!(with(bad), Err(ConfigError::Tracker(_, _))),
+                "{bad}"
+            );
+        }
+        // Unknown kinds and unknown keys (a token, say) never load.
+        for bad in [
+            "kind = \"gitlab\"\n",
+            "kind = \"linear\"\nproject = \"ENG\"\ntoken = \"lin_api_x\"\n",
+        ] {
+            assert!(matches!(with(bad), Err(ConfigError::Parse(_))), "{bad}");
+        }
+        // Jira labels cannot hold whitespace, and the derived ones extend the label.
+        let spaced = format!(
+            "{BASE}[[repos]]\nslug = \"o/r\"\ngates = [\"make\"]\nlabel = \"pro fab\"\n[repos.tracker]\nkind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"ENG\"\n"
+        );
+        assert!(matches!(
+            Config::from_toml_str(&spaced),
+            Err(ConfigError::Tracker(_, _))
         ));
     }
 

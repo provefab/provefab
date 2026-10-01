@@ -112,6 +112,7 @@ mod tests {
             gates: vec!["make test".into()],
             post_merge_checks: Vec::new(),
             risk: None,
+            tracker: None,
         }
     }
 
