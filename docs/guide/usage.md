@@ -2,7 +2,7 @@
 
 ## The life of an issue
 
-1. **You set the `provefab` label** on an open issue. It is the only authorization Provefab needs. Only people who can triage the repository can set a label.
+1. **You set the `provefab` label** on an open issue. It is the only authorization Provefab needs. Only people who can triage the repository can set a label. On Jira or Linear, the label goes on the ticket (see [Jira and Linear](trackers.md)).
 2. **Classification.** Jev reads the title, body and labels. It estimates the kind (bugfix, feature, refactor, docs, test, chore), the difficulty, the scope, and whether the issue is too vague.
 3. **A question, if the issue is vague.** Provefab asks in a comment and sets `provefab:needs-info`. Answer with a comment, as the issue author or a collaborator. If the answer is enough, the task resumes, and your answer is added to the issue text every stage reads.
 4. **Plan** (read-only tools). For a bugfix, the plan must give a **reproduction command** that fails before the fix. If it already passes, Provefab stops: the bug is not reproduced.
@@ -13,7 +13,7 @@
    - moves to a stronger model;
    - stops if nothing works.
 7. **Review** by a different model provider than the implementer's. If it asks for changes, the implementer gets all of them, earlier rounds included, and must write a test for each. When Jev asks for a frontier review (a high review risk), the review runs on the frontier tier only if your catalog has a frontier model from another provider than the implementer's; otherwise the usual cross-provider standard reviewer stays. `provefab log` shows the reason under `routes:`.
-8. **Pull request.** Provefab commits, pushes and opens the PR. Its text lists the checks, the routing, and any deleted or disabled tests. It comments on the issue and sets `provefab:in-pr`. The PR then waits for your review.
+8. **Pull request.** Provefab commits, pushes and opens the PR. Its text lists the checks, the routing, and any deleted or disabled tests. It comments on the issue and sets `provefab:in-pr`. For a Jira or Linear ticket, the branch is `provefab/ENG-123-<title>`, the title starts with `ENG-123:` and the body links the ticket. The PR then waits for your review.
 9. **Optional post-merge verification.** If you set `post_merge_checks`, Provefab runs them on the exact commit its PR produced on the base branch. A failing command is rerun once on a fresh checkout; if it passes then, the run counts as passed and the command is reported as flaky. On a confirmed failure, Provefab runs the same checks on the current base: if they pass, a later commit already fixed it and no revert is proposed. Otherwise Provefab prepares a revert on the current base and opens a revert PR only if the reverted tree passes the same checks. Every merge is verified. A revert is never proposed for a multi-commit PR a person merged by squash or rebase (Provefab cannot tell the two apart); a merge commit is reverted as one commit. In that case its failure is reported and a human decides. Revert conflicts, failing revert checks, and a base branch that keeps moving also require a human. Provefab never merges a revert PR. These are repository commands, not production monitoring.
 
 ## Risk-aware changes
@@ -50,7 +50,9 @@ What works best:
 | Issue reopened after a merge (the bug is back) | Nothing: Provefab starts a new pass by itself. |
 | `provefab:failed` | Read its comment and `provefab log <id>`. Fix the cause (vague issue, environment...), then `provefab add <url>`. |
 
-`provefab add <url>` on a stopped task starts a **new pass** on a fresh branch from the base. Provefab keeps every blocking finding from earlier passes and puts the `provefab` label back.
+On Jira and Linear, the reporter or creator and any workspace member may answer.
+
+`provefab add <url>` takes a GitHub issue, Jira ticket or Linear issue URL. On a stopped task it starts a **new pass** on a fresh branch from the base. Provefab keeps every blocking finding from earlier passes and puts the `provefab` label back.
 
 ## Recording decisions on review findings
 

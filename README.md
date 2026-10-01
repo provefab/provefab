@@ -1,6 +1,6 @@
 # Provefab
 
-Provefab turns labelled GitHub issues into pull requests that arrive green, reviewed by a second model, with their evidence.
+Provefab turns labelled GitHub, Jira or Linear issues into pull requests that arrive green, reviewed by a second model, with their evidence.
 
 It runs on your Mac as a service. AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI, signed in with your own plan or your own API key, chosen per model), and Jev, TypeSafe's classifier, rates each issue so that every stage runs on the cheapest model that can do it: your plans first, then your API keys by price, with prices updated daily. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
 
@@ -30,7 +30,7 @@ Requirements: macOS, `git` and `gh` (signed in with `gh auth login`), and at lea
 #       provefab-<version>-macos-universal.zip from the Releases page, unzip, then
 sudo install -m 755 provefab /usr/local/bin/provefab
 #    b. from source, with Rust 1.96 or newer:
-cargo install --git https://github.com/provefab/provefab --tag v0.2.1 --locked provefab
+cargo install --git https://github.com/provefab/provefab --tag v0.3.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
 provefab login claude        # Claude plan login, in ~/.provefab/claude
@@ -87,6 +87,7 @@ Provefab talks to you on GitHub, in issue comments that always start with *Poste
 
 - [Configuration](docs/guide/configuration.md): every field of `provefab.toml`, with its default.
 - [Usage](docs/guide/usage.md): writing issues that land, answering Provefab, restarting, reading states.
+- [Jira and Linear](docs/guide/trackers.md): issues from a Jira Cloud project or a Linear team, pull requests on GitHub.
 - [Operations](docs/guide/operations.md): the service, logs, budgets, troubleshooting.
 - [Security](docs/guide/security.md): what agents can and cannot do, and who can trigger Provefab.
 

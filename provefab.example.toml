@@ -70,6 +70,14 @@ gates = ["cargo fmt -- --check", "cargo clippy --all-targets -- -D warnings", "c
 # checks = ["cargo test --test auth"]         # extra commands after gates, when touched
 # reviewer_tier = "frontier"                  # or "standard"
 
+# Issues from Jira Cloud or Linear instead of GitHub issues (optional). Code and
+# pull requests stay on GitHub. Credentials: `provefab login jira --site <site>`
+# or `provefab login linear`, never in this file. See docs/guide/trackers.md.
+# [repos.tracker]
+# kind = "jira"                  # "github" (default), "jira" or "linear"
+# site = "acme.atlassian.net"    # Jira only
+# project = "ENG"                # Jira project key or Linear team key
+
 [limits]
 stage_timeout = "30m"
 gate_timeout = "20m"

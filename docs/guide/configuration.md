@@ -16,6 +16,8 @@ No secret goes in `provefab.toml`.
 | Codex (ChatGPT) subscription login | `provefab login codex` (directory `~/.provefab/codex`) |
 | OpenAI API key | `provefab login codex --api-key` (directory `~/.provefab/codex-api`) |
 | GitHub | `gh auth login` (Provefab uses `gh` and `git` with your permissions) |
+| Jira Cloud | `provefab login jira --site <site>`: e-mail and API token in the Keychain (`provefab-jira`); or `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` |
+| Linear | `provefab login linear`: personal API key in the Keychain (`provefab-linear`); or `PROVEFAB_LINEAR_KEY` |
 
 **Plans for work.** Provefab runs the official CLIs with whatever login you give them. For professional use, prefer a business plan (Claude Team or Enterprise, ChatGPT Business) or API keys: consumer plans can restrict commercial use (for example, Anthropic's consumer terms for EEA and Swiss residents say "Non-commercial use only"). Check your plan's terms; this is not legal advice.
 
@@ -83,7 +85,7 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 
 | Field | Default | Role |
 |---|---|---|
-| `slug` | required | `owner/name` on GitHub. |
+| `slug` | required | `owner/name` on GitHub, where the code and the pull requests are. |
 | `local_path` | none | Your local clone. **Optional**: without it, Provefab clones the repository into `~/.provefab/repos/<owner>/<name>`. Either way it runs `git fetch` before every pass and starts from `origin/<base>`. |
 | `label` | `provefab` | The label that triggers Provefab. Only people who can triage the repository can set it: it is the authorization. The derived labels (`<label>:in-pr`, `:needs-info`, `:failed`, `:merged`) are created at startup. The risk labels (`<label>:risk-<category>`, including `:risk-unknown`) are created at startup too. |
 | `base` | `main` | Branch work starts from, and pull requests target. |
@@ -155,6 +157,18 @@ Category names use lowercase letters, digits and `-`. `unknown` and `none` are r
 - An unknown key under `[repos.risk]` or a category table is refused too.
 
 `provefab doctor` prints one `risk <slug>` line per repository: the category count and names, and how many checks were added. It ends with `; warning: risky changes implemented on <providers> keep a standard reviewer (no frontier model on another provider)` when, for one or more providers in your catalog, no frontier model is on another provider. Providers are listed in catalog order and comma-separated (for example `claude-code`, `codex`, `pi:<provider>`). See [Usage](usage.md#risk-aware-changes) for what happens to a risky change.
+
+## `[repos.tracker]`: Jira or Linear issues
+
+Absent, the repository's issues are its GitHub issues. Setup, labels and limits: [Jira and Linear](trackers.md).
+
+| Field | Default | Role |
+|---|---|---|
+| `kind` | `github` | `github`, `jira` or `linear`. |
+| `site` | none | Jira only, required: the site's host name, such as `acme.atlassian.net` (no `https://`, no path). |
+| `project` | none | Jira and Linear, required: the project or team key, `[A-Z][A-Z0-9_]*`, as in `ENG-123`. |
+
+Refused at load: an unknown `kind` or key (credentials never go in this file), `site` outside Jira, `project` with `github`, and, for Jira, a `label` containing whitespace.
 
 ## `[limits]`
 

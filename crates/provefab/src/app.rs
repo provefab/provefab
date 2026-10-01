@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     name = "provefab",
     version,
-    about = "Turns labelled GitHub issues into tested pull requests"
+    about = "Turns labelled GitHub, Jira or Linear issues into tested pull requests"
 )]
 struct Cli {
     #[command(subcommand)]
