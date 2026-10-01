@@ -2952,14 +2952,20 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let base_shown = format!("{} at {}", repo.base, &base[..base.len().min(12)]);
         let rules = self.pass_rules(task, repo).await?;
         // The round's changed files, both sides of a rename, as the risk policy reads them.
-        let changed: Vec<String> = self
-            .git
-            .changed_files(&wt, &base)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|c| std::iter::once(c.path).chain(c.from))
-            .collect();
+        let changed: Vec<String> = match self.git.changed_files(&wt, &base).await {
+            Ok(c) => c,
+            Err(e) => {
+                // Only the rules without `paths:` reach this review.
+                eprintln!(
+                    "provefab: task {}: could not list the changed files for the rules: {e}",
+                    task.id
+                );
+                Vec::new()
+            }
+        }
+        .into_iter()
+        .flat_map(|c| std::iter::once(c.path).chain(c.from))
+        .collect();
         let selected = crate::rules::select(&rules, Stage::Review, &changed);
         let (rules_block, omitted) = crate::rules::render(&selected, crate::rules::BUDGET);
         let given = crate::rules::numbers(&selected, omitted);

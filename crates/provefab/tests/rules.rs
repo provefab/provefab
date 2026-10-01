@@ -218,3 +218,43 @@ async fn a_pass_without_its_rules_output_loads_them_at_its_next_stage() {
     assert_eq!(p.drive(id).await.unwrap(), PrOpen);
     assert!(prompt_of(&p.runner.calls(), "plan").contains("R1: Keep commits small"));
 }
+
+/// `prepare` runs again in the same pass (a crash after the rules were
+/// recorded, before the state moved) once `main` has moved: the base is
+/// pinned again and the stages get the rules of that new base.
+#[tokio::test]
+async fn a_rerun_prepare_on_a_moved_base_reloads_the_rules() {
+    let f = fixture(&["test -f feature.txt"]);
+    commit_rules(&f, RULES);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    for _ in 0..5 {
+        if p.step(id).await.unwrap() == Planning {
+            break;
+        }
+    }
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().state, Planning);
+    commit_rules(&f, "## R5: The moved base's rule\n\nNew text.\n");
+    let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", f.home.join("provefab.db").display()))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET state = 'classified' WHERE id = ?")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let plan = prompt_of(&p.runner.calls(), "plan");
+    assert!(plan.contains("R5: The moved base's rule"), "{plan}");
+    assert!(!plan.contains("R1: Keep commits small"), "{plan}");
+    let ev = p.store.events(id).await.unwrap();
+    let loaded: Vec<_> = ev.iter().filter(|e| e.kind == "rules_loaded").collect();
+    assert_eq!(loaded.len(), 2, "{:?}", kinds(&ev));
+    assert_eq!(loaded[1].payload["numbers"], json!([5]));
+}

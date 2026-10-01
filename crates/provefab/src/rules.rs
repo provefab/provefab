@@ -338,7 +338,7 @@ where
                 (None, Some(Event::RulesInvalid { pass, reason }), Vec::new())
             }
         };
-        let value = json!({"pass": pass, "text": text});
+        let value = json!({"pass": pass, "base": base, "text": text});
         let events: Vec<Event> = event.into_iter().collect();
         self.store
             .write_with_events(
@@ -353,23 +353,25 @@ where
         Ok(rules)
     }
 
-    /// The rules of the task's current pass: those `prepare` loaded, or, for
-    /// a pass without them (begun before the upgrade), loaded now from its
-    /// pinned base (Review Focus 5).
+    /// The rules of the task's current pass: those `prepare` loaded at the
+    /// pass's pinned base, or loaded now from it when the pass has none
+    /// (begun before the upgrade, Review Focus 5) or has rules read at another
+    /// commit (a `prepare` run again in the pass pins the base again).
     pub(crate) async fn pass_rules(
         &self,
         task: &TaskRow,
         repo: &RepoConfig,
     ) -> Result<Vec<Rule>, PipelineError> {
+        let base = self.pass_base(task, repo).await?;
         if let Some(v) = self.store.last_output(task.id, "rules").await?
             && v["pass"].as_u64() == Some(u64::from(pass_of(task)))
+            && v["base"].as_str() == Some(base.as_str())
         {
             return Ok(v["text"]
                 .as_str()
                 .and_then(|t| parse(t).ok())
                 .unwrap_or_default());
         }
-        let base = self.pass_base(task, repo).await?;
         self.load_rules(task, repo, &base).await
     }
 }
@@ -582,5 +584,38 @@ mod tests {
         for bad in ["3", "R", "R03", "R0", "Rx", "R3a", ""] {
             assert_eq!(rule_number(bad), None, "{bad}");
         }
+    }
+
+    /// A base the checkout cannot read stores Provefab's fixed reason and no
+    /// text, never git's own words (which can name paths or hold a token).
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn an_unreadable_base_records_only_the_fixed_reason() {
+        use crate::testkit::{FakeHub, FakeOracle, fixture, happy, pipeline, queue};
+        let f = fixture(&["true"]);
+        let p = pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await;
+        let id = queue(&p).await;
+        let task = p.store.task(id).await.unwrap().unwrap();
+        let zero = "0".repeat(40);
+        let rules = p
+            .load_rules(&task, &f.config.repos[0], &zero)
+            .await
+            .unwrap();
+        assert!(rules.is_empty());
+        let out = p.store.last_output(id, "rules").await.unwrap().unwrap();
+        assert_eq!(out, json!({"pass": 1, "base": zero, "text": null}));
+        let ev = p.store.events(id).await.unwrap();
+        let invalid: Vec<_> = ev.iter().filter(|e| e.kind == "rules_invalid").collect();
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(
+            invalid[0].payload["reason"],
+            "could not read .provefab/rules.md at the base commit"
+        );
     }
 }
