@@ -59,6 +59,19 @@ pub enum ForgeError {
         actual: String,
         wanted: String,
     },
+    /// A Jira or Linear call that failed (issue trackers spec §8). `message`
+    /// never holds a credential: the adapters redact before building it.
+    #[error("{service}: {}: {message}", status_text(.status))]
+    Tracker {
+        service: &'static str,
+        /// `None` when the service did not answer (network, timeout).
+        status: Option<u16>,
+        message: String,
+    },
+}
+
+fn status_text(status: &Option<u16>) -> String {
+    status.map_or_else(|| "network".to_string(), |s| format!("HTTP {s}"))
 }
 
 impl ForgeError {
@@ -72,6 +85,12 @@ impl ForgeError {
                 stderr.contains("could not resolve to an issue")
                     || stderr.contains("could not resolve to a repository")
                     || stderr.contains("repository not found")
+            }
+            // A refused credential, no access, nothing at that address or any
+            // other client error cannot fix itself; a timeout, a rate limit or
+            // a server error may (spec §8, plan decision 10).
+            ForgeError::Tracker { status, .. } => {
+                status.is_some_and(|s| (400..500).contains(&s) && s != 408 && s != 429)
             }
             ForgeError::Spawn { .. } | ForgeError::Parse(..) | ForgeError::Timeout { .. } => false,
         }
@@ -782,11 +801,11 @@ pub struct Gh {
 
 /// `gh issue list --limit` for [`Gh::labeled_issues`]: high enough that a
 /// backlog is never silently cut off, but still a single page.
-const ISSUE_LIMIT: usize = 1000;
+pub(crate) const ISSUE_LIMIT: usize = 1000;
 
 /// A warning for [`Gh::labeled_issues`] when `count` hits `ISSUE_LIMIT`: more
 /// labelled issues may exist than were read.
-fn issue_limit_warning(slug: &str, label: &str, count: usize) -> Option<String> {
+pub(crate) fn issue_limit_warning(slug: &str, label: &str, count: usize) -> Option<String> {
     (count >= ISSUE_LIMIT).then(|| {
         format!(
             "provefab: {slug} has {ISSUE_LIMIT}+ open issues labelled {label}; only the first {ISSUE_LIMIT} are read"

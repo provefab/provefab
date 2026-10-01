@@ -13,6 +13,7 @@ pub mod gates;
 pub mod guard;
 pub mod intake;
 pub mod jevq;
+pub mod jira;
 pub mod paths;
 pub mod pipeline;
 pub mod plugins;

@@ -4,9 +4,13 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::process::Command;
+
+use crate::forge::ForgeError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -262,6 +266,200 @@ pub fn pr_first_line(kind: TrackerKind, number: u64, key: Option<&str>, url: &st
     }
 }
 
+/// A timestamp as Provefab stores and compares them: UTC, whole seconds,
+/// `YYYY-MM-DDTHH:MM:SSZ` (spec §6, §7). Accepts `Z`, `+HH:MM` and `+HHMM`
+/// offsets and fractional seconds; `None` for anything else.
+pub fn utc_seconds(s: &str) -> Option<String> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = s.get(r)?;
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let mut rest = &s[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        rest = &frac[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let digits: String = rest[1..].chars().filter(|c| *c != ':').collect();
+            if digits.len() != 4 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            sign * (digits[..2].parse::<i64>().ok()? * 3600 + digits[2..].parse::<i64>().ok()? * 60)
+        }
+    };
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - offset;
+    Some(crate::store::rfc3339(secs))
+}
+
+/// Howard Hinnant's days-from-civil: the inverse of `store::rfc3339`'s.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The number of `key` when it belongs to `project`: `("ENG-123", "ENG")` gives 123.
+pub fn number_of(key: &str, project: &str) -> Option<u64> {
+    key.strip_prefix(project)?.strip_prefix('-')?.parse().ok()
+}
+
+/// Budget of one Jira or Linear call.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+/// A 429 whose `Retry-After` is at most this many seconds is waited out once
+/// inside the call (plan decision 9); a longer one is a transient error.
+pub const SHORT_RETRY: u64 = 30;
+
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// `text` with every credential replaced: an API may echo what it was sent.
+pub fn redact(text: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .filter(|s| s.len() >= 4)
+        .fold(text.to_string(), |t, s| t.replace(s, "<redacted>"))
+}
+
+/// Sends the request `make` builds (built again for the one retry) and returns
+/// status, `Retry-After` seconds and body. Only a failure to get an answer is
+/// an error here; the caller decides what a status means.
+pub async fn send(
+    service: &'static str,
+    secrets: &[&str],
+    make: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<(u16, Option<u64>, String), ForgeError> {
+    let mut waited = false;
+    loop {
+        let resp = make()
+            .send()
+            .await
+            .map_err(|e| network_error(service, &e, secrets))?;
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| network_error(service, &e, secrets))?;
+        match retry_after {
+            Some(secs) if status == 429 && !waited && secs <= SHORT_RETRY => {
+                waited = true;
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+            }
+            _ => return Ok((status, retry_after, body)),
+        }
+    }
+}
+
+fn network_error(service: &'static str, e: &reqwest::Error, secrets: &[&str]) -> ForgeError {
+    ForgeError::Tracker {
+        service,
+        status: None,
+        message: redact(&e.to_string(), secrets),
+    }
+}
+
+/// A status that is not a success, with what the service said about it (Jira
+/// `errorMessages` and `errors`, GraphQL `errors[].message`), redacted.
+pub fn http_error(
+    service: &'static str,
+    status: u16,
+    retry_after: Option<u64>,
+    body: &str,
+    secrets: &[&str],
+) -> ForgeError {
+    let what = match status {
+        401 => "the credentials were refused",
+        403 => "no access to this project or ticket",
+        404 => "project or ticket not found",
+        429 => "rate limited",
+        500..=599 => "server error",
+        _ => "request refused",
+    };
+    let mut message = what.to_string();
+    let said = server_messages(body);
+    if !said.is_empty() {
+        message.push_str(": ");
+        message.push_str(&said);
+    }
+    if let Some(secs) = retry_after {
+        message.push_str(&format!(" (retry after {secs} s)"));
+    }
+    ForgeError::Tracker {
+        service,
+        status: Some(status),
+        message: redact(&message, secrets),
+    }
+}
+
+fn server_messages(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return String::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    out.extend(
+        v["errorMessages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.as_str().map(str::to_string)),
+    );
+    if let Some(fields) = v["errors"].as_object() {
+        out.extend(
+            fields
+                .iter()
+                .filter_map(|(k, m)| m.as_str().map(|m| format!("{k}: {m}"))),
+        );
+    }
+    out.extend(
+        v["errors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["message"].as_str().map(str::to_string)),
+    );
+    out.join("; ").chars().take(300).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +590,68 @@ esac"#;
         );
         // A task queued from GitHub before the repository moved keeps its closing line.
         assert_eq!(pr_first_line(TrackerKind::Jira, 7, None, gh), "Closes #7.");
+    }
+    #[test]
+    fn utc_seconds_normalises_offsets_fractions_and_dates() {
+        for (raw, utc) in [
+            ("2026-10-01T10:00:00.000+0200", "2026-10-01T08:00:00Z"),
+            ("2026-10-01T01:30:00.123+02:00", "2026-09-30T23:30:00Z"),
+            ("2026-10-01T08:00:00.123Z", "2026-10-01T08:00:00Z"),
+            ("2026-10-01T08:00:00Z", "2026-10-01T08:00:00Z"),
+            ("2024-02-29T23:00:00-0130", "2024-03-01T00:30:00Z"),
+            ("2026-12-31T23:59:59.999-0100", "2027-01-01T00:59:59Z"),
+        ] {
+            assert_eq!(utc_seconds(raw).as_deref(), Some(utc), "{raw}");
+        }
+        for bad in [
+            "",
+            "2026-10-01",
+            "garbage",
+            "2026-13-01T00:00:00Z",
+            "2026-10-01T08:00:00",
+            "2026-10-01T08:00:00+2",
+        ] {
+            assert_eq!(utc_seconds(bad), None, "{bad}");
+        }
+        // Provefab's own timestamps are a fixed point, so string order is time order.
+        for secs in [0, 951_782_400, 1_790_000_000] {
+            let s = crate::store::rfc3339(secs);
+            assert_eq!(utc_seconds(&s), Some(s.clone()));
+        }
+    }
+
+    #[test]
+    fn numbers_come_from_keys_of_the_project() {
+        assert_eq!(number_of("ENG-123", "ENG"), Some(123));
+        assert_eq!(number_of("OPS-123", "ENG"), None);
+        assert_eq!(number_of("ENG-x", "ENG"), None);
+        assert_eq!(number_of("ENGX-1", "ENG"), None);
+    }
+
+    #[test]
+    fn http_errors_are_classified_and_redacted() {
+        let secrets = ["tok-SECRET-123", "bot@acme.test"];
+        let body = r#"{"errorMessages":["no access for bot@acme.test with tok-SECRET-123"]}"#;
+        for (status, permanent) in [
+            (400, true),
+            (401, true),
+            (403, true),
+            (404, true),
+            (408, false),
+            (429, false),
+            (500, false),
+            (503, false),
+        ] {
+            let e = http_error("jira", status, None, body, &secrets);
+            assert_eq!(e.is_permanent(), permanent, "{status}");
+            let shown = format!("{e} {e:?}");
+            assert!(
+                !shown.contains("tok-SECRET-123") && !shown.contains("bot@acme.test"),
+                "{shown}"
+            );
+            assert!(shown.contains(&format!("HTTP {status}")), "{shown}");
+        }
+        let e = http_error("jira", 429, Some(120), "", &secrets);
+        assert!(e.to_string().contains("retry after 120 s"), "{e}");
     }
 }
