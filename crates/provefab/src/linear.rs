@@ -2,6 +2,8 @@
 //! personal API key. Labels and comments only: Provefab never changes an
 //! issue's state.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 
@@ -38,6 +40,12 @@ const FIND_LABEL: &str = "query($name: String!) { issueLabels(filter: { name: { 
 const CREATE_LABEL: &str = "mutation($input: IssueLabelCreateInput!) { issueLabelCreate(input: $input) { success issueLabel { id } } }";
 const TEAM: &str = "query($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id } } }";
 const CHECK: &str = "query($key: String!) { viewer { id organization { urlKey } } teams(filter: { key: { eq: $key } }) { nodes { id } } }";
+
+/// Most pages one listing reads: enough for `ISSUE_LIMIT` issues, and a
+/// guard against a server that always says there is more.
+const ISSUE_PAGES: usize = ISSUE_LIMIT / 100 + 1;
+/// Most comment pages read for one issue: 5,000 comments.
+const COMMENT_PAGES: usize = 50;
 
 pub struct Linear {
     /// The GraphQL endpoint; a test server's address in tests.
@@ -111,11 +119,30 @@ fn comment_of(c: &Value) -> Option<Comment> {
     };
     Some(Comment {
         author,
-        // Only workspace members can comment on Linear (spec §8, decision 9).
+        // Guests also map to MEMBER until the real run confirms Linear's guest
+        // field; re-open then (map guests to NONE).
         association: "MEMBER".into(),
         body: c["body"].as_str().unwrap_or_default().to_string(),
         created_at,
     })
+}
+
+/// The cursor of the page after `page`, unless the listing should stop: no
+/// next page, `pages` already read up to `cap`, or a cursor seen before (a
+/// server that always says there is more cannot keep Provefab looping).
+fn next_page(
+    page: &Value,
+    seen: &mut HashSet<String>,
+    pages: usize,
+    cap: usize,
+    what: &str,
+) -> Option<String> {
+    let cursor = page_end(page)?;
+    if pages >= cap || !seen.insert(cursor.clone()) {
+        eprintln!("provefab: linear {what}: stopped after {pages} pages");
+        return None;
+    }
+    Some(cursor)
 }
 
 fn page_end(page: &Value) -> Option<String> {
@@ -155,11 +182,16 @@ impl Linear {
         })
         .await?;
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if let Some(code) = graphql_status(&v) {
+        // A status that says "try later" stands whatever the body says, so an
+        // unknown error code cannot turn it permanent; otherwise the body
+        // decides (a 400 carrying RATELIMITED is a rate limit), then the status.
+        let failed = if status == 408 || status == 429 || status >= 500 {
+            Some(status)
+        } else {
+            graphql_status(&v).or((!(200..300).contains(&status)).then_some(status))
+        };
+        if let Some(code) = failed {
             return Err(http_error(SERVICE, code, retry_after, &text, &secrets));
-        }
-        if !(200..300).contains(&status) {
-            return Err(http_error(SERVICE, status, retry_after, &text, &secrets));
         }
         match v.get("data") {
             Some(d) if !d.is_null() => Ok(d.clone()),
@@ -168,6 +200,19 @@ impl Linear {
                 "no data in the answer".into(),
             )),
         }
+    }
+
+    /// The issue's uuid, which mutations need: a local error when the answer
+    /// has none, so no mutation goes out with an empty or null id.
+    async fn issue_with_id(&self, number: u64) -> Result<(String, Value), ForgeError> {
+        let issue = self.issue_value(number).await?;
+        let id = issue["id"].as_str().map(str::to_string).ok_or_else(|| {
+            ForgeError::Parse(
+                "linear issue".into(),
+                format!("no id for {}", self.ident(number)),
+            )
+        })?;
+        Ok((id, issue))
     }
 
     async fn issue_value(&self, number: u64) -> Result<Value, ForgeError> {
@@ -270,7 +315,9 @@ impl Tracker for Linear {
     async fn open_issues(&self, slug: &str, label: &str) -> Result<Vec<Issue>, ForgeError> {
         let mut out = Vec::new();
         let mut after: Option<String> = None;
+        let (mut seen, mut pages) = (HashSet::new(), 0);
         loop {
+            pages += 1;
             let d = self
                 .query(
                     OPEN,
@@ -285,8 +332,11 @@ impl Tracker for Linear {
                     .flatten()
                     .filter_map(|i| self.issue_of(i)),
             );
-            after = page_end(page);
-            if out.len() >= ISSUE_LIMIT || after.is_none() {
+            if out.len() >= ISSUE_LIMIT {
+                break;
+            }
+            after = next_page(page, &mut seen, pages, ISSUE_PAGES, "issues");
+            if after.is_none() {
                 break;
             }
         }
@@ -311,7 +361,9 @@ impl Tracker for Linear {
         let ident = self.ident(number);
         let mut out = Vec::new();
         let mut after: Option<String> = None;
+        let (mut seen, mut pages) = (HashSet::new(), 0);
         loop {
+            pages += 1;
             let d = self
                 .query(COMMENTS, json!({"id": ident, "after": after}))
                 .await?;
@@ -326,7 +378,7 @@ impl Tracker for Linear {
                     .flatten()
                     .filter_map(comment_of),
             );
-            after = page_end(page);
+            after = next_page(page, &mut seen, pages, COMMENT_PAGES, "comments");
             if after.is_none() {
                 break;
             }
@@ -335,8 +387,7 @@ impl Tracker for Linear {
     }
 
     async fn comment(&self, _slug: &str, number: u64, body: &str) -> Result<(), ForgeError> {
-        let issue = self.issue_value(number).await?;
-        let id = issue["id"].as_str().unwrap_or_default();
+        let (id, _) = self.issue_with_id(number).await?;
         let d = self
             .query(COMMENT, json!({"id": id, "body": with_prefix(body)}))
             .await?;
@@ -353,7 +404,7 @@ impl Tracker for Linear {
         if add.is_empty() && remove.is_empty() {
             return Ok(());
         }
-        let issue = self.issue_value(number).await?;
+        let (id, issue) = self.issue_with_id(number).await?;
         let current: Vec<(String, String)> = issue
             .pointer("/labels/nodes")
             .and_then(Value::as_array)
@@ -390,7 +441,7 @@ impl Tracker for Linear {
         let d = self
             .query(
                 UPDATE_LABELS,
-                json!({"id": issue["id"], "added": added, "removed": removed}),
+                json!({"id": id, "added": added, "removed": removed}),
             )
             .await?;
         succeeded(&d, "issueUpdate")
@@ -500,18 +551,152 @@ mod tests {
 
     #[tokio::test]
     async fn open_issues_stop_at_the_cap() {
-        let server = MockServer::start().await;
+        // A new cursor each page: a repeated one would stop the listing first.
         let page: Vec<Value> = (1..=100).map(|n| node(n, "started")).collect();
-        Mock::given(method("POST"))
-            .respond_with(data(json!({"issues": {"nodes": page, "pageInfo": {"hasNextPage": true, "endCursor": "more"}}})))
-            .expect(10)
-            .mount(&server)
-            .await;
+        let (server, calls) = endless("issues", json!(page), false).await;
         let issues = linear(&server)
             .open_issues("acme/web", "provefab")
             .await
             .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
         assert_eq!(issues.len(), crate::forge::ISSUE_LIMIT);
+        // The warning `open_issues` prints (to stderr, not capturable here).
+        assert!(crate::forge::issue_limit_warning("acme/web", "provefab", issues.len()).is_some());
+    }
+
+    /// Answers `hasNextPage: true` forever, with a new cursor each time
+    /// unless `same`, and counts the requests.
+    struct Endless {
+        /// `issues`, or `comments` of one issue.
+        what: &'static str,
+        nodes: Value,
+        same: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for Endless {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let cursor = if self.same {
+                "same".to_string()
+            } else {
+                format!("c{n}")
+            };
+            let page = json!({"nodes": self.nodes, "pageInfo": {"hasNextPage": true, "endCursor": cursor}});
+            data(match self.what {
+                "issues" => json!({"issues": page}),
+                _ => json!({"issue": {"comments": page}}),
+            })
+        }
+    }
+
+    async fn endless(
+        what: &'static str,
+        nodes: Value,
+        same: bool,
+    ) -> (MockServer, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let server = MockServer::start().await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with(Endless {
+                what,
+                nodes,
+                same,
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+        (server, calls)
+    }
+
+    async fn within_20s<T>(
+        f: impl std::future::Future<Output = T>,
+    ) -> Result<T, tokio::time::error::Elapsed> {
+        tokio::time::timeout(std::time::Duration::from_secs(20), f).await
+    }
+
+    #[tokio::test]
+    async fn paging_ends_on_a_repeated_cursor_or_at_the_page_cap() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Nodes of another team never count, so only the guards stop the loop.
+        let foreign = json!([{"identifier": "OPS-1", "title": "t", "url": "u"}]);
+        let (server, calls) = endless("issues", foreign.clone(), true).await;
+        let issues = within_20s(linear(&server).open_issues("acme/web", "provefab"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(issues.is_empty());
+        assert_eq!(calls.load(SeqCst), 2, "the first repeat stops it");
+        let (server, calls) = endless("issues", foreign, false).await;
+        within_20s(linear(&server).open_issues("acme/web", "provefab"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(SeqCst), ISSUE_PAGES);
+        let (server, calls) = endless("comments", json!([]), true).await;
+        within_20s(linear(&server).comments("acme/web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(SeqCst), 2);
+        let (server, calls) = endless("comments", json!([]), false).await;
+        within_20s(linear(&server).comments("acme/web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(SeqCst), COMMENT_PAGES);
+    }
+
+    #[tokio::test]
+    async fn comments_follow_every_page() {
+        let server = MockServer::start().await;
+        let comment = |body: &str| json!({"body": body, "createdAt": "2026-10-01T08:00:00Z", "user": {"id": "user-bob"}});
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"variables": {"after": "p1"}})))
+            .respond_with(data(json!({"issue": {"comments": {"nodes": [comment("second")], "pageInfo": {"hasNextPage": false, "endCursor": "p2"}}}})))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(data(json!({"issue": {"comments": {"nodes": [comment("first")], "pageInfo": {"hasNextPage": true, "endCursor": "p1"}}}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let comments = linear(&server).comments("acme/web", 7).await.unwrap();
+        assert_eq!(
+            comments.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    /// An issue answer without its id never sends a mutation with an empty or
+    /// null id.
+    #[tokio::test]
+    async fn a_missing_issue_id_stops_before_the_mutation() {
+        let server = MockServer::start().await;
+        let mut issue = node(7, "started");
+        issue.as_object_mut().unwrap().remove("id");
+        on(
+            &server,
+            "issue(id: $id) { id identifier",
+            data(json!({"issue": issue})),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("mutation"))
+            .respond_with(data(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let l = linear(&server);
+        let err = l.comment("acme/web", 7, "hi").await.unwrap_err();
+        assert!(matches!(err, ForgeError::Parse(..)), "{err}");
+        let err = l
+            .edit_labels("acme/web", 7, &[], &["provefab"])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ForgeError::Parse(..)), "{err}");
     }
 
     #[tokio::test]
@@ -701,6 +886,10 @@ mod tests {
             (200, echo("INVALID_INPUT", "Entity not found: Issue"), true),
             (400, echo("RATELIMITED", "Rate limit exceeded"), false),
             (500, json!({}), false),
+            // The HTTP status wins when it says "try later", whatever the body.
+            (503, echo("SOMETHING_NEW", "Service unavailable"), false),
+            (429, echo("SOMETHING_NEW", "Slow down"), false),
+            (200, echo("SOMETHING_NEW", "Unexpected"), true),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
