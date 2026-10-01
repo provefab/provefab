@@ -185,3 +185,196 @@ async fn a_ticket_reopened_after_merge_starts_a_pass_on_a_keyed_branch() {
         "provefab/ENG-7-add-a-feature-file-r2"
     );
 }
+
+/// A Jira-repository pipeline with ENG-7 queued, nothing run yet.
+async fn queued_ticket() -> (Fixture, Pipeline<FakeRunner, FakeOracle, FakeHub>, i64) {
+    let mut f = fixture(&["true"]);
+    on(&mut f, TrackerKind::Jira);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        ticket_hub(TrackerKind::Jira, "please"),
+    )
+    .await;
+    let id = queue_ticket(&p, 7, "ENG-7", JIRA_URL).await;
+    (f, p, id)
+}
+
+fn nothing_written(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>) {
+    assert!(
+        p.hub.posted.lock().unwrap().is_empty(),
+        "{:?}",
+        p.hub.posted
+    );
+    assert!(
+        p.hub.labels.lock().unwrap().is_empty(),
+        "{:?}",
+        p.hub.labels
+    );
+}
+
+#[tokio::test]
+async fn a_ticket_whose_repository_left_the_config_gives_up_without_writing_to_github() {
+    let (_f, mut p, id) = queued_ticket().await;
+    p.config.repos.clear();
+    assert_eq!(p.step(id).await.unwrap(), Failed);
+    nothing_written(&p);
+    // Skipped, not queued for a retry that would reach GitHub later.
+    assert!(p.store.pending_github().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_ticket_on_a_repository_now_on_github_is_parked_without_writing_to_github() {
+    let (_f, mut p, id) = queued_ticket().await;
+    p.config.repos[0].tracker = None;
+    assert_eq!(p.park(id, "stopped", "").await.unwrap(), NeedsYou);
+    nothing_written(&p);
+}
+
+#[tokio::test]
+async fn a_pending_effect_of_a_ticket_is_not_replayed_to_github() {
+    let (_f, mut p, id) = queued_ticket().await;
+    p.hub
+        .comment_failures
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(p.park(id, "stopped", "").await.unwrap(), NeedsYou);
+    assert_eq!(p.store.pending_github().await.unwrap().len(), 2);
+    p.config.repos.clear();
+    p.retry_pending(&std::collections::HashSet::new()).await;
+    nothing_written(&p);
+    // Kept: restoring the repository replays them to its tracker.
+    assert_eq!(p.store.pending_github().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_task_that_disagrees_with_its_repository_tracker_stops_run_and_add() {
+    use provefab::commands::{CommandError, tracker_history};
+    let (_f, mut p, id) = queued_ticket().await;
+    assert!(tracker_history(&p.store, &p.config).await.is_ok());
+    // A key on a repository now on GitHub.
+    p.config.repos[0].tracker = None;
+    let err = tracker_history(&p.store, &p.config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("o/r") && err.contains(&format!("task {id}")) && err.contains("ENG-7"),
+        "{err}"
+    );
+    assert!(err.contains("Restore the previous tracker"), "{err}");
+    let added = provefab::commands::add(
+        &p.store,
+        &p.config,
+        &p.hub,
+        &p.git,
+        &p.paths,
+        "https://github.com/o/r/issues/8",
+    )
+    .await;
+    assert!(
+        matches!(added, Err(CommandError::TrackerHistory(_))),
+        "{added:?}"
+    );
+    // A key of another project.
+    on_project(&mut p, "OPS");
+    assert!(tracker_history(&p.store, &p.config).await.is_err());
+    // A terminal task alone does not block; its pending effect does.
+    on_project(&mut p, "OPS");
+    p.store.transition(id, Failed, "test").await.unwrap();
+    assert!(tracker_history(&p.store, &p.config).await.is_ok());
+    p.store
+        .record_output(
+            id,
+            "pending_github",
+            &json!({"op": "comment", "slug": "o/r", "number": 7, "body": "x"}),
+        )
+        .await
+        .unwrap();
+    assert!(tracker_history(&p.store, &p.config).await.is_err());
+}
+
+#[tokio::test]
+async fn a_github_task_on_a_repository_now_on_jira_stops_run() {
+    let f = fixture(&["true"]);
+    let mut p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    on_project(&mut p, "ENG");
+    let err = provefab::commands::tracker_history(&p.store, &p.config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("task {id}")) && err.contains("#7"),
+        "{err}"
+    );
+}
+
+fn on_project(p: &mut Pipeline<FakeRunner, FakeOracle, FakeHub>, project: &str) {
+    p.config.repos[0].tracker = Some(TrackerConfig {
+        kind: TrackerKind::Jira,
+        site: Some("acme.atlassian.net".into()),
+        project: Some(project.into()),
+    });
+}
+
+#[tokio::test]
+async fn intake_skips_a_ticket_whose_number_is_an_earlier_task_of_another_tracker() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    let mut repo = p.config.repos[0].clone();
+    repo.tracker = Some(TrackerConfig {
+        kind: TrackerKind::Jira,
+        site: Some("acme.atlassian.net".into()),
+        project: Some("ENG".into()),
+    });
+    let jira = ticket_hub(TrackerKind::Jira, "x");
+    let added = provefab::intake::poll(&jira, &repo, &p.store)
+        .await
+        .unwrap();
+    assert!(added.is_empty());
+    let task = p.store.task(id).await.unwrap().unwrap();
+    assert_eq!(task.issue_key, None);
+    // The line it logs names both.
+    let line = provefab::tracker::key_clash(&task, Some("ENG-7")).unwrap();
+    assert!(
+        line.contains("ENG-7") && line.contains("#7") && line.contains(&format!("task {id}")),
+        "{line}"
+    );
+    assert_eq!(provefab::tracker::key_clash(&task, None), None);
+}
+
+#[tokio::test]
+async fn add_refuses_a_stored_task_of_the_same_number_from_another_tracker() {
+    let (_f, mut p, id) = queued_ticket().await;
+    p.store.transition(id, Failed, "test").await.unwrap();
+    p.config.repos[0].tracker = None;
+    let hub = FakeHub::new("x");
+    let err = provefab::commands::add(
+        &p.store,
+        &p.config,
+        &hub,
+        &p.git,
+        &p.paths,
+        "https://github.com/o/r/issues/7",
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("ENG-7") && err.contains("#7"), "{err}");
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().state, Failed);
+    assert!(hub.labels.lock().unwrap().is_empty());
+}

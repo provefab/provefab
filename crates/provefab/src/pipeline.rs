@@ -466,6 +466,13 @@ pub async fn start_pass<H: Hub>(
         format!("{}:in-pr", repo.label),
     ];
     let others: Vec<&str> = others.iter().map(String::as_str).collect();
+    if let Some(why) = crate::tracker::key_mismatch(task.issue_key.as_deref(), Some(repo)) {
+        eprintln!(
+            "provefab: task {}: not relabelling its issue: {why}",
+            task.id
+        );
+        return Ok(());
+    }
     github(
         store,
         hub,
@@ -498,7 +505,7 @@ fn task_branch(task: &TaskRow) -> String {
     }
 }
 
-/// Applies a GitHub side effect (spec §3.2): `{"op":"comment",...}` posts a
+/// Applies a tracker side effect (spec §3.2): `{"op":"comment",...}` posts a
 /// comment, `{"op":"labels",...}` edits labels. What `github` records and
 /// `Pipeline::retry_pending` replays.
 async fn apply_effect<H: Hub>(hub: &H, effect: &Value) -> Result<(), ForgeError> {
@@ -524,7 +531,7 @@ async fn apply_effect<H: Hub>(hub: &H, effect: &Value) -> Result<(), ForgeError>
     hub.edit_labels(slug, number, &add, &remove).await
 }
 
-/// Applies a GitHub effect now, or stores it for the scheduler to retry
+/// Applies a tracker effect now, or stores it for the scheduler to retry
 /// (spec §3.2): a task with effects already waiting queues behind them, so a
 /// newer label change can never overwrite an older one still to be retried.
 /// A failure is logged, never the error text (review I7): gh and git errors
@@ -541,7 +548,7 @@ async fn github<H: Hub>(
             .await;
     }
     if let Err(e) = apply_effect(hub, &effect).await {
-        eprintln!("provefab: could not apply a github effect for task {task_id}: {e}");
+        eprintln!("provefab: could not apply a tracker effect for task {task_id}: {e}");
         store
             .record_output(task_id, "pending_github", &effect)
             .await?;
@@ -720,9 +727,23 @@ where
         Ok(to)
     }
 
-    /// GitHub side effects after the state is already recorded: a failure to
-    /// reach GitHub is never fatal (the state in the store is the truth), but
-    /// the effect is stored so the scheduler retries it (spec §3.2).
+    /// Whether the task's issue no longer fits its repository's tracker (a
+    /// ticket whose repository left `provefab.toml` or moved to GitHub, and
+    /// the reverse): then nothing is written to it, with one log line, and
+    /// the state change stays local (final review I1).
+    async fn misrouted(&self, id: i64, what: &str) -> Result<bool, PipelineError> {
+        let task = self.task(id).await?;
+        let Some(why) = crate::tracker::key_mismatch(task.issue_key.as_deref(), self.repo(&task))
+        else {
+            return Ok(false);
+        };
+        eprintln!("provefab: task {id}: not {what} its issue: {why}");
+        Ok(true)
+    }
+
+    /// Tracker side effects after the state is already recorded: a failure to
+    /// reach the tracker is never fatal (the state in the store is the truth),
+    /// but the effect is stored so the scheduler retries it (spec §3.2).
     pub(crate) async fn tell(
         &self,
         id: i64,
@@ -730,6 +751,9 @@ where
         number: u64,
         body: &str,
     ) -> Result<(), PipelineError> {
+        if self.misrouted(id, "commenting on").await? {
+            return Ok(());
+        }
         github(
             &self.store,
             &self.hub,
@@ -748,6 +772,9 @@ where
         add: &[&str],
         remove: &[&str],
     ) -> Result<(), PipelineError> {
+        if self.misrouted(id, "relabelling").await? {
+            return Ok(());
+        }
         github(
             &self.store,
             &self.hub,
@@ -768,7 +795,7 @@ where
         let pending = match self.store.pending_github().await {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("provefab: could not read pending github effects: {e}");
+                eprintln!("provefab: could not read pending tracker effects: {e}");
                 return;
             }
         };
@@ -777,14 +804,31 @@ where
             if skip.contains(&task_id) || failed.contains(&task_id) {
                 continue;
             }
+            // Kept, not replayed: restoring the repository's tracker sends it
+            // to the right issue (final review I1).
+            let why = match self.store.task(task_id).await {
+                Ok(task) => task.and_then(|t| {
+                    crate::tracker::key_mismatch(t.issue_key.as_deref(), self.repo(&t))
+                }),
+                Err(e) => {
+                    eprintln!("provefab: could not read task {task_id}: {e}");
+                    failed.insert(task_id);
+                    continue;
+                }
+            };
+            if let Some(why) = why {
+                eprintln!("provefab: task {task_id}: not replaying a tracker effect: {why}");
+                failed.insert(task_id);
+                continue;
+            }
             match apply_effect(&self.hub, &effect).await {
                 Ok(()) => {
                     if let Err(e) = self.store.delete_output(row_id).await {
-                        eprintln!("provefab: could not clear a retried github effect: {e}");
+                        eprintln!("provefab: could not clear a retried tracker effect: {e}");
                     }
                 }
                 Err(e) => {
-                    eprintln!("provefab: retry of a github effect for task {task_id} failed: {e}");
+                    eprintln!("provefab: retry of a tracker effect for task {task_id} failed: {e}");
                     failed.insert(task_id);
                 }
             }
@@ -2752,6 +2796,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
         detected: &[Detected],
         previous: Option<&[Detected]>,
     ) -> Result<(), PipelineError> {
+        if self.misrouted(task.id, "labelling").await? {
+            return Ok(());
+        }
         let mut remove: Vec<String> = Vec::new();
         for d in previous
             .unwrap_or_default()

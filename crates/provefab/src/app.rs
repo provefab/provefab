@@ -335,6 +335,8 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             let Some(_lock) = commands::lock(&paths.home.join("run.lock"))? else {
                 bail!("another `provefab run` is already working on this queue");
             };
+            let store = Store::open(&paths.db()).await?;
+            commands::tracker_history(&store, &config).await?;
             // Spec §7: models whose worker is not signed in leave the catalog.
             let checks = commands::doctor(
                 &Tools::default(),
@@ -385,7 +387,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             let prices =
                 crate::prices::load(&paths, config.routing.price_urls(), crate::store::now()).await;
             let pipeline = Arc::new(Pipeline {
-                store: Store::open(&paths.db()).await?,
+                store,
                 runner: AgentRunner::new(&paths, &installed, exe),
                 oracle,
                 hub,

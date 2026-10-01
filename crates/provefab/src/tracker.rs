@@ -11,11 +11,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::config::Config;
+use crate::config::{Config, RepoConfig};
 use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus};
 use crate::jira::Jira;
 use crate::linear::Linear;
 use crate::ports::{Forge, Tracker};
+use crate::store::TaskRow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -508,6 +509,57 @@ pub fn split_key(key: &str) -> Option<(&str, u64)> {
     let (project, n) = key.rsplit_once('-')?;
     let n: u64 = n.parse().ok()?;
     (is_project_key(project) && n > 0).then_some((project, n))
+}
+
+/// Why a task's issue no longer fits its repository's tracker: a ticket key
+/// on a repository now on GitHub or gone from `provefab.toml`, a GitHub issue
+/// on a repository now on Jira or Linear, or a key of another project. Writing
+/// to it would reach another issue with the same number (final review I1, I2).
+pub fn key_mismatch(key: Option<&str>, repo: Option<&RepoConfig>) -> Option<String> {
+    let Some(repo) = repo else {
+        return key
+            .map(|k| format!("{k} is a ticket and its repository is no longer in provefab.toml"));
+    };
+    let kind = repo.tracker_kind();
+    let project = repo
+        .tracker
+        .as_ref()
+        .and_then(|t| t.project.as_deref())
+        .unwrap_or_default();
+    match (key, kind) {
+        (None, TrackerKind::Github) => None,
+        (Some(k), TrackerKind::Github) => Some(format!(
+            "{k} is a ticket and {} now takes its issues from github",
+            repo.slug
+        )),
+        (None, _) => Some(format!(
+            "it is a GitHub issue and {} now takes its issues from {}",
+            repo.slug,
+            kind.as_str()
+        )),
+        (Some(k), _) if number_of(k, project).is_none() => Some(format!(
+            "{k} is not in the {} project {project} that {} now uses",
+            kind.as_str(),
+            repo.slug
+        )),
+        (Some(_), _) => None,
+    }
+}
+
+/// The line intake logs (and `provefab add` refuses with) when an incoming
+/// issue has the number of an earlier task of the repository that came from
+/// another tracker: `(repo, number)` is the task's identity, so the new one
+/// cannot be queued (final review I2).
+pub fn key_clash(task: &TaskRow, incoming: Option<&str>) -> Option<String> {
+    (task.issue_key.as_deref() != incoming).then(|| {
+        format!(
+            "{} has the number of task {} ({}) of {}, which came from another tracker",
+            repo_ref(&task.repo, task.issue_number, incoming),
+            task.id,
+            task.reference(),
+            task.repo
+        )
+    })
 }
 
 /// A Jira or Linear ticket link, its key upper case and a Jira site lower

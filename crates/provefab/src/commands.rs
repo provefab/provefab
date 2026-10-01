@@ -1,6 +1,7 @@
 //! The user-facing commands besides `run` and `guard` (spec §2.2): `add`,
 //! `status`, `log`, `doctor`, plus the single-instance lock and the Jev key.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,8 @@ pub enum CommandError {
     OtherWorkspace(String),
     #[error("{0} is not in provefab.toml's [[repos]]")]
     UnknownRepo(String),
+    #[error("{0}")]
+    TrackerHistory(String),
     #[error("no task {0}")]
     UnknownTask(i64),
     #[error("{0}")]
@@ -58,6 +61,52 @@ pub fn parse_issue_url(url: &str) -> Option<(String, u64)> {
     }
 }
 
+/// Refuses to start when a configured repository has a task in progress, or
+/// a pending tracker effect, whose issue does not fit the repository's
+/// tracker any more: its comments and labels would reach another issue with
+/// the same number (final review I2). Checked by `provefab run` and `add`.
+pub async fn tracker_history(store: &Store, config: &Config) -> Result<(), CommandError> {
+    let pending: HashSet<i64> = store
+        .pending_github()
+        .await?
+        .into_iter()
+        .map(|(_, task_id, _)| task_id)
+        .collect();
+    let mut lines = Vec::new();
+    for task in store.tasks_in(&TaskState::ALL).await? {
+        if task.state.is_terminal() && !pending.contains(&task.id) {
+            continue;
+        }
+        let Some(repo) = config
+            .repos
+            .iter()
+            .find(|r| r.slug.eq_ignore_ascii_case(&task.repo))
+        else {
+            continue;
+        };
+        if let Some(why) = crate::tracker::key_mismatch(task.issue_key.as_deref(), Some(repo)) {
+            let what = if task.state.is_terminal() {
+                "has tracker updates still to send"
+            } else {
+                task.state.as_str()
+            };
+            lines.push(format!(
+                "  {}: task {} ({}, {what}): {why}",
+                repo.slug,
+                task.id,
+                task.reference()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    Err(CommandError::TrackerHistory(format!(
+        "these tasks do not match their repository's tracker in provefab.toml:\n{}\nRestore the previous tracker until they finish, then switch (see docs/guide/trackers.md).",
+        lines.join("\n")
+    )))
+}
+
 /// `provefab add <url>`: queues the issue, or requeues it when the task is
 /// parked (terminal or waiting for information). A task in progress is left
 /// alone. GitHub, Jira (`https://<site>/browse/ENG-123`) and Linear
@@ -70,6 +119,7 @@ pub async fn add<H: Hub>(
     paths: &Paths,
     url: &str,
 ) -> Result<String, CommandError> {
+    tracker_history(store, config).await?;
     let (repo, number, ticket) = match parse_issue_url(url) {
         Some((slug, number)) => {
             let repo = config
@@ -114,11 +164,15 @@ pub async fn add<H: Hub>(
         return Ok(format!("queued as task {id}"));
     }
     let task = store
-        .tasks_in(&TaskState::ALL)
+        .task_of_issue(&repo.slug, number)
         .await?
-        .into_iter()
-        .find(|t| t.repo.eq_ignore_ascii_case(&repo.slug) && t.issue_number == number)
         .ok_or(CommandError::UnknownTask(0))?;
+    // `(repo, number)` names a task from the repository's previous tracker.
+    if let Some(clash) = crate::tracker::key_clash(&task, issue.key.as_deref()) {
+        return Err(CommandError::TrackerHistory(format!(
+            "{clash}; Provefab cannot queue it (see docs/guide/trackers.md)"
+        )));
+    }
     if task.state.is_terminal() || task.state == TaskState::NeedsInfo {
         // A new pass starts from `base` on a new branch (the pipeline suffixes it
         // with the pass number): the old worktree holds work that was rejected

@@ -288,6 +288,20 @@ impl Store {
         row.map(|r| task_row(&r)).transpose()
     }
 
+    /// The task of issue `number` of `repo` (slugs compare case-insensitively).
+    pub async fn task_of_issue(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<TaskRow>, StoreError> {
+        let row = sqlx::query("SELECT * FROM tasks WHERE lower(repo) = ? AND issue_number = ?")
+            .bind(repo.to_lowercase())
+            .bind(number as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| task_row(&r)).transpose()
+    }
+
     /// Tasks in any of `states`, oldest first.
     pub async fn tasks_in(&self, states: &[TaskState]) -> Result<Vec<TaskRow>, StoreError> {
         let mut out = Vec::new();

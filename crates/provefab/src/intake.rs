@@ -32,6 +32,11 @@ pub async fn poll(
         };
         if let Some(id) = store.add_issue(&new).await? {
             added.push(id);
+        } else if let Some(task) = store.task_of_issue(&new.repo, new.number).await?
+            && let Some(clash) = crate::tracker::key_clash(&task, new.issue_key.as_deref())
+        {
+            // Not queued: `(repo, number)` already names that task (final review I2).
+            eprintln!("provefab: skipped {clash}; see docs/guide/trackers.md");
         }
     }
     Ok(added)
