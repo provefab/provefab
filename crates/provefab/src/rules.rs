@@ -714,15 +714,23 @@ where
                 });
             }
         }
-        // Every earlier periodic pull request that is merged or closed, whatever its age.
-        let mut seen = HashSet::new();
-        for run in p
+        Ok(out)
+    }
+
+    /// Every earlier periodic pull request that is merged or closed,
+    /// whatever its age. One whose state cannot be read fails the call
+    /// (final review I4): taken for open, a refused proposal would lose its
+    /// refusal.
+    async fn outcomes(&self) -> Result<Vec<Signal>, String> {
+        let (p, slug) = (self.p, &self.repo.slug);
+        let runs = p
             .store
             .maintenance_runs(Some(slug))
-            .await?
-            .into_iter()
-            .rev()
-        {
+            .await
+            .map_err(|e| failed(format!("could not read the record of {slug}"), e))?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for run in runs.into_iter().rev() {
             let Some(url) = run.pr_url.clone() else {
                 continue;
             };
@@ -735,10 +743,7 @@ where
                     PrState::Closed => false,
                     PrState::Open => continue,
                 },
-                Err(e) => {
-                    failed(format!("could not read {url}"), e);
-                    continue;
-                }
+                Err(e) => return Err(failed(format!("could not read {url}"), e)),
             };
             let what = if merged { "merged" } else { "closed" };
             out.push(Signal {
@@ -752,7 +757,6 @@ where
                 },
             });
         }
-        out.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
         Ok(out)
     }
 
@@ -1135,12 +1139,15 @@ where
 {
     fn signals(&self, since: i64) -> BoxFuture<'_, Result<Vec<Signal>, String>> {
         Box::pin(async move {
-            self.collect(since).await.map_err(|e| {
+            let mut out = self.collect(since).await.map_err(|e| {
                 failed(
                     format!("could not read the record of {}", self.repo.slug),
                     e,
                 )
-            })
+            })?;
+            out.extend(self.outcomes().await?);
+            out.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
+            Ok(out)
         })
     }
 

@@ -267,6 +267,8 @@ pub struct FakeHub {
     pub pr_comment_failures: std::sync::atomic::AtomicU32,
     /// Every `pr_edit`: (url, title, body).
     pub edited: Mutex<Vec<(String, String, String)>>,
+    /// While set, `pr_status` fails (GitHub unreachable).
+    pub pr_status_down: std::sync::atomic::AtomicBool,
 }
 
 impl FakeHub {
@@ -314,6 +316,7 @@ impl FakeHub {
             pr_head_override: Mutex::new(None),
             pr_comment_failures: Default::default(),
             edited: Mutex::new(Vec::new()),
+            pr_status_down: Default::default(),
         }
     }
 
@@ -495,6 +498,12 @@ impl Forge for FakeHub {
         Ok(())
     }
     async fn pr_status(&self, _: &str, url: &str) -> Result<crate::forge::PrStatus, ForgeError> {
+        if self
+            .pr_status_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ForgeError::Parse("gh pr view".into(), "unreachable".into()));
+        }
         if let Some(s) = self.pr_statuses.lock().unwrap().get(url) {
             return Ok(s.clone());
         }

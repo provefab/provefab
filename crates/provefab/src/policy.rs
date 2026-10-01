@@ -129,6 +129,7 @@ pub struct Proposal {
 pub trait PeriodicTools: Send + Sync {
     /// The repository's signals since `since` (unix seconds), plus the
     /// outcome of every earlier periodic pull request, whatever its age.
+    /// `Err("could not read <url>")` when one of those cannot be read.
     fn signals(&self, since: i64) -> BoxFuture<'_, Result<Vec<Signal>, String>>;
     /// The highest rule number the record saw: loaded by a pass or cited by a finding.
     fn highest_rule_number(&self) -> BoxFuture<'_, Result<u32, String>>;

@@ -1294,3 +1294,22 @@ async fn propose_file_rebuilds_a_merged_branch_that_was_kept() {
         "rebuilt on the base"
     );
 }
+
+/// I4: an earlier proposal whose state cannot be read fails the call, so a
+/// closed proposal is never taken for an open one and its refusal kept.
+#[tokio::test]
+async fn signals_fail_when_a_proposals_state_cannot_be_read() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    hub.pr_status_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let url = "https://github.com/o/r/pull/90";
+    p.store
+        .record_maintenance_run(&run_of("rules", Some(url), None))
+        .await
+        .unwrap();
+    let repo = f.config.repos[0].clone();
+    let err = p.maintenance(&repo).signals(0).await.unwrap_err();
+    assert_eq!(err, format!("could not read {url}"));
+}
