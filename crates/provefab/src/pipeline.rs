@@ -2647,7 +2647,6 @@ Please reply with what should happen, what happens instead, and how to reproduce
             None => risk::unknown(),
         };
         let previous = self.latest_risk(task.id, |_, _| true).await?;
-        let same_round = self.risk_of_round(task).await?;
         self.store
             .write_with_events(
                 task.id,
@@ -2659,14 +2658,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 }],
             )
             .await?;
-        self.risk_labels(
-            task,
-            repo,
-            &detected,
-            previous.as_deref(),
-            same_round.as_deref(),
-        )
-        .await?;
+        self.risk_labels(task, repo, &detected, previous.as_deref())
+            .await?;
         // A check that is already a gate ran above: once, not twice (Review Focus 2).
         let extra: Vec<String> = risk_checks(&policy, &detected, commands)
             .into_iter()
@@ -2688,15 +2681,16 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// (Review Focus 3). Labelled before the extra checks run. A label
     /// `ensure_label` could not create is left out of the edit, so the queued
     /// edit never names a label that may not exist (it would fail on every
-    /// retry and hold the task's later GitHub effects). No edit when this
-    /// round was already classified with the same labels and none is removed.
+    /// retry and hold the task's later GitHub effects). The edit is skipped
+    /// only when every label to add was added earlier in the same round (a
+    /// `risk_labelled` output) and none is removed, so a label whose creation
+    /// failed is retried by the next classification of the round.
     async fn risk_labels(
         &self,
         task: &TaskRow,
         repo: &RepoConfig,
         detected: &[Detected],
         previous: Option<&[Detected]>,
-        same_round: Option<&[Detected]>,
     ) -> Result<(), PipelineError> {
         let name = |d: &Detected| risk::label(&repo.label, &d.name).0;
         let remove: Vec<String> = previous
@@ -2720,14 +2714,34 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 ),
             }
         }
-        let already = same_round.is_some_and(|s| s.iter().map(name).eq(add.iter().cloned()));
+        let (pass, round) = (pass_of(task), task.review_rounds);
+        let added_before: Vec<String> = self
+            .store
+            .recent_outputs(task.id, "risk_labelled", 16)
+            .await?
+            .iter()
+            .filter(|o| o["pass"] == pass && o["round"] == round)
+            .flat_map(|o| o["labels"].as_array().into_iter().flatten())
+            .filter_map(|l| l.as_str().map(String::from))
+            .collect();
+        let already = !add.is_empty() && add.iter().all(|l| added_before.contains(l));
         if (add.is_empty() || already) && remove.is_empty() {
             return Ok(());
         }
-        let add: Vec<&str> = add.iter().map(String::as_str).collect();
+        let labels: Vec<&str> = add.iter().map(String::as_str).collect();
         let remove: Vec<&str> = remove.iter().map(String::as_str).collect();
-        self.relabel(task.id, &task.repo, task.issue_number, &add, &remove)
-            .await
+        self.relabel(task.id, &task.repo, task.issue_number, &labels, &remove)
+            .await?;
+        if !add.is_empty() {
+            self.store
+                .record_output(
+                    task.id,
+                    "risk_labelled",
+                    &json!({"pass": pass, "round": round, "labels": add}),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// The categories of the latest `risk_classified` event whose (pass, round) `keep` accepts.
