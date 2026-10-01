@@ -232,6 +232,20 @@ fn gh() -> Gh {
     }
 }
 
+/// The hub `run` and `add` use: each repository's issues on its tracker, code
+/// on GitHub. Missing Jira or Linear credentials stop the command here, with
+/// the `provefab login` to run.
+async fn routed(config: &Config) -> anyhow::Result<crate::tracker::Routed> {
+    crate::tracker::Routed::from_config(
+        config,
+        gh(),
+        std::path::Path::new("security"),
+        &crate::tracker::process_env,
+    )
+    .await
+    .map_err(anyhow::Error::msg)
+}
+
 /// `provefab login jira --site <site>` and `provefab login linear` (spec §5):
 /// the token is typed at the Keychain's own prompt, so it never passes through
 /// Provefab or a command line. The Jira e-mail is kept as the item's comment.
@@ -311,8 +325,9 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             }
             policy.check(&config).map_err(anyhow::Error::msg)?;
             let oracle = oracle(&config).await?;
+            let hub = routed(&config).await?;
             if dry_run {
-                for line in scheduler::dry_run(&config, &gh(), &oracle).await? {
+                for line in scheduler::dry_run(&config, &hub, &oracle).await? {
                     println!("{line}");
                 }
                 return Ok(ExitCode::SUCCESS);
@@ -373,7 +388,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 store: Store::open(&paths.db()).await?,
                 runner: AgentRunner::new(&paths, &installed, exe),
                 oracle,
-                hub: gh(),
+                hub,
                 git: Git {
                     program: "git".into(),
                 },
@@ -394,11 +409,12 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
         }
         Cmd::Add { url } => {
             let config = load_config(&paths)?;
+            let hub = routed(&config).await?;
             let store = Store::open(&paths.db()).await?;
             let git = Git {
                 program: "git".into(),
             };
-            let out = commands::add(&store, &config, &gh(), &git, &paths, &url).await?;
+            let out = commands::add(&store, &config, &hub, &git, &paths, &url).await?;
             println!("{out}");
             Ok(ExitCode::SUCCESS)
         }
@@ -448,13 +464,17 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 }
             };
             let oracle = oracle(&config).await?;
-            let checks = commands::doctor(
+            let mut checks = commands::doctor(
                 &Tools::default(),
                 &config,
                 &paths,
                 oracle.as_ref().map(|o| &o.client),
             )
             .await;
+            checks.extend(
+                commands::tracker_checks(&Tools::default(), &config, &crate::tracker::process_env)
+                    .await,
+            );
             let mut ok = policy_ok;
             for c in &checks {
                 // The Jev key is optional: its absence is reported, not fatal.

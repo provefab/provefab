@@ -2,6 +2,7 @@
 //! the `[repos.tracker]` table, credentials, and what Jira and Linear share.
 //! Code and pull requests stay on GitHub; Provefab never changes a ticket's status.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,7 +11,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::forge::ForgeError;
+use crate::config::Config;
+use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus};
+use crate::jira::Jira;
+use crate::linear::Linear;
+use crate::ports::{Forge, Tracker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -489,11 +494,211 @@ fn server_messages(body: &str) -> String {
     out.join("; ")
 }
 
+/// A ticket link `provefab add` accepts (spec §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketUrl {
+    /// `https://<site>/browse/ENG-123`
+    Jira { site: String, key: String },
+    /// `https://linear.app/<workspace>/issue/ENG-123[/...]`
+    Linear { workspace: String, key: String },
+}
+
+/// `ENG-123` as (`ENG`, 123); the number is never 0.
+pub fn split_key(key: &str) -> Option<(&str, u64)> {
+    let (project, n) = key.rsplit_once('-')?;
+    let n: u64 = n.parse().ok()?;
+    (is_project_key(project) && n > 0).then_some((project, n))
+}
+
+/// A Jira or Linear ticket link, its key upper case and a Jira site lower
+/// case; the query string and fragment are ignored.
+pub fn parse_ticket_url(url: &str) -> Option<TicketUrl> {
+    let url = url.trim();
+    let url = url.split(['?', '#']).next()?.trim_end_matches('/');
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    let key = |k: &str| {
+        let k = k.to_uppercase();
+        split_key(&k).is_some().then_some(k)
+    };
+    match parts.as_slice() {
+        ["linear.app", workspace, "issue", k, ..] if !workspace.is_empty() => {
+            Some(TicketUrl::Linear {
+                workspace: workspace.to_string(),
+                key: key(k)?,
+            })
+        }
+        [site, "browse", k] if is_host(site) => Some(TicketUrl::Jira {
+            site: site.to_lowercase(),
+            key: key(k)?,
+        }),
+        _ => None,
+    }
+}
+
+/// A repository's tracker when it is not GitHub.
+pub enum Remote {
+    Jira(Jira),
+    Linear(Linear),
+}
+
+impl Remote {
+    /// The adapter for a Jira or Linear `[repos.tracker]`, with its
+    /// credentials; `None` for GitHub. A missing credential is an error naming
+    /// the `provefab login` to run. Shared by `provefab run` and `doctor`.
+    pub async fn from_tracker(
+        t: &TrackerConfig,
+        security: &Path,
+        env: Env<'_>,
+    ) -> Result<Option<Self>, String> {
+        let project = t.project.as_deref().unwrap_or_default();
+        Ok(Some(match t.kind {
+            TrackerKind::Github => return Ok(None),
+            TrackerKind::Jira => {
+                let site = t.site.as_deref().unwrap_or_default();
+                let auth = jira_auth(security, site, env).await?;
+                Remote::Jira(Jira::new(&format!("https://{site}"), site, project, auth))
+            }
+            TrackerKind::Linear => Remote::Linear(Linear::new(
+                crate::linear::API,
+                project,
+                linear_key(security, env).await?,
+            )),
+        }))
+    }
+
+    /// For `provefab doctor`: the credentials authenticate and the project or
+    /// team is readable.
+    pub async fn check(&self) -> Result<String, ForgeError> {
+        match self {
+            Remote::Jira(j) => j.check().await,
+            Remote::Linear(l) => l.check().await,
+        }
+    }
+}
+
+/// The production hub (spec §3): each repository's issues go to its tracker,
+/// found by slug (so stored pending effects replay to the right one), and
+/// every forge call goes to GitHub.
+pub struct Routed {
+    pub gh: Gh,
+    /// By lower-case slug; repositories without an entry use GitHub issues.
+    pub remotes: HashMap<String, Remote>,
+}
+
+impl Routed {
+    pub fn remote(&self, slug: &str) -> Option<&Remote> {
+        self.remotes.get(&slug.to_lowercase())
+    }
+
+    /// One adapter per Jira or Linear repository, with its credentials. A
+    /// missing credential is an error naming the `provefab login` to run.
+    pub async fn from_config(
+        config: &Config,
+        gh: Gh,
+        security: &Path,
+        env: Env<'_>,
+    ) -> Result<Self, String> {
+        let mut remotes = HashMap::new();
+        for repo in &config.repos {
+            let Some(t) = &repo.tracker else { continue };
+            if let Some(remote) = Remote::from_tracker(t, security, env).await? {
+                remotes.insert(repo.slug.to_lowercase(), remote);
+            }
+        }
+        Ok(Self { gh, remotes })
+    }
+}
+
+/// Calls `method` on the slug's tracker, or on `Gh` for a GitHub repository.
+macro_rules! route {
+    ($self:ident, $slug:ident, $method:ident($($arg:expr),*)) => {
+        match $self.remote($slug) {
+            Some(Remote::Jira(j)) => Tracker::$method(j, $slug, $($arg),*).await,
+            Some(Remote::Linear(l)) => Tracker::$method(l, $slug, $($arg),*).await,
+            None => Tracker::$method(&$self.gh, $slug, $($arg),*).await,
+        }
+    };
+}
+
+impl Tracker for Routed {
+    async fn open_issues(&self, slug: &str, label: &str) -> Result<Vec<Issue>, ForgeError> {
+        route!(self, slug, open_issues(label))
+    }
+    async fn issue(&self, slug: &str, number: u64) -> Result<Issue, ForgeError> {
+        route!(self, slug, issue(number))
+    }
+    async fn comments(&self, slug: &str, number: u64) -> Result<Vec<Comment>, ForgeError> {
+        route!(self, slug, comments(number))
+    }
+    async fn comment(&self, slug: &str, number: u64, body: &str) -> Result<(), ForgeError> {
+        route!(self, slug, comment(number, body))
+    }
+    async fn edit_labels(
+        &self,
+        slug: &str,
+        number: u64,
+        add: &[&str],
+        remove: &[&str],
+    ) -> Result<(), ForgeError> {
+        route!(self, slug, edit_labels(number, add, remove))
+    }
+    async fn ensure_label(
+        &self,
+        slug: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> Result<(), ForgeError> {
+        route!(self, slug, ensure_label(name, color, description))
+    }
+    async fn issue_open(&self, slug: &str, number: u64) -> Result<bool, ForgeError> {
+        route!(self, slug, issue_open(number))
+    }
+}
+
+impl Forge for Routed {
+    async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
+        Forge::pr_comment(&self.gh, slug, url, body).await
+    }
+    async fn pr_create(
+        &self,
+        slug: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<String, ForgeError> {
+        Forge::pr_create(&self.gh, slug, head, base, title, body).await
+    }
+    async fn repo_clone(&self, slug: &str, dest: &Path) -> Result<(), ForgeError> {
+        Forge::repo_clone(&self.gh, slug, dest).await
+    }
+    async fn pr_status(&self, slug: &str, url: &str) -> Result<PrStatus, ForgeError> {
+        Forge::pr_status(&self.gh, slug, url).await
+    }
+    async fn pr_merge(&self, slug: &str, url: &str, head: &str) -> Result<(), ForgeError> {
+        Forge::pr_merge(&self.gh, slug, url, head).await
+    }
+    async fn repo_is_public(&self, slug: &str) -> Result<bool, ForgeError> {
+        Forge::repo_is_public(&self.gh, slug).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::forge::Gh;
+    use crate::jira::Jira;
+    use crate::ports::{Forge, Tracker};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fake_security(dir: &Path, name: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -716,5 +921,148 @@ esac"#;
         ] {
             assert_eq!(base64(raw.as_bytes()), b64, "{raw}");
         }
+    }
+
+    #[test]
+    fn ticket_urls() {
+        let jira = |site: &str, key: &str| {
+            Some(TicketUrl::Jira {
+                site: site.into(),
+                key: key.into(),
+            })
+        };
+        let linear = |ws: &str, key: &str| {
+            Some(TicketUrl::Linear {
+                workspace: ws.into(),
+                key: key.into(),
+            })
+        };
+        assert_eq!(
+            parse_ticket_url("https://acme.atlassian.net/browse/ENG-123"),
+            jira("acme.atlassian.net", "ENG-123")
+        );
+        assert_eq!(
+            parse_ticket_url(" https://Acme.Atlassian.net/browse/eng-123?focusedCommentId=9 "),
+            jira("acme.atlassian.net", "ENG-123")
+        );
+        assert_eq!(
+            parse_ticket_url("https://linear.app/acme/issue/ENG-123/fix-the-crash"),
+            linear("acme", "ENG-123")
+        );
+        assert_eq!(
+            parse_ticket_url("https://linear.app/acme/issue/ENG-123/"),
+            linear("acme", "ENG-123")
+        );
+        for bad in [
+            "https://acme.atlassian.net/browse/ENG",
+            "https://acme.atlassian.net/browse/ENG-0",
+            "https://acme.atlassian.net/jira/ENG-1",
+            "https://linear.app/acme/project/ENG-1",
+            "https://linear.app//issue/ENG-1",
+            "ftp://acme.atlassian.net/browse/ENG-1",
+            "https://github.com/o/r/issues/1",
+        ] {
+            assert_eq!(parse_ticket_url(bad), None, "{bad}");
+        }
+        assert_eq!(split_key("ENG_2-12"), Some(("ENG_2", 12)));
+        assert_eq!(split_key("eng-12"), None);
+    }
+
+    #[tokio::test]
+    async fn routed_sends_tickets_to_their_tracker_and_the_rest_to_github() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/ENG-7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"key": "ENG-7", "fields": {"summary": "From Jira", "labels": []}}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/ENG-7"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = JiraAuth {
+            email: "bot@acme.test".into(),
+            token: "tok-x".into(),
+        };
+        let routed = Routed {
+            gh: Gh {
+                program: "/nonexistent/gh".into(),
+            },
+            remotes: HashMap::from([(
+                "acme/api".to_string(),
+                Remote::Jira(Jira::new(&server.uri(), "acme.atlassian.net", "ENG", auth)),
+            )]),
+        };
+        // Slugs are case-insensitive, as everywhere else in Provefab.
+        assert_eq!(
+            routed.issue("Acme/API", 7).await.unwrap().title,
+            "From Jira"
+        );
+        // A stored pending label effect (slug, number) replays to the same tracker.
+        routed
+            .edit_labels("acme/api", 7, &["provefab:in-pr"], &["provefab"])
+            .await
+            .unwrap();
+        // Another repository's issues and every forge call go to gh.
+        assert!(matches!(
+            routed.issue("o/r", 7).await,
+            Err(ForgeError::Spawn { .. })
+        ));
+        assert!(matches!(
+            routed
+                .pr_status("acme/api", "https://github.com/acme/api/pull/1")
+                .await,
+            Err(ForgeError::Spawn { .. })
+        ));
+    }
+
+    const CONFIG: &str = "[jev]\nmodel = \"jev-1.13\"\n\n[[models]]\nid = \"m\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\n\n[[repos]]\nslug = \"acme/api\"\ngates = [\"make\"]\n[repos.tracker]\nkind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"ENG\"\n\n[[repos]]\nslug = \"acme/web\"\ngates = [\"make\"]\n[repos.tracker]\nkind = \"linear\"\nproject = \"WEB\"\n\n[[repos]]\nslug = \"o/r\"\ngates = [\"make\"]\n";
+
+    #[tokio::test]
+    async fn routed_is_built_from_the_config_and_names_missing_credentials() {
+        let config = Config::from_toml_str(CONFIG).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let nothing = fake_security(dir.path(), "security", "exit 44");
+        let env = env_of(&[
+            ("PROVEFAB_JIRA_EMAIL", "e@acme.test"),
+            ("PROVEFAB_JIRA_TOKEN", "tok"),
+            ("PROVEFAB_LINEAR_KEY", "lin"),
+        ]);
+        let routed = Routed::from_config(
+            &config,
+            Gh {
+                program: "gh".into(),
+            },
+            &nothing,
+            &env,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(routed.remote("ACME/api"), Some(Remote::Jira(j)) if j.api == "https://acme.atlassian.net" && j.project == "ENG")
+        );
+        assert!(
+            matches!(routed.remote("acme/web"), Some(Remote::Linear(l)) if l.api == crate::linear::API && l.team == "WEB")
+        );
+        assert!(routed.remote("o/r").is_none());
+        let err = Routed::from_config(
+            &config,
+            Gh {
+                program: "gh".into(),
+            },
+            &nothing,
+            &env_of(&[]),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            err.contains("provefab login jira --site acme.atlassian.net"),
+            "{err}"
+        );
     }
 }

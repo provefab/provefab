@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::config::Config;
+use crate::config::{Config, RepoConfig};
 use crate::forge::{ForgeError, Git};
 use crate::paths::Paths;
 use crate::ports::Hub;
@@ -17,11 +17,20 @@ use crate::post_merge::CheckState;
 use crate::record::{Event, MergedBy, StoredEvent, parse_date, redact_event, redact_text};
 use crate::store::{NewIssue, Store, StoreError};
 use crate::task::TaskState;
+use crate::tracker::{TicketUrl, TrackerKind, parse_ticket_url, split_key};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
-    #[error("`{0}` is not a GitHub issue URL (https://github.com/owner/name/issues/N)")]
+    #[error("`{0}` is not a GitHub, Jira or Linear issue URL")]
     BadUrl(String),
+    #[error("{0} takes its issues from {1}: give the ticket's URL")]
+    WrongTracker(String, &'static str),
+    #[error(
+        "{0} matches several repositories ({1}): put exactly one of their labels on the ticket"
+    )]
+    Ambiguous(String, String),
+    #[error("{0} is in another Linear workspace than the one Provefab's key reads")]
+    OtherWorkspace(String),
     #[error("{0} is not in provefab.toml's [[repos]]")]
     UnknownRepo(String),
     #[error("no task {0}")]
@@ -50,7 +59,9 @@ pub fn parse_issue_url(url: &str) -> Option<(String, u64)> {
 }
 
 /// `provefab add <url>`: queues the issue, or requeues it when the task is
-/// parked (terminal or waiting for information). A task in progress is left alone.
+/// parked (terminal or waiting for information). A task in progress is left
+/// alone. GitHub, Jira (`https://<site>/browse/ENG-123`) and Linear
+/// (`https://linear.app/<workspace>/issue/ENG-123`) links (spec §4).
 pub async fn add<H: Hub>(
     store: &Store,
     config: &Config,
@@ -59,13 +70,38 @@ pub async fn add<H: Hub>(
     paths: &Paths,
     url: &str,
 ) -> Result<String, CommandError> {
-    let (slug, number) = parse_issue_url(url).ok_or_else(|| CommandError::BadUrl(url.into()))?;
-    let repo = config
-        .repos
-        .iter()
-        .find(|r| r.slug.eq_ignore_ascii_case(&slug))
-        .ok_or(CommandError::UnknownRepo(slug))?;
+    let (repo, number, ticket) = match parse_issue_url(url) {
+        Some((slug, number)) => {
+            let repo = config
+                .repos
+                .iter()
+                .find(|r| r.slug.eq_ignore_ascii_case(&slug))
+                .ok_or(CommandError::UnknownRepo(slug))?;
+            // Its tracker would read a different ticket with that number.
+            if repo.tracker_kind() != TrackerKind::Github {
+                return Err(CommandError::WrongTracker(
+                    repo.slug.clone(),
+                    repo.tracker_kind().as_str(),
+                ));
+            }
+            (repo, number, None)
+        }
+        None => {
+            let ticket = parse_ticket_url(url).ok_or_else(|| CommandError::BadUrl(url.into()))?;
+            let (repo, number) = ticket_repo(config, hub, &ticket).await?;
+            (repo, number, Some(ticket))
+        }
+    };
     let issue = hub.issue(&repo.slug, number).await?;
+    // The key alone does not name the workspace (plan decision 6).
+    if let Some(TicketUrl::Linear { workspace, key }) = &ticket
+        && !issue
+            .url
+            .to_lowercase()
+            .contains(&format!("linear.app/{}/", workspace.to_lowercase()))
+    {
+        return Err(CommandError::OtherWorkspace(key.clone()));
+    }
     let new = NewIssue {
         repo: repo.slug.clone(),
         number,
@@ -110,6 +146,61 @@ pub async fn add<H: Hub>(
             task.state.as_str()
         ))
     }
+}
+
+/// The repository a ticket belongs to: same tracker, site (Jira) and project.
+/// When several share the project, the one whose label the ticket carries
+/// (plan decision 7).
+async fn ticket_repo<'a, H: Hub>(
+    config: &'a Config,
+    hub: &H,
+    ticket: &TicketUrl,
+) -> Result<(&'a RepoConfig, u64), CommandError> {
+    let (kind, site, key) = match ticket {
+        TicketUrl::Jira { site, key } => (TrackerKind::Jira, Some(site.as_str()), key.as_str()),
+        TicketUrl::Linear { key, .. } => (TrackerKind::Linear, None, key.as_str()),
+    };
+    let (project, number) = split_key(key).ok_or_else(|| CommandError::BadUrl(key.into()))?;
+    let matches: Vec<&RepoConfig> = config
+        .repos
+        .iter()
+        .filter(|r| {
+            r.tracker.as_ref().is_some_and(|t| {
+                t.kind == kind
+                    && t.project.as_deref() == Some(project)
+                    && site.is_none_or(|s| {
+                        t.site
+                            .as_deref()
+                            .is_some_and(|own| own.eq_ignore_ascii_case(s))
+                    })
+            })
+        })
+        .collect();
+    let repo = match matches.as_slice() {
+        [] => {
+            return Err(CommandError::UnknownRepo(format!(
+                "{} {key}",
+                kind.as_str()
+            )));
+        }
+        [one] => *one,
+        many => {
+            let labels = hub.issue(&many[0].slug, number).await?.labels;
+            let labelled: Vec<&RepoConfig> = many
+                .iter()
+                .copied()
+                .filter(|r| labels.contains(&r.label))
+                .collect();
+            match labelled.as_slice() {
+                [one] => *one,
+                _ => {
+                    let slugs: Vec<&str> = many.iter().map(|r| r.slug.as_str()).collect();
+                    return Err(CommandError::Ambiguous(key.into(), slugs.join(", ")));
+                }
+            }
+        }
+    };
+    Ok((repo, number))
 }
 
 /// `provefab status`: one line per task, with the reason for its current state.
@@ -1038,6 +1129,42 @@ pub async fn doctor(
     checks
 }
 
+/// One `tracker <slug>` line per repository whose issues are on Jira or Linear
+/// (spec §5): kind, site, project, and whether the credentials authenticate
+/// and the project or team is readable.
+pub async fn tracker_checks(
+    tools: &Tools,
+    config: &Config,
+    env: crate::tracker::Env<'_>,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+    for repo in &config.repos {
+        let Some(t) = repo.tracker.as_ref() else {
+            continue;
+        };
+        let project = t.project.as_deref().unwrap_or_default();
+        let what = match t.kind {
+            TrackerKind::Github => continue,
+            TrackerKind::Jira => {
+                format!("jira {} {project}", t.site.as_deref().unwrap_or_default())
+            }
+            TrackerKind::Linear => format!("linear {project}"),
+        };
+        let answer = match crate::tracker::Remote::from_tracker(t, &tools.security, env).await {
+            Ok(Some(remote)) => remote.check().await.map_err(|e| e.to_string()),
+            Ok(None) => continue,
+            Err(e) => Err(e),
+        };
+        checks.push(check(
+            &format!("tracker {}", repo.slug),
+            answer
+                .map(|d| format!("{what}: {d}"))
+                .map_err(|e| format!("{what}: {e}")),
+        ));
+    }
+    checks
+}
+
 /// True if `gate` sets `CARGO_TARGET_DIR` or `--target-dir` to a fixed
 /// (absolute) path, which every task worktree would then share and build
 /// into, letting a gate silently test another task's compiled code.
@@ -1135,6 +1262,32 @@ mod tests {
         std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    #[tokio::test]
+    async fn tracker_checks_name_missing_credentials_per_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Tools {
+            security: fake(dir.path(), "security", "exit 44"),
+            ..Tools::default()
+        };
+        let config = Config::from_toml_str(
+            "[jev]\nmodel = \"jev-1.13\"\n\n[[models]]\nid = \"m\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\n\n[[repos]]\nslug = \"acme/api\"\ngates = [\"make\"]\n[repos.tracker]\nkind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"ENG\"\n\n[[repos]]\nslug = \"o/r\"\ngates = [\"make\"]\n",
+        )
+        .unwrap();
+        let checks = tracker_checks(&tools, &config, &|_: &str| None::<String>).await;
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(
+            (checks[0].name.as_str(), checks[0].ok),
+            ("tracker acme/api", false)
+        );
+        assert!(
+            checks[0]
+                .detail
+                .starts_with("jira acme.atlassian.net ENG: no Jira API token"),
+            "{}",
+            checks[0].detail
+        );
     }
 
     #[tokio::test]

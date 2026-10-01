@@ -141,3 +141,119 @@ async fn requeue_starts_a_fresh_pass_that_remembers_blocking_findings() {
     );
     assert_eq!(pushed, "x");
 }
+
+use provefab::tracker::{TrackerConfig, TrackerKind};
+
+const JIRA: &str = "https://acme.atlassian.net/browse/ENG-7";
+
+fn tracked(f: &mut Fixture, kind: TrackerKind) {
+    f.config.repos[0].tracker = Some(TrackerConfig {
+        kind,
+        site: (kind == TrackerKind::Jira).then(|| "acme.atlassian.net".to_string()),
+        project: Some("ENG".into()),
+    });
+}
+
+fn keyed_hub(url: &str) -> FakeHub {
+    let mut hub = FakeHub::new("x");
+    hub.issue.key = Some("ENG-7".into());
+    hub.issue.url = url.into();
+    hub
+}
+
+#[tokio::test]
+async fn add_queues_a_jira_ticket_by_its_url() {
+    use provefab::commands::{CommandError, add};
+    let mut f = fixture(&["true"]);
+    tracked(&mut f, TrackerKind::Jira);
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), keyed_hub(JIRA)).await;
+    let out = add(
+        &p.store,
+        &f.config,
+        &p.hub,
+        &p.git,
+        &p.paths,
+        "https://acme.atlassian.net/browse/ENG-7?focusedCommentId=1",
+    )
+    .await
+    .unwrap();
+    assert!(out.starts_with("queued as task"), "{out}");
+    let t = p.store.task_by_url(JIRA).await.unwrap().unwrap();
+    assert_eq!((t.issue_number, t.issue_key.as_deref()), (7, Some("ENG-7")));
+    for (url, what) in [
+        ("https://github.com/o/r/issues/7", "wrong tracker"),
+        ("https://acme.atlassian.net/browse/OPS-7", "unknown project"),
+        ("https://other.atlassian.net/browse/ENG-7", "unknown site"),
+        ("https://acme.atlassian.net/projects/ENG", "not a ticket"),
+    ] {
+        let r = add(&p.store, &f.config, &p.hub, &p.git, &p.paths, url).await;
+        let ok = match what {
+            "wrong tracker" => matches!(r, Err(CommandError::WrongTracker(_, _))),
+            "not a ticket" => matches!(r, Err(CommandError::BadUrl(_))),
+            _ => matches!(r, Err(CommandError::UnknownRepo(_))),
+        };
+        assert!(ok, "{url}: {what}");
+    }
+}
+
+#[tokio::test]
+async fn add_refuses_a_linear_ticket_from_another_workspace() {
+    use provefab::commands::{CommandError, add};
+    let mut f = fixture(&["true"]);
+    tracked(&mut f, TrackerKind::Linear);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        keyed_hub("https://linear.app/acme/issue/ENG-7/add-a-feature-file"),
+    )
+    .await;
+    let r = add(
+        &p.store,
+        &f.config,
+        &p.hub,
+        &p.git,
+        &p.paths,
+        "https://linear.app/other/issue/ENG-7",
+    )
+    .await;
+    assert!(matches!(r, Err(CommandError::OtherWorkspace(_))));
+    assert!(p.store.tasks_in(&TaskState::ALL).await.unwrap().is_empty());
+    let out = add(
+        &p.store,
+        &f.config,
+        &p.hub,
+        &p.git,
+        &p.paths,
+        "https://linear.app/ACME/issue/eng-7/add",
+    )
+    .await
+    .unwrap();
+    assert!(out.starts_with("queued as task"), "{out}");
+}
+
+#[tokio::test]
+async fn add_picks_the_repository_by_label_when_a_project_is_shared() {
+    use provefab::commands::{CommandError, add};
+    let mut f = fixture(&["true"]);
+    tracked(&mut f, TrackerKind::Jira);
+    f.config.repos[0].label = "api".into();
+    let mut web = f.config.repos[0].clone();
+    web.slug = "o/s".into();
+    web.label = "web".into();
+    f.config.repos.push(web);
+    let mut p = pipeline(&f, Box::new(happy), FakeOracle::default(), keyed_hub(JIRA)).await;
+    for labels in [vec![], vec!["api".to_string(), "web".to_string()]] {
+        p.hub.issue.labels = labels;
+        let r = add(&p.store, &f.config, &p.hub, &p.git, &p.paths, JIRA).await;
+        assert!(
+            matches!(&r, Err(CommandError::Ambiguous(key, slugs)) if key == "ENG-7" && slugs == "o/r, o/s")
+        );
+    }
+    p.hub.issue.labels = vec!["web".into()];
+    add(&p.store, &f.config, &p.hub, &p.git, &p.paths, JIRA)
+        .await
+        .unwrap();
+    let t = p.store.task_by_url(JIRA).await.unwrap().unwrap();
+    assert_eq!(t.repo, "o/s");
+}
