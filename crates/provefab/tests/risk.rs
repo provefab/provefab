@@ -370,6 +370,31 @@ async fn a_same_round_reclassification_does_not_relabel() {
     assert_eq!(risk_edits, 1, "{edits:?}");
 }
 
+#[tokio::test]
+async fn a_risk_label_that_failed_to_be_created_is_added_by_a_later_classification_of_the_round() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    let flag = f.home.with_file_name("risk-check-ran-2");
+    let check = format!(
+        "[\"test -e {0} || {{ touch {0}; false; }}\"]",
+        flag.display()
+    );
+    f.config.repos[0].risk = migration_checks(&check);
+    let label = format!("{}:risk-migrations", f.config.repos[0].label);
+    let hub = FakeHub::new("x");
+    hub.ensure_fails_once.lock().unwrap().push(label.clone());
+    let oracle = FakeOracle {
+        triage: Some(Triage::RealBug),
+        ..Default::default()
+    };
+    let p = pipeline(&f, Box::new(risky), oracle, hub).await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    assert_eq!(classified(&p, id).await.len(), 2);
+    let edits = p.hub.labels.lock().unwrap().clone();
+    let risk_edits = edits.iter().filter(|(a, _)| a.contains(&label)).count();
+    assert_eq!(risk_edits, 1, "{edits:?}");
+}
+
 /// I4: the agent commits its own work, then the base commit object goes
 /// missing, so `changed_files(base...HEAD)` fails right after the round's
 /// commit. The review's own diff then fails too (the task waits); the
