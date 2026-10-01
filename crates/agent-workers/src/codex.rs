@@ -60,6 +60,9 @@ impl CodexWorker {
         // off as well (codex-rs: `web_search = "disabled"` registers no
         // search tool; `features.view_image = false` no image viewer).
         if req.tools == ToolProfile::NoTools {
+            // Its empty scratch directory is no git repository, which Codex
+            // refuses without this flag; stages run in worktrees.
+            push("--skip-git-repo-check");
             for setting in ["web_search=\"disabled\"", "features.view_image=false"] {
                 push("-c");
                 push(setting);
@@ -357,6 +360,13 @@ mod tests {
         );
         let review = joined(worker().args(&req(ToolProfile::ReadOnly, true), "R"));
         assert!(!review.contains("web_search"), "{review}");
+        // The scratch directory is no git repository: Codex refuses it
+        // without this flag. Stages run in git worktrees and never pass it.
+        assert!(args.contains("--skip-git-repo-check"), "{args}");
+        let full = joined(worker().args(&req(ToolProfile::Full, false), "F"));
+        for a in [&review, &full] {
+            assert!(!a.contains("--skip-git-repo-check"), "{a}");
+        }
         let cmd = worker().command(&none, "Answer");
         let set = cmd
             .as_std()
