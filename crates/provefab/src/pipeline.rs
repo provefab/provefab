@@ -2692,7 +2692,6 @@ Please reply with what should happen, what happens instead, and how to reproduce
         detected: &[Detected],
         previous: Option<&[Detected]>,
     ) -> Result<(), PipelineError> {
-        let name = |d: &Detected| risk::label(&repo.label, &d.name).0;
         let mut remove: Vec<String> = Vec::new();
         for d in previous
             .unwrap_or_default()
