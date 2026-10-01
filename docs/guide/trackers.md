@@ -1,5 +1,7 @@
 # Jira and Linear
 
+> **Beta.** Jira and Linear support has been tested against recorded API responses, not yet against live Jira and Linear sites. If something fails, `provefab doctor` and the task's reason say what; please report it in an issue.
+
 A repository can take its issues from a Jira Cloud project or a Linear team instead of GitHub issues. The code, the branches and the pull requests stay on GitHub, and so do the `/provefab` commands on review findings.
 
 It works like GitHub issues: a label hands a ticket to Provefab, Provefab reports progress with labels and comments, and the pull request is opened on GitHub. **Provefab never changes a ticket's status.**

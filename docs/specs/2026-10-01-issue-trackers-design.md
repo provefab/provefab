@@ -1,7 +1,7 @@
 # Issue trackers: Jira Cloud and Linear
 
 - Date: 2026-10-01
-- Status: approved design (owner, 2026-10-01); implemented in 0.3.0, real run pending
+- Status: approved design (owner, 2026-10-01); released in 0.3.0 as a beta, real run pending
 - Feature: issues can come from Jira Cloud or Linear; code, pull requests and `/provefab` finding commands stay on GitHub.
 
 ## 1. Intent
@@ -133,3 +133,4 @@ Out of v1, each with a re-open trigger:
 16. `add` matches Linear by team key, refuses another workspace, and picks a shared project's repository by label (controller).
 17. Real-run checklist (owner): Jira `statusCategory.key` is `done`; Jira comment pagination `total`; the Keychain e-mail stored as the item comment and read back, including a non-ASCII e-mail (`security` may print the comment as hex); Linear filter shapes (team key, label name, state type `nin`), `IssueLabel.team`, `IssueLabelCreateInput`, `Organization.urlKey`, label name case sensitivity, the guest field name; whether Linear keeps an HTML comment (the post-merge marker) in a comment body; a Linear mutation answering `success: false` (the effect stays pending and holds the task's later effects).
 18. Switching a repository's tracker is supported only without task history that could collide (controller, final review). `UNIQUE (repo, issue_number)` stays: `run` and `add` refuse to start while a task that can still touch its ticket (any state but `failed`, `needs_you`, and `pr_open` with `pr_state` archived: an open or merged PR is still watched), or a pending effect, does not match its repository's tracker (key on GitHub, no key on Jira or Linear, key of another project); intake skips, with a log line naming both, a ticket whose number is an earlier task of the repository; `add` refuses it. A task that no longer fits its repository's tracker (its repository removed, for instance) never writes to another tracker: the write is skipped and logged. Why: no second migration in this feature. Cost if wrong: a repository that changes tracker loses the tickets whose numbers it already used. Re-open trigger: a pilot needs to switch trackers on a repository with history; the fix is the key in the unique constraint, a later migration.
+19. Release 0.3.0 without the real run, with Jira and Linear marked beta in the docs, the README and the landing (owner decision 2026-10-01: "On va supposer que ça fonctionne, je ne peux pas tester actuellement", then "go"). Why: the owner cannot provide test sites now; every unverified shape fails visibly (doctor FAIL line or a task in needs_you with the reason) and GitHub repositories are unaffected. Re-open: the first live Jira or Linear run; run the decision 17 checklist then, and drop "beta" when it passes.

@@ -87,7 +87,7 @@ Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in commen
 
 - [Configuration](docs/guide/configuration.md): every field of `provefab.toml`, with its default.
 - [Usage](docs/guide/usage.md): writing issues that land, answering Provefab, restarting, reading states.
-- [Jira and Linear](docs/guide/trackers.md): issues from a Jira Cloud project or a Linear team, pull requests on GitHub.
+- [Jira and Linear](docs/guide/trackers.md) (beta): issues from a Jira Cloud project or a Linear team, pull requests on GitHub.
 - [Operations](docs/guide/operations.md): the service, logs, budgets, troubleshooting.
 - [Security](docs/guide/security.md): what agents can and cannot do, and who can trigger Provefab.
 
