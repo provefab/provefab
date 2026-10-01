@@ -324,6 +324,55 @@ async fn a_later_round_without_the_category_removes_its_label() {
 }
 
 #[tokio::test]
+async fn a_risk_label_that_could_not_be_created_is_not_removed_later() {
+    let mut f = fixture(&["test -f feature.txt"]);
+    with_codex_frontier(&mut f);
+    let label = format!("{}:risk-migrations", f.config.repos[0].label);
+    let implements = Mutex::new(0);
+    let reviews = Mutex::new(0);
+    let script = move |m: &ModelEntry, req: &StageRequest, tx: &UnboundedSender<WorkerEvent>| {
+        match stage_of(&req.prompt) {
+            "implement" => {
+                let mut n = implements.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    risky(m, req, tx)
+                } else {
+                    std::fs::remove_file(req.cwd.join("migrations/0005.sql")).unwrap();
+                    done(None)
+                }
+            }
+            "review" => {
+                let mut r = reviews.lock().unwrap();
+                *r += 1;
+                if *r == 1 {
+                    done(Some(json!({"verdict": "changes", "findings": [
+                        {"file": "migrations/0005.sql", "line": 1, "severity": "blocking", "text": "no migration"}
+                    ]})))
+                } else {
+                    done(Some(approve()))
+                }
+            }
+            _ => happy(m, req, tx),
+        }
+    };
+    let hub = FakeHub::new("x");
+    hub.ensure_fails.lock().unwrap().push(label.clone());
+    let p = pipeline(&f, Box::new(script), FakeOracle::default(), hub).await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let edits = p.hub.labels.lock().unwrap().clone();
+    assert!(
+        !edits
+            .iter()
+            .any(|(a, r)| a.contains(&label) || r.contains(&label)),
+        "{edits:?}"
+    );
+    let in_pr = format!("{}:in-pr", f.config.repos[0].label);
+    assert!(edits.iter().any(|(a, _)| a.contains(&in_pr)), "{edits:?}");
+}
+
+#[tokio::test]
 async fn a_risk_label_that_could_not_be_created_is_left_out_of_the_edit() {
     let f = fixture(&["test -f feature.txt"]);
     let label = format!("{}:risk-migrations", f.config.repos[0].label);

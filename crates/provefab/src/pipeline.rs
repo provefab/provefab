@@ -2679,7 +2679,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// `<label>:risk-<category>` on the issue for each detected category; the
     /// ones of the previous classification that no longer apply are removed
     /// (Review Focus 3). Labelled before the extra checks run. A label
-    /// `ensure_label` could not create is left out of the edit, so the queued
+    /// `ensure_label` could not create (to add or to remove) is left out of the edit, so the queued
     /// edit never names a label that may not exist (it would fail on every
     /// retry and hold the task's later GitHub effects). The edit is skipped
     /// only when every label to add was added earlier in the same round (a
@@ -2693,12 +2693,25 @@ Please reply with what should happen, what happens instead, and how to reproduce
         previous: Option<&[Detected]>,
     ) -> Result<(), PipelineError> {
         let name = |d: &Detected| risk::label(&repo.label, &d.name).0;
-        let remove: Vec<String> = previous
+        let mut remove: Vec<String> = Vec::new();
+        for d in previous
             .unwrap_or_default()
             .iter()
-            .map(name)
-            .filter(|l| !detected.iter().map(name).any(|a| &a == l))
-            .collect();
+            .filter(|d| !detected.iter().any(|a| a.name == d.name))
+        {
+            let (label, description) = risk::label(&repo.label, &d.name);
+            match self
+                .hub
+                .ensure_label(&repo.slug, &label, risk::LABEL_COLOR, &description)
+                .await
+            {
+                Ok(()) => remove.push(label),
+                Err(e) => eprintln!(
+                    "provefab: could not create label {label} on {}, not removing it: {e}",
+                    repo.slug
+                ),
+            }
+        }
         let mut add: Vec<String> = Vec::new();
         for d in detected {
             let (label, description) = risk::label(&repo.label, &d.name);
