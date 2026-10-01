@@ -636,6 +636,30 @@ fn event_summary(e: &StoredEvent) -> String {
                 format!("{} {}", e.kind, each.join(", "))
             }
         }
+        RulesLoaded {
+            pass,
+            numbers,
+            omitted,
+            ..
+        } => {
+            let rules = if numbers.is_empty() {
+                "no rules".to_string()
+            } else {
+                numbers
+                    .iter()
+                    .map(|n| format!("R{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let left = if omitted > 0 {
+                format!(" ({omitted} left out by the budget)")
+            } else {
+                String::new()
+            };
+            format!("{} pass {pass}: {rules}{left}", e.kind)
+        }
+        // Provefab's own words, never the file's (plan decision 5).
+        RulesInvalid { pass, reason } => format!("{} pass {pass}: {reason}", e.kind),
         Plan { pass, .. } => format!("{} pass {pass}", e.kind),
         Review {
             reviewer_model,

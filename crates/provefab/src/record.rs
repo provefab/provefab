@@ -159,6 +159,21 @@ pub enum Event {
         round: u32,
         categories: Vec<crate::risk::Detected>,
     },
+    /// The repository rules a pass read from its base commit (repository
+    /// rules spec §4). `omitted`: rules the budget left out of the plan
+    /// prompt, which gets them all (plan decision 4).
+    RulesLoaded {
+        pass: u32,
+        numbers: Vec<u32>,
+        sha256: String,
+        omitted: u32,
+    },
+    /// The base commit's rules file is invalid: the pass runs without rules.
+    /// `reason` never quotes the file (plan decision 5).
+    RulesInvalid {
+        pass: u32,
+        reason: String,
+    },
     // claim
     Plan {
         pass: u32,
@@ -210,6 +225,8 @@ impl Event {
             Self::PostMerge { .. } => "post_merge",
             Self::IssueReopened { .. } => "issue_reopened",
             Self::RiskClassified { .. } => "risk_classified",
+            Self::RulesLoaded { .. } => "rules_loaded",
+            Self::RulesInvalid { .. } => "rules_invalid",
             Self::Plan { .. } => "plan",
             Self::Review { .. } => "review",
             Self::FindingDisposition { .. } => "finding_disposition",
@@ -521,8 +538,25 @@ mod tests {
                 rule_version: RULE_VERSION,
             },
             Event::IssueReopened { previous_pass: 1 },
+            Event::RulesLoaded {
+                pass: 1,
+                numbers: vec![1, 3],
+                sha256: "ab".into(),
+                omitted: 0,
+            },
+            Event::RulesInvalid {
+                pass: 1,
+                reason: "R1 is used by two rules".into(),
+            },
         ];
-        let sources = [Source::Claim, Source::Human, Source::Inferred, Source::Fact];
+        let sources = [
+            Source::Claim,
+            Source::Human,
+            Source::Inferred,
+            Source::Fact,
+            Source::Fact,
+            Source::Fact,
+        ];
         for (e, s) in events.iter().zip(sources) {
             assert_eq!(e.source(), s);
             let v = serde_json::to_value(e).unwrap();
@@ -546,6 +580,8 @@ mod tests {
             assert_eq!(back.typed().as_ref(), Some(e));
         }
         assert_eq!(events[2].kind(), "finding_followed_by_revert");
+        assert_eq!(events[4].kind(), "rules_loaded");
+        assert_eq!(events[5].kind(), "rules_invalid");
     }
 
     #[test]

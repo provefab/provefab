@@ -1137,7 +1137,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// pass never re-resolves `origin/<base>` (which another task's fetch could
     /// have moved) or silently falls back to a stale ref after a failed fetch.
     /// Falls back to `base_ref` for a task started before this was recorded.
-    async fn pass_base(&self, task: &TaskRow, repo: &RepoConfig) -> Result<String, PipelineError> {
+    pub(crate) async fn pass_base(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+    ) -> Result<String, PipelineError> {
         let pass = u64::from(task.reopen_count) + 1;
         if let Some(b) = self.store.last_output(task.id, "base").await?
             && b["pass"].as_u64() == Some(pass)
@@ -1165,6 +1169,8 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 .transient(task, repo, "could not resolve the base branch", &e)
                 .await;
         }
+        // Repository rules spec §4: read once per pass, at the commit just pinned.
+        self.pass_rules(task, repo).await?;
         let wt = match self.ensure_worktree(task, repo).await {
             Ok(wt) => wt,
             Err(e) => {
@@ -2185,6 +2191,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let (title, body) = self.issue_text(task.id).await?;
         let kind = task.kind.unwrap_or(TaskKind::Feature);
         let reference = task.reference();
+        let rules = self.pass_rules(task, repo).await?;
+        let (rules_block, _) = crate::rules::render(
+            &crate::rules::select(&rules, Stage::Plan, &[]),
+            crate::rules::BUDGET,
+        );
         let prompt = render(
             Template::Plan,
             &[
@@ -2192,6 +2203,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 ("title", &title),
                 ("kind", kind.as_str()),
                 ("body", &body),
+                ("rules", &rules_block),
             ],
         );
         let req = self.request(
@@ -2464,6 +2476,12 @@ Please reply with what should happen, what happens instead, and how to reproduce
             .collect::<Vec<_>>()
             .join(", ");
         let reference = task.reference();
+        let rules = self.pass_rules(task, repo).await?;
+        let files = plan.as_ref().map(|p| p.files.clone()).unwrap_or_default();
+        let (rules_block, _) = crate::rules::render(
+            &crate::rules::select(&rules, Stage::Implement, &files),
+            crate::rules::BUDGET,
+        );
         let prompt = render(
             Template::Implement,
             &[
@@ -2473,6 +2491,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 ("plan", &plan_str),
                 ("feedback", &feedback),
                 ("gates", &gates),
+                ("rules", &rules_block),
             ],
         );
         let session = self.paths.session(
@@ -2931,6 +2950,28 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let reference = task.reference();
         let diff = truncate(&diff, DIFF_LIMIT);
         let base_shown = format!("{} at {}", repo.base, &base[..base.len().min(12)]);
+        let rules = self.pass_rules(task, repo).await?;
+        // The round's changed files, both sides of a rename, as the risk policy reads them.
+        let changed: Vec<String> = self
+            .git
+            .changed_files(&wt, &base)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|c| std::iter::once(c.path).chain(c.from))
+            .collect();
+        let selected = crate::rules::select(&rules, Stage::Review, &changed);
+        let (rules_block, omitted) = crate::rules::render(&selected, crate::rules::BUDGET);
+        let given = crate::rules::numbers(&selected, omitted);
+        if !given.is_empty() {
+            self.store
+                .record_output(
+                    task.id,
+                    "rules_given",
+                    &json!({"pass": pass_of(task), "round": task.review_rounds, "numbers": given}),
+                )
+                .await?;
+        }
         let prompt = render(
             Template::Review,
             &[
@@ -2940,6 +2981,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 ("plan", &plan_str),
                 ("base", &base_shown),
                 ("diff", &diff),
+                ("rules", &rules_block),
             ],
         );
         let req = self.request(

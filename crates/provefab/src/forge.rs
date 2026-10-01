@@ -503,6 +503,26 @@ impl Git {
         .await
     }
 
+    /// `path` as committed at `rev`, or `None` when that commit has no such
+    /// file (repository rules spec §4: never the worktree's copy). Trailing
+    /// newlines are trimmed, like every git output here.
+    pub async fn show_file(
+        &self,
+        repo: &Path,
+        rev: &str,
+        path: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let listed = self
+            .git(repo, &["ls-tree", "--name-only", rev, "--", path])
+            .await?;
+        if listed.trim() != path {
+            return Ok(None);
+        }
+        self.git(repo, &["show", &format!("{rev}:{path}")])
+            .await
+            .map(Some)
+    }
+
     /// `origin/<base>` when the repo has it (fetched), else the local `<base>`.
     pub async fn base_ref(&self, repo: &Path, base: &str) -> String {
         let remote = format!("refs/remotes/origin/{base}");
@@ -1358,6 +1378,49 @@ mod tests {
         Git {
             program: "git".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn show_file_reads_the_commit_never_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let sh = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(d)
+                .env_remove("GIT_CONFIG_COUNT")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(d.join(".provefab")).unwrap();
+        std::fs::write(d.join(".provefab/rules.md"), "## R1: One\n\ntext\n").unwrap();
+        sh(&["add", "-f", ".provefab/rules.md"]);
+        sh(&["commit", "-q", "-m", "rules"]);
+        std::fs::write(d.join(".provefab/rules.md"), "## R9: edited\n").unwrap();
+        let g = git();
+        assert_eq!(
+            g.show_file(d, "HEAD", ".provefab/rules.md")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("## R1: One\n\ntext")
+        );
+        assert_eq!(
+            g.show_file(d, "HEAD", ".provefab/none.md").await.unwrap(),
+            None
+        );
+        assert!(
+            g.show_file(d, "no-such-rev", ".provefab/rules.md")
+                .await
+                .is_err()
+        );
     }
 
     async fn sh(cwd: &Path, script: &str) {

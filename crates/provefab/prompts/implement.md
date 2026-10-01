@@ -23,3 +23,4 @@ Rules:
 - If a check fails for a reason outside the code (missing tool, broken environment), say so plainly in your last message instead of working around it.
 - The change stays within what the issue asks. Never edit a test or a file unrelated to the issue to make a check pass.
 - If a check fails for a reason unrelated to the issue (a flaky or broken test, say), stop, make no workaround, and say so plainly in your last message; triage sends it to the user as an environment problem.
+{{rules}}

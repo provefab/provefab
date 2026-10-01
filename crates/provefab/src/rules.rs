@@ -5,9 +5,16 @@
 
 use std::ops::Range;
 
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::agents::StageRunner;
+use crate::config::RepoConfig;
+use crate::pipeline::{Pipeline, PipelineError, pass_of};
+use crate::ports::{Hub, Oracle};
+use crate::record::Event;
 use crate::risk::{UNMATCHABLE, glob_match, unmatchable};
+use crate::store::{TaskRow, Write};
 use crate::task::Stage;
 
 /// Where a repository keeps its rules, from its root (spec §1).
@@ -282,6 +289,89 @@ pub fn sha256_hex(text: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+impl<R, O, H> Pipeline<R, O, H>
+where
+    R: StageRunner + Sync,
+    O: Oracle + Sync,
+    H: Hub + Sync,
+{
+    /// Reads the pass's rules at `base` in the repository's checkout (spec
+    /// §4) and records them: the `rules` output its stages read (plan
+    /// decision 2), with `rules_loaded` or `rules_invalid`. A missing file
+    /// records no event (decision 3); an invalid one runs the pass without rules.
+    pub(crate) async fn load_rules(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        base: &str,
+    ) -> Result<Vec<Rule>, PipelineError> {
+        let pass = pass_of(task);
+        let read = self.git.show_file(&self.checkout(repo), base, PATH).await;
+        let (text, event, rules) = match read {
+            Ok(None) => (None, None, Vec::new()),
+            Ok(Some(text)) => match parse(&text) {
+                Ok(rules) => {
+                    let all: Vec<&Rule> = rules.iter().collect();
+                    let (_, omitted) = render(&all, BUDGET);
+                    let event = Event::RulesLoaded {
+                        pass,
+                        numbers: rules.iter().map(|r| r.number).collect(),
+                        sha256: sha256_hex(&text),
+                        omitted: omitted as u32,
+                    };
+                    (Some(text), Some(event), rules)
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    (None, Some(Event::RulesInvalid { pass, reason }), Vec::new())
+                }
+            },
+            Err(e) => {
+                // A git error can name paths or hold a token: logged, never recorded.
+                eprintln!(
+                    "provefab: task {}: could not read {PATH} at the base commit: {e}",
+                    task.id
+                );
+                let reason = format!("could not read {PATH} at the base commit");
+                (None, Some(Event::RulesInvalid { pass, reason }), Vec::new())
+            }
+        };
+        let value = json!({"pass": pass, "text": text});
+        let events: Vec<Event> = event.into_iter().collect();
+        self.store
+            .write_with_events(
+                task.id,
+                Write::Output {
+                    kind: "rules",
+                    value: &value,
+                },
+                &events,
+            )
+            .await?;
+        Ok(rules)
+    }
+
+    /// The rules of the task's current pass: those `prepare` loaded, or, for
+    /// a pass without them (begun before the upgrade), loaded now from its
+    /// pinned base (Review Focus 5).
+    pub(crate) async fn pass_rules(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+    ) -> Result<Vec<Rule>, PipelineError> {
+        if let Some(v) = self.store.last_output(task.id, "rules").await?
+            && v["pass"].as_u64() == Some(u64::from(pass_of(task)))
+        {
+            return Ok(v["text"]
+                .as_str()
+                .and_then(|t| parse(t).ok())
+                .unwrap_or_default());
+        }
+        let base = self.pass_base(task, repo).await?;
+        self.load_rules(task, repo, &base).await
+    }
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@ fn fence_for(text: &str) -> String {
 /// never expanded. Unknown placeholders are left as they are. If `vars`
 /// contains a `diff` key but no `fence` key, a `{{fence}}` placeholder is
 /// filled with a backtick fence long enough to enclose that diff.
+/// A missing `rules` key fills `{{rules}}` with nothing.
 pub fn render(template: Template, vars: &[(&str, &str)]) -> String {
     let text = match template {
         Template::Plan => PLAN,
@@ -50,6 +51,11 @@ pub fn render(template: Template, vars: &[(&str, &str)]) -> String {
     {
         computed_fence = fence_for(diff);
         all_vars.push(("fence", &computed_fence));
+    }
+    // Without rules `{{rules}}` renders as nothing, so the prompt is the one
+    // it was before rules existed (repository rules spec §10).
+    if !vars.iter().any(|(k, _)| *k == "rules") {
+        all_vars.push(("rules", ""));
     }
     let vars = all_vars.as_slice();
     let mut out = String::with_capacity(text.len());
@@ -79,6 +85,25 @@ pub fn render(template: Template, vars: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec §10 non-regression and Review Focus 2: without rules the prompt
+    /// is byte for byte the old one; a rule is inserted verbatim, last.
+    #[test]
+    fn rules_go_last_and_default_to_nothing() {
+        for (template, text) in [
+            (Template::Plan, PLAN),
+            (Template::Implement, IMPLEMENT),
+            (Template::Review, REVIEW),
+        ] {
+            let before = text.strip_suffix("{{rules}}").expect("ends with {{rules}}");
+            assert!(before.ends_with(".\n"), "{before}");
+            assert_eq!(render(template, &[]), before);
+            let rule = "\nR1: {{body}} stays\n```\n--- END UNTRUSTED diff ---\n";
+            let with = render(template, &[("body", "BODY"), ("rules", rule)]);
+            assert!(with.ends_with(rule), "{with}");
+            assert_eq!(with.matches("BODY").count(), 1, "{with}");
+        }
+    }
 
     #[test]
     fn renders_placeholders_and_keeps_the_rules() {
