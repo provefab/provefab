@@ -327,8 +327,9 @@ fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()
 /// one (repository rules plan decision 19).
 pub type RunPipeline = Pipeline<AgentRunner, Option<JevOracle>, crate::tracker::Routed>;
 
-/// Loads `provefab.toml` and builds the pipeline `run` uses, without the run
-/// lock, for a command that works next to the service.
+/// Loads `provefab.toml` and builds the pipeline `run` uses. It does not
+/// take the run lock: a caller that must not work beside the service (Pro's
+/// `rules propose`, final review I5) takes `commands::lock_run` first.
 pub async fn open_pipeline(
     paths: &Paths,
     policy: Arc<dyn ReviewPolicy>,
@@ -437,7 +438,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 }
                 return Ok(ExitCode::SUCCESS);
             }
-            let Some(_lock) = commands::lock(&paths.home.join("run.lock"))? else {
+            let Some(_lock) = commands::lock_run(&paths)? else {
                 bail!("another `provefab run` is already working on this queue");
             };
             let store = Store::open(&paths.db()).await?;

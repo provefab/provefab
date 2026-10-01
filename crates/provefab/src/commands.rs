@@ -770,6 +770,14 @@ pub async fn prune(store: &Store, before: &str, yes: bool) -> Result<String, Com
     Ok(out)
 }
 
+/// The service's run lock, `<home>/run.lock`: `provefab run` holds it while
+/// it drives the queue, and Provefab Pro's `rules propose` takes it so it
+/// never works beside the service (final review I5). `None` while another
+/// process holds it.
+pub fn lock_run(paths: &Paths) -> std::io::Result<Option<File>> {
+    lock(&paths.home.join("run.lock"))
+}
+
 /// One process drives the queue at a time: a second `provefab run` would race
 /// the first on the same tasks. The lock lasts as long as the returned file.
 pub fn lock(path: &Path) -> std::io::Result<Option<File>> {
@@ -1417,6 +1425,18 @@ mod tests {
         assert!(lock(&path).unwrap().is_none());
         drop(first);
         assert!(lock(&path).unwrap().is_some());
+    }
+
+    /// Final review I5: `provefab run` and Provefab Pro's commands share one
+    /// run lock under the home.
+    #[test]
+    fn the_run_lock_is_one_file_under_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let held = lock_run(&paths).unwrap();
+        assert!(held.is_some());
+        assert!(lock(&dir.path().join("run.lock")).unwrap().is_none());
+        assert!(lock_run(&paths).unwrap().is_none());
     }
 
     fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
