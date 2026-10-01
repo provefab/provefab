@@ -50,6 +50,8 @@ impl ClaudeCodeWorker {
         push(match req.tools {
             ToolProfile::ReadOnly => "Read,Grep,Glob",
             ToolProfile::Full => "Bash,Read,Edit,Write,Glob,Grep",
+            // `""` disables every built-in tool; `--json-schema` still answers.
+            ToolProfile::NoTools => "",
         });
         if req.tools == ToolProfile::Full {
             // With --permission-prompts none, shell commands outside Claude Code's
@@ -83,7 +85,12 @@ impl ClaudeCodeWorker {
     pub fn command(&self, req: &StageRequest) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(self.args(req)).current_dir(&req.cwd);
-        apply_worker_env(&mut cmd, &req.cwd, &req.session_dir.join("git-hooks"));
+        apply_worker_env(
+            &mut cmd,
+            &req.cwd,
+            &req.session_dir.join("git-hooks"),
+            req.tools,
+        );
         for key in API_KEY_ENV {
             cmd.env_remove(key);
         }
@@ -250,6 +257,7 @@ impl ClaudeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::NO_TOOLS_ENV;
     use serde_json::json;
     use std::time::Duration;
 
@@ -331,6 +339,33 @@ mod tests {
             !joined(&req()).contains("--allowedTools"),
             "read-only must not pre-approve Bash"
         );
+    }
+
+    /// Repository rules pre-flight S2: no built-in tool, and the guard is told
+    /// to refuse every call; the answer still comes through `--json-schema`.
+    #[test]
+    fn no_tools_lists_no_tool_and_tells_the_guard() {
+        let mut none = req();
+        none.tools = ToolProfile::NoTools;
+        let args: Vec<String> = worker()
+            .args(&none)
+            .into_iter()
+            .map(|s| s.into_string().unwrap())
+            .collect();
+        let at = args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(args[at + 1], "", "{args:?}");
+        assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--json-schema"), "{args:?}");
+        let no_tools = |r: &StageRequest| {
+            worker()
+                .command(r)
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == NO_TOOLS_ENV)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
+        };
+        assert_eq!(no_tools(&none), Some(Some("1".into())));
+        assert_eq!(no_tools(&req()), Some(None), "removed for other stages");
     }
 
     /// Final review M6: other switches that move Claude Code off the subscription are removed too.

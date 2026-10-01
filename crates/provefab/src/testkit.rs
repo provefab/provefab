@@ -265,6 +265,8 @@ pub struct FakeHub {
     pub pr_head_override: Mutex<Option<String>>,
     /// The next this-many `pr_comment` calls fail (GitHub unreachable).
     pub pr_comment_failures: std::sync::atomic::AtomicU32,
+    /// Every `pr_edit`: (url, title, body).
+    pub edited: Mutex<Vec<(String, String, String)>>,
 }
 
 impl FakeHub {
@@ -311,6 +313,7 @@ impl FakeHub {
             pr_statuses: Mutex::new(std::collections::HashMap::new()),
             pr_head_override: Mutex::new(None),
             pr_comment_failures: Default::default(),
+            edited: Mutex::new(Vec::new()),
         }
     }
 
@@ -483,6 +486,13 @@ impl Forge for FakeHub {
             .unwrap()
             .push((head.into(), base.into(), title.into(), body.into()));
         Ok("https://github.com/o/r/pull/8".into())
+    }
+    async fn pr_edit(&self, _: &str, url: &str, title: &str, body: &str) -> Result<(), ForgeError> {
+        self.edited
+            .lock()
+            .unwrap()
+            .push((url.into(), title.into(), body.into()));
+        Ok(())
     }
     async fn pr_status(&self, _: &str, url: &str) -> Result<crate::forge::PrStatus, ForgeError> {
         if let Some(s) = self.pr_statuses.lock().unwrap().get(url) {

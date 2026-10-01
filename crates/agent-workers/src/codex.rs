@@ -50,7 +50,8 @@ impl CodexWorker {
         // plan and review, writes confined to the worktree (no network) for implement.
         push("--sandbox");
         push(match req.tools {
-            ToolProfile::ReadOnly => "read-only",
+            // Codex always has a shell: without tools the guard refuses it.
+            ToolProfile::ReadOnly | ToolProfile::NoTools => "read-only",
             ToolProfile::Full => "workspace-write",
         });
         // Execpolicy `.rules` files from the user or the repo must not widen what runs.
@@ -67,7 +68,12 @@ impl CodexWorker {
     pub fn command(&self, req: &StageRequest, prompt: &str) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(self.args(req, prompt)).current_dir(&req.cwd);
-        apply_worker_env(&mut cmd, &req.cwd, &req.session_dir.join("git-hooks"));
+        apply_worker_env(
+            &mut cmd,
+            &req.cwd,
+            &req.session_dir.join("git-hooks"),
+            req.tools,
+        );
         for key in API_KEY_ENV {
             cmd.env_remove(key);
         }
@@ -268,6 +274,7 @@ impl CodexState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::NO_TOOLS_ENV;
     use serde_json::json;
     use std::time::Duration;
 
@@ -325,6 +332,22 @@ mod tests {
             );
             assert!(!a.contains("danger-full-access"), "{a}");
         }
+    }
+
+    /// Repository rules pre-flight S2: Codex always has a shell, so the guard
+    /// refuses it; its sandbox stays read-only behind that.
+    #[test]
+    fn no_tools_is_read_only_and_tells_the_guard() {
+        let req = req(ToolProfile::NoTools, true);
+        let args = joined(worker().args(&req, "Answer"));
+        assert!(args.contains("--sandbox read-only"), "{args}");
+        let cmd = worker().command(&req, "Answer");
+        let set = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == NO_TOOLS_ENV)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()));
+        assert_eq!(set.as_deref(), Some("1"));
     }
 
     #[test]

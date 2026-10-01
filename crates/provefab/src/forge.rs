@@ -466,6 +466,49 @@ impl Git {
         Ok(())
     }
 
+    /// Commits exactly `path`, forced past ignore rules (`.provefab/` is
+    /// excluded in Provefab's worktrees). `None` when the file did not change.
+    pub async fn commit_file(
+        &self,
+        worktree: &Path,
+        path: &str,
+        message: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        self.git(worktree, &["add", "-f", "--", path]).await?;
+        let staged = self
+            .git(worktree, &["diff", "--cached", "--name-only"])
+            .await?;
+        if staged.trim().is_empty() {
+            return Ok(None);
+        }
+        self.git(worktree, &["commit", "-q", "--no-verify", "-m", message])
+            .await?;
+        Ok(Some(self.git(worktree, &["rev-parse", "HEAD"]).await?))
+    }
+
+    /// Replaces `branch` on `origin` with the worktree's HEAD only while
+    /// `origin` still holds `expected` there (`None`: the branch must not
+    /// exist), so a commit someone else pushed is never lost (repository
+    /// rules pre-flight B1). The remote checks the lease as it updates.
+    pub async fn push_lease(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        expected: Option<&str>,
+    ) -> Result<(), ForgeError> {
+        let lease = format!(
+            "--force-with-lease=refs/heads/{branch}:{}",
+            expected.unwrap_or_default()
+        );
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.git(
+            worktree,
+            &["push", "--no-verify", &lease, "origin", &refspec],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Updates `origin/*` so a new pass starts from the latest base (D48).
     pub async fn fetch(&self, repo: &Path) -> Result<(), ForgeError> {
         self.git(repo, &["fetch", "--quiet", "origin"]).await?;
@@ -1201,6 +1244,32 @@ impl Gh {
         Ok(())
     }
 
+    /// Replaces a pull request's title and body.
+    pub async fn pr_edit(
+        &self,
+        slug: &str,
+        url: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        self.gh(
+            &[
+                "pr",
+                "edit",
+                url,
+                "--repo",
+                slug,
+                "--title",
+                title,
+                "--body-file",
+                "-",
+            ],
+            Some(body),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Opens the pull request and returns its URL.
     pub async fn pr_create(
         &self,
@@ -1859,6 +1928,29 @@ mod tests {
             log.starts_with("ARG label\nARG create\nARG provefab:in-pr\nARG --repo\nARG o/r")
                 && log.ends_with("ARG --force\n"),
             "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gh_edits_a_pull_requests_title_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), "");
+        gh.pr_edit(
+            "o/r",
+            "https://github.com/o/r/pull/9",
+            "New title",
+            "New body",
+        )
+        .await
+        .unwrap();
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+        assert_eq!(
+            log,
+            "ARG pr\nARG edit\nARG https://github.com/o/r/pull/9\nARG --repo\nARG o/r\nARG --title\nARG New title\nARG --body-file\nARG -\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap(),
+            "New body"
         );
     }
 

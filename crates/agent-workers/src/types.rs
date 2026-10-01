@@ -31,6 +31,9 @@ pub enum ToolProfile {
     ReadOnly,
     /// Read, search, edit, write and shell (implement).
     Full,
+    /// No tool: the model answers from its prompt alone (periodic work). The
+    /// guard refuses every call but the structured answer's own.
+    NoTools,
 }
 
 /// What the agent did, normalised across workers. Consumed by the loop detector,

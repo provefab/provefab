@@ -5,7 +5,12 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::Mutex;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::time::SystemTime;
+
+use agent_workers::{ExitReason, ToolProfile};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -13,15 +18,17 @@ use sha2::{Digest, Sha256};
 use crate::agents::StageRunner;
 use crate::config::RepoConfig;
 use crate::forge::PrState;
-use crate::pipeline::{PR_COMMENT_FILE, Pipeline, PipelineError, pass_of};
-use crate::policy::{BoxFuture, PeriodicTools, Signal, SignalKind};
+use crate::pipeline::{
+    Claim, Outcome, PR_COMMENT_FILE, Pipeline, PipelineError, exit_kind, pass_of,
+};
+use crate::policy::{BoxFuture, PeriodicTools, Proposal, Signal, SignalKind};
 use crate::ports::{Hub, Oracle};
 use crate::post_merge::CheckState;
 use crate::record::{Disposition, Event};
 use crate::risk::{UNMATCHABLE, glob_match, unmatchable};
 use crate::stage::ReviewOutput;
 use crate::store::{MaintenanceRun, TaskRow, Write, now};
-use crate::task::{Stage, TaskState};
+use crate::task::{Stage, TaskState, Tier};
 
 /// Where a repository keeps its rules, from its root (spec §1).
 pub const PATH: &str = ".provefab/rules.md";
@@ -455,6 +462,21 @@ fn signal_id(task: &TaskRow, url: &str, what: &str) -> String {
     }
 }
 
+/// Two optional costs added; `None` only when both are.
+fn plus(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (None, None) => None,
+        _ => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+    }
+}
+
+/// Why `propose_file` left a branch alone (pre-flight B1).
+fn changed_by_a_person(branch: &str) -> String {
+    format!(
+        "a person changed the branch {branch} after Provefab pushed it, so Provefab pushed nothing and left its pull request as it is"
+    )
+}
+
 /// A tool's error is fixed text (pre-flight S1): the detail, which can hold
 /// a path or a token, goes to the log only, redacted.
 fn failed(said: String, detail: impl std::fmt::Display) -> String {
@@ -767,6 +789,228 @@ where
             })
     }
 
+    /// A fresh empty directory under `<home>/maintenance/ask`, outside every
+    /// checkout, and the call's session directory (plan decision 15).
+    fn scratch(&self) -> Result<(PathBuf, PathBuf), String> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "{}-{}-{}",
+            self.repo.slug.replace('/', "-"),
+            now(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let home = &self.p.paths.home;
+        let dir = home.join("maintenance").join("ask").join(&name);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| failed("could not create the model call's directory".into(), e))?;
+        Ok((dir, home.join("sessions").join("maintenance").join(name)))
+    }
+
+    async fn ask(&self, prompt: &str, schema: &Value) -> Result<Value, String> {
+        let p = self.p;
+        let claim = p
+            .claim_tier(Tier::Standard, &[])
+            .await
+            .map_err(|e| failed("could not read the daily worker budget".into(), e))?;
+        let (model, _slot) = match claim {
+            Claim::Run(m, s) => (*m, s),
+            Claim::Busy => {
+                return Err(
+                    "no standard model is free (cooling down or at max_concurrency)".into(),
+                );
+            }
+            Claim::OverBudget => return Err("the daily worker budget is spent".into()),
+        };
+        let (dir, session) = self.scratch()?;
+        // No tools (pre-flight S2): the prompt carries what anyone wrote on
+        // the repository, and even read-only tools open any absolute path.
+        let req = p.request(
+            &dir,
+            prompt.to_string(),
+            ToolProfile::NoTools,
+            Some(schema.clone()),
+            p.config.limits.max_turns.plan,
+            session,
+        );
+        let started = SystemTime::now();
+        let outcome = p.watched(&model, req, false).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let result = match outcome {
+            Ok(Outcome::Finished(r)) => r,
+            Ok(Outcome::Looping(_)) => return Err("the loop detector stopped the model".into()),
+            // Worker errors can quote the environment: logged, redacted.
+            Err(e) => return Err(failed("the worker failed to run".into(), e)),
+        };
+        let cost = {
+            let prices = p.prices.read().unwrap_or_else(PoisonError::into_inner);
+            crate::cost::stage_cost(
+                &model,
+                &p.config.models,
+                &result.usage,
+                result.actual_model.as_deref(),
+                &prices,
+            )
+        };
+        {
+            let mut spent = self.spent.lock().unwrap_or_else(PoisonError::into_inner);
+            spent.model_id = Some(model.id.clone());
+            spent.cost_usd = plus(spent.cost_usd, cost.usd);
+            spent.quota_units = plus(spent.quota_units, cost.quota_units);
+        }
+        let limited = {
+            let mut cooldowns = p.cooldowns.lock().unwrap_or_else(PoisonError::into_inner);
+            match &result.exit {
+                ExitReason::RateLimited(_) => {
+                    cooldowns.strike(&model.cooldown_key(), SystemTime::now());
+                    true
+                }
+                ExitReason::Completed => {
+                    cooldowns.clear(&model.cooldown_key(), started);
+                    false
+                }
+                _ => false,
+            }
+        };
+        if limited {
+            return Err("the model is rate limited; it cools down before the next call".into());
+        }
+        result.structured_output.ok_or_else(|| {
+            format!(
+                "no structured answer (the model's run ended: {})",
+                exit_kind(&result.exit)
+            )
+        })
+    }
+
+    /// Plan decision 16. The shared checkout is written under the repo lock;
+    /// the pull request calls run after it is released.
+    async fn propose(
+        &self,
+        path: &str,
+        content: &str,
+        title: &str,
+        body: &str,
+        last_pushed: Option<&str>,
+    ) -> Result<Proposal, String> {
+        let (p, repo) = (self.p, self.repo);
+        let rel = Path::new(path);
+        let inside = rel
+            .components()
+            .all(|c| matches!(c, Component::Normal(n) if n != ".git"));
+        let stem = rel
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|_| inside)
+            .ok_or_else(|| format!("{path} is not a file path inside the repository"))?;
+        let branch = format!("provefab/{stem}");
+        let checkout = p.checkout(repo);
+        let wt = p
+            .paths
+            .home
+            .join("maintenance")
+            .join("worktrees")
+            .join(format!("{}-{stem}", repo.slug.replace('/', "-")));
+        let sha = {
+            let lock = p.repo_lock(repo);
+            let _guard = lock.lock().await;
+            let not_fetched = || format!("could not fetch {}", repo.slug);
+            match p.refresh_checkout(repo).await {
+                Ok(true) => {}
+                // `refresh_checkout` logged why.
+                Ok(false) => return Err(not_fetched()),
+                Err(e) => return Err(failed(not_fetched(), e)),
+            }
+            // Pre-flight B1: only a branch Provefab left as it is, or none, is
+            // replaced; the push's lease holds it to what is read here.
+            let remote = p
+                .git
+                .remote_branch_sha(&checkout, &branch)
+                .await
+                .map_err(|e| failed(format!("could not read {branch} on {}", repo.slug), e))?;
+            if remote.is_some() && remote.as_deref() != last_pushed {
+                return Err(changed_by_a_person(&branch));
+            }
+            let base = p
+                .git
+                .rev_parse(&checkout, &p.base_ref(repo).await)
+                .await
+                .map_err(|e| {
+                    failed(
+                        format!("could not read the base branch of {}", repo.slug),
+                        e,
+                    )
+                })?;
+            p.git
+                .worktree_fresh_detached(&checkout, &wt, &base)
+                .await
+                .map_err(|e| failed(format!("could not prepare a worktree for {path}"), e))?;
+            let pushed = self
+                .commit_and_push(&wt, path, content, title, &branch, remote.as_deref())
+                .await;
+            if let Err(e) = p.git.worktree_discard(&checkout, &wt).await {
+                failed(format!("could not remove the worktree for {path}"), e);
+            }
+            pushed?
+        };
+        // `pr_create` reuses the branch's open pull request without touching
+        // it: bring its title and body up to date.
+        let pr = match p
+            .hub
+            .pr_create(&repo.slug, &branch, &repo.base, title, body)
+            .await
+        {
+            Err(e) => Err(failed(
+                format!(
+                    "could not open the pull request of {branch} on {}",
+                    repo.slug
+                ),
+                e,
+            )),
+            Ok(url) => match p.hub.pr_edit(&repo.slug, &url, title, body).await {
+                Ok(()) => Ok(url),
+                Err(e) => Err(failed(format!("could not update {url}"), e)),
+            },
+        };
+        Ok(Proposal { sha, pr })
+    }
+
+    /// Writes and commits the file, then pushes it to `branch` while `origin`
+    /// still holds `remote` there. The new commit's sha.
+    async fn commit_and_push(
+        &self,
+        wt: &Path,
+        path: &str,
+        content: &str,
+        message: &str,
+        branch: &str,
+        remote: Option<&str>,
+    ) -> Result<String, String> {
+        let (git, repo) = (&self.p.git, self.repo);
+        let file = wt.join(path);
+        let written = match file.parent() {
+            Some(dir) => std::fs::create_dir_all(dir),
+            None => Ok(()),
+        }
+        .and_then(|()| std::fs::write(&file, content));
+        written.map_err(|e| failed(format!("could not write {path}"), e))?;
+        let sha = git
+            .commit_file(wt, path, message)
+            .await
+            .map_err(|e| failed(format!("could not commit {path}"), e))?
+            .ok_or_else(|| format!("{path} on {} already reads like this", repo.base))?;
+        if let Err(e) = git.push_lease(wt, branch, remote).await {
+            let now = git.remote_branch_sha(&self.p.checkout(repo), branch).await;
+            if now.as_ref().is_ok_and(|now| now.as_deref() != remote) {
+                return Err(failed(changed_by_a_person(branch), e));
+            }
+            return Err(failed(
+                format!("could not push {branch} to {}", repo.slug),
+                e,
+            ));
+        }
+        Ok(sha)
+    }
+
     async fn record(
         &self,
         kind: &str,
@@ -774,12 +1018,7 @@ where
         pr_url: Option<&str>,
         detail: Option<&Value>,
     ) -> Result<(), String> {
-        let spent = std::mem::take(
-            &mut *self
-                .spent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let spent = std::mem::take(&mut *self.spent.lock().unwrap_or_else(PoisonError::into_inner));
         let run = MaintenanceRun {
             id: 0,
             repo: self.repo.slug.clone(),
@@ -837,6 +1076,25 @@ where
 
     fn rules_at_base(&self) -> BoxFuture<'_, Result<Option<String>, String>> {
         Box::pin(self.base_rules())
+    }
+
+    fn ask_model<'a>(
+        &'a self,
+        prompt: &'a str,
+        schema: &'a Value,
+    ) -> BoxFuture<'a, Result<Value, String>> {
+        Box::pin(self.ask(prompt, schema))
+    }
+
+    fn propose_file<'a>(
+        &'a self,
+        path: &'a str,
+        content: &'a str,
+        title: &'a str,
+        body: &'a str,
+        last_pushed: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Proposal, String>> {
+        Box::pin(self.propose(path, content, title, body, last_pushed))
     }
 
     fn last_run<'a>(

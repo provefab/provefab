@@ -13,8 +13,10 @@ mod types;
 pub use claude::ClaudeCodeWorker;
 pub use codex::CodexWorker;
 pub use jsonl::JsonlReader;
-pub use pi::PiWorker;
-pub use process::{NO_PUSH_CONFIG, SCRUBBED_ENV, apply_worker_env, prepare_git_hooks};
+pub use pi::{PiWorker, SUBMIT_TOOL};
+pub use process::{
+    NO_PUSH_CONFIG, NO_TOOLS_ENV, SCRUBBED_ENV, apply_worker_env, prepare_git_hooks,
+};
 pub use types::{
     ExitReason, StageRequest, StageResult, ToolProfile, Usage, Worker, WorkerError, WorkerEvent,
 };

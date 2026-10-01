@@ -112,6 +112,17 @@ pub enum SignalKind {
     },
 }
 
+/// A periodic pull request as `PeriodicTools::propose_file` left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    /// The commit pushed to the proposal branch: the next call's
+    /// `last_pushed`, even when `pr` failed (the push already happened).
+    pub sha: String,
+    /// The pull request's URL, or the fixed text of why it could not be
+    /// opened or updated.
+    pub pr: Result<String, String>,
+}
+
 /// What the core lends a policy's periodic work for one repository
 /// (repository rules spec §7). Errors are fixed text; the detail goes to
 /// the log only, redacted (pre-flight S1).
@@ -123,6 +134,31 @@ pub trait PeriodicTools: Send + Sync {
     fn highest_rule_number(&self) -> BoxFuture<'_, Result<u32, String>>;
     /// `.provefab/rules.md` on the base branch, fetched first; `None` when absent.
     fn rules_at_base(&self) -> BoxFuture<'_, Result<Option<String>, String>>;
+    /// One structured answer from a standard-tier model, routed like a stage
+    /// (subscription first, then API keys by price), run in an empty
+    /// directory with every tool call refused by the guard: the prompt can
+    /// carry untrusted text (pre-flight S2). Its cost goes with the next
+    /// recorded run.
+    fn ask_model<'a>(
+        &'a self,
+        prompt: &'a str,
+        schema: &'a Value,
+    ) -> BoxFuture<'a, Result<Value, String>>;
+    /// Commits `content` as `path` on the branch `provefab/<file stem>`,
+    /// rebuilt from the current base, pushes it and opens its pull request or
+    /// updates the open one. Never merges. `Err` means nothing was pushed.
+    /// `last_pushed` is the `sha` of the
+    /// previous proposal (`None`: there is none); when the branch holds
+    /// anything else, a person changed it, and nothing is pushed or edited
+    /// (pre-flight B1).
+    fn propose_file<'a>(
+        &'a self,
+        path: &'a str,
+        content: &'a str,
+        title: &'a str,
+        body: &'a str,
+        last_pushed: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Proposal, String>>;
     /// The latest run of `kind` for this repository.
     fn last_run<'a>(
         &'a self,

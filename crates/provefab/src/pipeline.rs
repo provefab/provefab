@@ -101,7 +101,7 @@ pub fn ladder(attempts: u32, escalated: bool, improved: bool) -> Ladder {
 }
 
 /// A model counted as running; freed on drop.
-struct Slot<'a> {
+pub(crate) struct Slot<'a> {
     cooldowns: &'a Mutex<Cooldowns>,
     model_id: String,
     /// Whether this claim's `stage_run` has been recorded yet (issue #12).
@@ -137,7 +137,7 @@ impl Drop for Slot<'_> {
 }
 
 /// What `Pipeline::claim` found.
-enum Claim<'a> {
+pub(crate) enum Claim<'a> {
     Run(Box<ModelEntry>, Slot<'a>),
     /// No model is free (cooling down or at `max_concurrency`).
     Busy,
@@ -146,7 +146,7 @@ enum Claim<'a> {
 }
 
 /// How a worker stage ended, as the pipeline sees it.
-enum Outcome {
+pub(crate) enum Outcome {
     Finished(StageResult),
     /// The loop detector stopped it (spec §4.3).
     Looping(f64),
@@ -187,7 +187,7 @@ fn tier_name(t: Tier) -> &'static str {
 }
 
 /// The exit reason without any tool output: safe to post on GitHub (review I7).
-fn exit_kind(e: &ExitReason) -> &'static str {
+pub(crate) fn exit_kind(e: &ExitReason) -> &'static str {
     match e {
         ExitReason::Completed => "completed",
         ExitReason::MaxTurns => "max turns reached",
@@ -1848,6 +1848,16 @@ Please reply with what should happen, what happens instead, and how to reproduce
             Stage::Review => self.review_avoid(task).await?,
             _ => Vec::new(),
         };
+        self.claim_tier(tier, &avoid).await
+    }
+
+    /// `claim` for a tier and the providers to avoid; also how periodic
+    /// work's model calls get a model (repository rules plan decision 15).
+    pub(crate) async fn claim_tier(
+        &self,
+        tier: Tier,
+        avoid: &[String],
+    ) -> Result<Claim<'_>, PipelineError> {
         let catalog = self.ordered_models();
         // Serialises this count+claim with `run_stage`'s record+mark, so the
         // count below can never be undercut by a run that is about to be
@@ -1862,7 +1872,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             return Ok(Claim::OverBudget);
         }
         let avail = cooldowns.availability();
-        let Some(model) = select(tier, &catalog, &avail, SystemTime::now(), &avoid).cloned() else {
+        let Some(model) = select(tier, &catalog, &avail, SystemTime::now(), avoid).cloned() else {
             return Ok(Claim::Busy);
         };
         cooldowns.start(&model.id);
@@ -2035,7 +2045,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
         }
     }
 
-    async fn watched(
+    pub(crate) async fn watched(
         &self,
         model: &ModelEntry,
         req: StageRequest,
@@ -2074,7 +2084,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
         }
     }
 
-    fn request(
+    pub(crate) fn request(
         &self,
         wt: &Path,
         prompt: String,

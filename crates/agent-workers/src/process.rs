@@ -10,8 +10,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::WorkerError;
 use crate::jsonl::JsonlReader;
+use crate::{ToolProfile, WorkerError};
 
 /// Credentials a worker must never see. Pushing is Provefab's job (spec §3.2).
 pub const SCRUBBED_ENV: [&str; 6] = [
@@ -53,11 +53,19 @@ pub(crate) struct Finished {
     pub stderr_tail: String,
 }
 
+/// Set (to `1`) for a stage without tools: `provefab guard` then refuses
+/// every call but the structured answer's own.
+pub const NO_TOOLS_ENV: &str = "PROVEFAB_NO_TOOLS";
+
 /// Environment every worker gets, whatever the agent runtime.
-pub fn apply_worker_env(cmd: &mut Command, worktree: &Path, hooks_dir: &Path) {
+pub fn apply_worker_env(cmd: &mut Command, worktree: &Path, hooks_dir: &Path, tools: ToolProfile) {
     for key in SCRUBBED_ENV {
         cmd.env_remove(key);
     }
+    match tools {
+        ToolProfile::NoTools => cmd.env(NO_TOOLS_ENV, "1"),
+        ToolProfile::ReadOnly | ToolProfile::Full => cmd.env_remove(NO_TOOLS_ENV),
+    };
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     let mut n = current_env(cmd, "GIT_CONFIG_COUNT")
         .and_then(|v| v.parse::<usize>().ok())
@@ -415,7 +423,12 @@ mod tests {
         );
         cmd.env("SSH_AUTH_SOCK", "/tmp/agent.sock")
             .env("GH_TOKEN", "secret");
-        apply_worker_env(&mut cmd, dir.path(), &dir.path().join("hooks"));
+        apply_worker_env(
+            &mut cmd,
+            dir.path(),
+            &dir.path().join("hooks"),
+            ToolProfile::Full,
+        );
         let mut seen = None;
         run_jsonl(cmd, Duration::from_secs(5), |v| {
             seen = Some(v);
@@ -441,7 +454,12 @@ git remote add origin ../remote.git
 if git push -q origin HEAD:main 2>/dev/null; then echo '{"pushed":true}'; else echo '{"pushed":false}'; fi"#;
         let mut cmd = sh(script);
         cmd.current_dir(dir.path());
-        apply_worker_env(&mut cmd, dir.path(), &dir.path().join("hooks"));
+        apply_worker_env(
+            &mut cmd,
+            dir.path(),
+            &dir.path().join("hooks"),
+            ToolProfile::Full,
+        );
         let mut seen = None;
         run_jsonl(cmd, Duration::from_secs(20), |v| {
             seen = Some(v);
@@ -562,7 +580,7 @@ git config remote.origin.pushurl "$(cd .. && pwd)/remote.git"
 if git push -q origin HEAD:main 2>/dev/null; then echo '{"pushed":true}'; else echo '{"pushed":false}'; fi"#;
         let mut cmd = sh(script);
         cmd.current_dir(dir.path());
-        apply_worker_env(&mut cmd, dir.path(), &hooks);
+        apply_worker_env(&mut cmd, dir.path(), &hooks, ToolProfile::Full);
         let mut seen = None;
         run_jsonl(cmd, Duration::from_secs(20), |v| {
             seen = Some(v);
@@ -580,7 +598,12 @@ if git push -q origin HEAD:main 2>/dev/null; then echo '{"pushed":true}'; else e
         cmd.env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "safe.directory")
             .env("GIT_CONFIG_VALUE_0", "*");
-        apply_worker_env(&mut cmd, Path::new("/w"), Path::new("/h"));
+        apply_worker_env(
+            &mut cmd,
+            Path::new("/w"),
+            Path::new("/h"),
+            ToolProfile::Full,
+        );
         let envs: std::collections::HashMap<String, String> = cmd
             .as_std()
             .get_envs()

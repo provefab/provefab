@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use crate::agents::AgentRunner;
-use crate::cli::{GuardFormat, run_guard};
+use crate::cli::{GuardFormat, run_guard, run_guard_no_tools};
 use crate::commands::{self, Tools};
 use crate::config::{Auth, Config, WorkerKind};
 use crate::cooldown::Cooldowns;
@@ -98,6 +98,11 @@ enum Cmd {
         /// The task's worktree. Workers set PROVEFAB_WORKTREE.
         #[arg(long, env = "PROVEFAB_WORKTREE")]
         root: Option<PathBuf>,
+        /// Refuse every call but the structured answer. Workers set
+        /// PROVEFAB_NO_TOOLS for a stage without tools; any value but a
+        /// false one (0, false, no, off) turns it on.
+        #[arg(long, env = agent_workers::NO_TOOLS_ENV, value_parser = clap::builder::FalseyValueParser::new())]
+        no_tools: bool,
     },
 }
 
@@ -179,12 +184,21 @@ where
         Ok(c) => c,
         Err(e) => e.exit(),
     };
-    if let Cmd::Guard { format, root } = cli.cmd {
+    if let Cmd::Guard {
+        format,
+        root,
+        no_tools,
+    } = cli.cmd
+    {
         // Synchronous and dependency-free: runs before every agent tool call.
         let mut stdin = String::new();
         // An unreadable stdin becomes "" and is denied by run_guard.
         let _ = std::io::stdin().read_to_string(&mut stdin);
-        let out = run_guard(format, root.as_deref(), &stdin);
+        let out = if no_tools {
+            run_guard_no_tools(format, &stdin)
+        } else {
+            run_guard(format, root.as_deref(), &stdin)
+        };
         let _ = std::io::stdout().write_all(out.stdout.as_bytes());
         let _ = std::io::stderr().write_all(out.stderr.as_bytes());
         return ExitCode::from(out.exit_code as u8);

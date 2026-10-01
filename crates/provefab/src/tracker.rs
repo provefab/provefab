@@ -730,6 +730,15 @@ impl Forge for Routed {
     ) -> Result<String, ForgeError> {
         Forge::pr_create(&self.gh, slug, head, base, title, body).await
     }
+    async fn pr_edit(
+        &self,
+        slug: &str,
+        url: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        Forge::pr_edit(&self.gh, slug, url, title, body).await
+    }
     async fn repo_clone(&self, slug: &str, dest: &Path) -> Result<(), ForgeError> {
         Forge::repo_clone(&self.gh, slug, dest).await
     }

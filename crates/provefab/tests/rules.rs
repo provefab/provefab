@@ -764,3 +764,312 @@ async fn signals_redact_credential_looking_text() {
     };
     assert_eq!(text, "the test sets <redacted> inline");
 }
+
+/// What `provefab guard` answers for one Claude Code tool call, run with the
+/// environment a worker gives `req`'s stage (pre-flight S2).
+fn guard_answer(req: &StageRequest, tool: &str, input: Value) -> String {
+    use std::io::Write as _;
+    let mut workers = tokio::process::Command::new("true");
+    agent_workers::apply_worker_env(
+        &mut workers,
+        &req.cwd,
+        &req.session_dir.join("git-hooks"),
+        req.tools,
+    );
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_provefab"));
+    for (k, v) in workers.as_std().get_envs() {
+        match v {
+            Some(v) => cmd.env(k, v),
+            None => cmd.env_remove(k),
+        };
+    }
+    let mut child = cmd
+        .args(["guard", "--format", "claude-code"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let call = json!({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input});
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(call.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn ask_model_runs_a_standard_model_without_tools_and_records_its_cost() {
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, usize, Option<Value>, [String; 3])>>>;
+    let f = fixture(&["true"]);
+    let seen: Seen = Default::default();
+    let log = seen.clone();
+    let script = move |_: &ModelEntry, req: &StageRequest, _: &UnboundedSender<WorkerEvent>| {
+        let entries = std::fs::read_dir(&req.cwd).unwrap().count();
+        // Tool calls the model could try while it runs, through the real guard.
+        let answers = [
+            guard_answer(req, "Read", json!({"file_path": "/etc/hosts"})),
+            guard_answer(req, "Glob", json!({"pattern": "*"})),
+            guard_answer(req, "StructuredOutput", json!({"changes": []})),
+        ];
+        log.lock()
+            .unwrap()
+            .push((req.cwd.clone(), entries, req.output_schema.clone(), answers));
+        let mut r = done(Some(json!({"changes": []})))?;
+        r.usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            ..Usage::default()
+        };
+        Some(r)
+    };
+    let p = pipeline(
+        &f,
+        Box::new(script),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let schema = json!({"type": "object"});
+    let answer = tools
+        .ask_model("You are drafting repository rules.", &schema)
+        .await
+        .unwrap();
+    assert_eq!(answer, json!({"changes": []}));
+    let (cwd, entries, sent, [read, glob, submit]) = seen.lock().unwrap()[0].clone();
+    assert_eq!((entries, sent), (0, Some(schema)));
+    for refused in [&read, &glob] {
+        let v: Value = serde_json::from_str(refused).unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{refused}"
+        );
+    }
+    assert_eq!(submit, "", "the answer itself goes through");
+    assert!(
+        cwd.starts_with(f.home.join("maintenance")),
+        "{}",
+        cwd.display()
+    );
+    assert!(
+        !cwd.starts_with(repo.path_in(&f.home)),
+        "no repository access"
+    );
+    assert!(!cwd.exists(), "removed after the call");
+    let model = p.runner.calls()[0].0.clone();
+    let entry = f.config.models.iter().find(|m| m.id == model).unwrap();
+    assert_eq!(entry.tier, provefab::task::Tier::Standard);
+    tools
+        .record_run("rules", "nothing to propose", None, None)
+        .await
+        .unwrap();
+    let run = tools.last_run("rules").await.unwrap().unwrap();
+    assert_eq!(run.model_id.as_deref(), Some(model.as_str()));
+    assert!(run.quota_units.is_some_and(|q| q > 0.0), "{run:?}");
+    // Written once: the next run has no model call of its own.
+    tools
+        .record_run("rules", "again", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        tools.last_run("rules").await.unwrap().unwrap().model_id,
+        None
+    );
+}
+
+#[tokio::test]
+async fn ask_model_errors_are_fixed_text() {
+    let f = fixture(&["true"]);
+    let script = |_: &ModelEntry, _: &StageRequest, _: &UnboundedSender<WorkerEvent>| {
+        provefab::testkit::exit(ExitReason::Crashed {
+            code: Some(1),
+            stderr_tail: "GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345".into(),
+        })
+    };
+    let p = pipeline(
+        &f,
+        Box::new(script),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let repo = f.config.repos[0].clone();
+    let err = p
+        .maintenance(&repo)
+        .ask_model("prompt", &json!({"type": "object"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err, "no structured answer (the model's run ended: crashed)");
+}
+
+#[tokio::test]
+async fn propose_file_opens_then_updates_one_pull_request_and_never_merges() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    // Like GitHub: one open pull request per head branch, reused.
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let main = git(&f.origin, &["rev-parse", "main"]);
+    let first = tools
+        .propose_file(
+            ".provefab/rules.md",
+            "## R1: One\n\nText.\n",
+            "Rules 1",
+            "Body 1",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        git(&f.origin, &["show", "provefab/rules:.provefab/rules.md"]),
+        "## R1: One\n\nText."
+    );
+    assert_eq!(git(&f.origin, &["rev-parse", "provefab/rules^"]), main);
+    assert_eq!(first.sha, git(&f.origin, &["rev-parse", "provefab/rules"]));
+    let second = tools
+        .propose_file(
+            ".provefab/rules.md",
+            "## R1: One\n\nText.\n\n## R2: Two\n\nMore.\n",
+            "Rules 2",
+            "Body 2",
+            Some(&first.sha),
+        )
+        .await
+        .unwrap();
+    let url = second.pr.clone().unwrap();
+    assert_eq!(first.pr, second.pr);
+    assert_eq!(second.sha, git(&f.origin, &["rev-parse", "provefab/rules"]));
+    assert_eq!(p.hub.prs.lock().unwrap().len(), 1);
+    assert_eq!(
+        p.hub.edited.lock().unwrap().last().cloned(),
+        Some((url, "Rules 2".to_string(), "Body 2".to_string()))
+    );
+    assert!(git(&f.origin, &["show", "provefab/rules:.provefab/rules.md"]).ends_with("More."));
+    assert_eq!(
+        git(&f.origin, &["rev-parse", "provefab/rules^"]),
+        main,
+        "rebuilt from the base: one commit on top of it"
+    );
+    assert!(p.hub.merged.lock().unwrap().is_empty(), "never merges");
+    for bad in ["../outside.md", "/etc/x.md", ""] {
+        let err = tools
+            .propose_file(bad, "x", "t", "b", Some(&second.sha))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("{bad} is not a file path inside the repository")
+        );
+    }
+    let worktrees = git(&repo.path_in(&f.home), &["worktree", "list"]);
+    assert_eq!(worktrees.lines().count(), 1, "{worktrees}");
+}
+
+/// Pre-flight B1: a maintainer's commit on the proposal branch is never lost.
+#[tokio::test]
+async fn propose_file_never_overwrites_a_persons_commit_on_its_branch() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let ours = tools
+        .propose_file(".provefab/rules.md", "## R1: One\n", "Rules", "Body", None)
+        .await
+        .unwrap();
+    // A maintainer edits the proposal and pushes to its branch.
+    let human = f._dir.path().join("human");
+    git(
+        f._dir.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "provefab/rules",
+            f.origin.to_str().unwrap(),
+            "human",
+        ],
+    );
+    std::fs::write(human.join(".provefab/rules.md"), "## R1: One, reworded\n").unwrap();
+    git(&human, &["commit", "-q", "-am", "reword"]);
+    git(&human, &["push", "-q", "origin", "provefab/rules"]);
+    let theirs = git(&f.origin, &["rev-parse", "provefab/rules"]);
+    let edits = p.hub.edited.lock().unwrap().len();
+    let changed = "a person changed the branch provefab/rules after Provefab pushed it, so Provefab pushed nothing and left its pull request as it is";
+    for expected in [Some(ours.sha.as_str()), None] {
+        let err = tools
+            .propose_file(
+                ".provefab/rules.md",
+                "## R1: Two\n",
+                "Rules 2",
+                "Body 2",
+                expected,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, changed);
+        assert_eq!(git(&f.origin, &["rev-parse", "provefab/rules"]), theirs);
+        assert_eq!(p.hub.edited.lock().unwrap().len(), edits, "no edit");
+        assert_eq!(p.hub.prs.lock().unwrap().len(), 1);
+    }
+    // Once the branch is gone (merged or closed, then deleted), nothing can be lost.
+    git(
+        &human,
+        &["push", "-q", "origin", "--delete", "provefab/rules"],
+    );
+    let again = tools
+        .propose_file(
+            ".provefab/rules.md",
+            "## R1: Two\n",
+            "Rules 2",
+            "Body 2",
+            Some(&ours.sha),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.sha, git(&f.origin, &["rev-parse", "provefab/rules"]));
+}
+
+/// A push that happened is reported even when its pull request call fails,
+/// so the next call's lease matches it.
+#[tokio::test]
+async fn propose_file_reports_its_push_when_the_pull_request_call_fails() {
+    let f = fixture(&["true"]);
+    let hub = FakeHub::new("x");
+    *hub.revert_origin.lock().unwrap() = Some(f.origin.clone());
+    hub.pr_create_failures
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let p = pipeline(&f, Box::new(happy), FakeOracle::default(), hub).await;
+    let repo = f.config.repos[0].clone();
+    let tools = p.maintenance(&repo);
+    let first = tools
+        .propose_file(".provefab/rules.md", "## R1: One\n", "Rules", "Body", None)
+        .await
+        .unwrap();
+    assert_eq!(first.sha, git(&f.origin, &["rev-parse", "provefab/rules"]));
+    let err = first.pr.unwrap_err();
+    assert_eq!(
+        err,
+        "could not open the pull request of provefab/rules on o/r"
+    );
+    assert!(p.hub.edited.lock().unwrap().is_empty());
+    let second = tools
+        .propose_file(
+            ".provefab/rules.md",
+            "## R1: Two\n",
+            "Rules",
+            "Body",
+            Some(&first.sha),
+        )
+        .await
+        .unwrap();
+    assert!(second.pr.is_ok(), "{second:?}");
+}

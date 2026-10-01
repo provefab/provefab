@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_workers::{SCRUBBED_ENV, apply_worker_env, prepare_git_hooks};
+use agent_workers::{SCRUBBED_ENV, ToolProfile, apply_worker_env, prepare_git_hooks};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -189,7 +189,8 @@ async fn run_gate(worktree: &Path, command: &str, timeout: Duration, scratch: &P
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
-    apply_worker_env(&mut cmd, worktree, &hooks);
+    // Gate commands are not agent stages: no `PROVEFAB_NO_TOOLS`.
+    apply_worker_env(&mut cmd, worktree, &hooks, ToolProfile::Full);
     for key in SCRUBBED_ENV {
         cmd.env_remove(key);
     }

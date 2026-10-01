@@ -43,8 +43,14 @@ impl PiWorker {
         }
         push("--model");
         push(&req.model);
-        push("--tools");
-        push(&tools_arg(req.tools, req.output_schema.is_some()));
+        match tools_arg(req.tools, req.output_schema.is_some()) {
+            // Say "no tools" outright rather than pass an empty list.
+            t if t.is_empty() => push("--no-tools"),
+            t => {
+                push("--tools");
+                push(&t);
+            }
+        }
         a.push("--session-dir".into());
         a.push(req.session_dir.clone().into_os_string());
         a.push("-e".into());
@@ -64,8 +70,11 @@ fn tools_arg(profile: ToolProfile, submit: bool) -> String {
     let base = match profile {
         ToolProfile::ReadOnly => "read,grep,find,ls",
         ToolProfile::Full => "read,bash,edit,write,grep,find,ls",
+        ToolProfile::NoTools => "",
     };
-    if submit {
+    if submit && base.is_empty() {
+        SUBMIT_TOOL.to_string()
+    } else if submit {
         format!("{base},{SUBMIT_TOOL}")
     } else {
         base.to_string()
@@ -81,7 +90,12 @@ impl Worker for PiWorker {
         std::fs::create_dir_all(&req.session_dir).map_err(|e| WorkerError::Io(e.to_string()))?;
         let mut cmd = Command::new(&self.program);
         cmd.args(self.args(req)).current_dir(&req.cwd);
-        apply_worker_env(&mut cmd, &req.cwd, &req.session_dir.join("git-hooks"));
+        apply_worker_env(
+            &mut cmd,
+            &req.cwd,
+            &req.session_dir.join("git-hooks"),
+            req.tools,
+        );
         cmd.env("PROVEFAB_BIN", &self.provefab_bin);
         cmd.env_remove("PROVEFAB_OUTPUT_SCHEMA");
         if let Some(schema) = &req.output_schema {
@@ -308,6 +322,33 @@ mod tests {
             "{joined}"
         );
         assert_eq!(args.last().unwrap(), "Fix the bug");
+    }
+
+    /// Repository rules pre-flight S2: only the answer tool, or none at all.
+    #[test]
+    fn no_tools_keeps_only_the_submit_tool() {
+        let w = PiWorker {
+            program: "pi".into(),
+            package: "/x/pi-provefab".into(),
+            provefab_bin: "/x/provefab".into(),
+        };
+        let mut r = req(std::path::Path::new("/w"));
+        r.tools = ToolProfile::NoTools;
+        let joined = |r: &StageRequest| {
+            w.args(r)
+                .into_iter()
+                .map(|s| s.into_string().unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(
+            joined(&r).contains("--tools submit_result "),
+            "{}",
+            joined(&r)
+        );
+        r.output_schema = None;
+        assert!(joined(&r).contains(" --no-tools "), "{}", joined(&r));
+        assert!(!joined(&r).contains("--tools"), "{}", joined(&r));
     }
 
     #[test]

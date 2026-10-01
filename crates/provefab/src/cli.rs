@@ -63,6 +63,30 @@ pub fn run_guard(format: GuardFormat, root: Option<&Path>, stdin: &str) -> Guard
     render(format, &decision)
 }
 
+/// `run_guard` for a stage without tools (`PROVEFAB_NO_TOOLS`, repository
+/// rules pre-flight S2): every call is refused, reads included, except the
+/// tool that carries the structured answer (Pi's `submit_result`, Claude
+/// Code's `StructuredOutput`). Codex answers without a tool call.
+pub fn run_guard_no_tools(format: GuardFormat, stdin: &str) -> GuardOutput {
+    let Ok(input) = serde_json::from_str::<Value>(stdin) else {
+        return unreadable(format);
+    };
+    let (key, answer) = match format {
+        GuardFormat::Pi => ("tool", Some(agent_workers::SUBMIT_TOOL)),
+        GuardFormat::ClaudeCode => ("tool_name", Some("StructuredOutput")),
+        GuardFormat::Codex => ("tool_name", None),
+    };
+    let Some(tool) = input.get(key).and_then(Value::as_str) else {
+        return unreadable(format);
+    };
+    let decision = if Some(tool) == answer {
+        Decision::Allow
+    } else {
+        Decision::Deny("this stage has no tools, so every tool call is refused".into())
+    };
+    render(format, &decision)
+}
+
 fn render(format: GuardFormat, decision: &Decision) -> GuardOutput {
     let stdout = match (format, decision) {
         (GuardFormat::Pi, Decision::Allow) => json!({"decision": "allow"}).to_string(),
@@ -178,6 +202,63 @@ mod tests {
             "{}",
             out.stdout
         );
+    }
+
+    /// Repository rules pre-flight S2: a stage without tools has every call
+    /// refused, harmless reads of absolute paths included; only the answer
+    /// itself goes through.
+    #[test]
+    fn without_tools_every_call_but_the_answer_is_refused() {
+        let denied = |format, input: Value| {
+            let out = run_guard_no_tools(format, &input.to_string());
+            let v: Value = serde_json::from_str(&out.stdout).unwrap();
+            let decision = match format {
+                GuardFormat::Pi => v["decision"].clone(),
+                _ => v["hookSpecificOutput"]["permissionDecision"].clone(),
+            };
+            decision == "deny"
+        };
+        let pi = |tool: &str, args: Value| json!({"tool": tool, "args": args});
+        let cc = |tool: &str, input: Value| json!({"tool_name": tool, "tool_input": input});
+        for (format, input) in [
+            (
+                GuardFormat::Pi,
+                pi("read", json!({"path": "/home/u/.provefab/license.key"})),
+            ),
+            (GuardFormat::Pi, pi("ls", json!({"path": "/"}))),
+            (GuardFormat::Pi, pi("bash", json!({"command": "ls"}))),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": "/etc/hosts"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Glob", json!({"pattern": "**"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Bash", json!({"command": "ls"})),
+            ),
+            (
+                GuardFormat::Codex,
+                cc("Bash", json!({"command": "cat /etc/hosts"})),
+            ),
+            (GuardFormat::Codex, cc("submit_result", json!({}))),
+            (GuardFormat::Pi, pi("StructuredOutput", json!({}))),
+        ] {
+            assert!(denied(format, input.clone()), "{format:?} {input}");
+        }
+        assert_eq!(
+            run_guard_no_tools(GuardFormat::Pi, &pi("submit_result", json!({})).to_string()).stdout,
+            r#"{"decision":"allow"}"#
+        );
+        let answer = run_guard_no_tools(
+            GuardFormat::ClaudeCode,
+            &cc("StructuredOutput", json!({"changes": []})).to_string(),
+        );
+        assert_eq!((answer.stdout.as_str(), answer.exit_code), ("", 0));
+        let cc_bad = run_guard_no_tools(GuardFormat::ClaudeCode, "not json");
+        assert_eq!(cc_bad.exit_code, 2);
     }
 
     #[test]

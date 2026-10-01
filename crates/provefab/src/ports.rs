@@ -178,6 +178,14 @@ pub trait Forge {
         title: &str,
         body: &str,
     ) -> impl Future<Output = Result<String, ForgeError>> + Send;
+    /// Replaces a pull request's title and body (a periodic proposal updated in place).
+    fn pr_edit(
+        &self,
+        slug: &str,
+        url: &str,
+        title: &str,
+        body: &str,
+    ) -> impl Future<Output = Result<(), ForgeError>> + Send;
     /// Clones the repo into `dest` (a provefab-managed checkout, D48).
     fn repo_clone(
         &self,
@@ -255,6 +263,15 @@ impl Forge for Gh {
         body: &str,
     ) -> Result<String, ForgeError> {
         Gh::pr_create(self, slug, head, base, title, body).await
+    }
+    async fn pr_edit(
+        &self,
+        slug: &str,
+        url: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        Gh::pr_edit(self, slug, url, title, body).await
     }
     async fn repo_clone(&self, slug: &str, dest: &Path) -> Result<(), ForgeError> {
         Gh::repo_clone(self, slug, dest).await
