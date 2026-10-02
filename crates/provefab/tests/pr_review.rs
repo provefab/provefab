@@ -1164,3 +1164,37 @@ async fn a_review_held_by_the_budget_resumes_into_its_round() {
         "the budget notice and the summary"
     );
 }
+
+/// Controller ruling on Task 6: a parked review whose pull request merged
+/// or closed has ended and is prunable; an issue task parked is not.
+#[tokio::test]
+async fn a_parked_review_that_ended_is_prunable() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = reviewed(&p).await;
+    p.store.transition(id, NeedsYou, "stopped").await.unwrap();
+    p.hub.pr_status.lock().unwrap().state = provefab::forge::PrState::Merged;
+    assert_eq!(p.watch_pr(id).await.unwrap(), NeedsYou);
+    let issue = queue(&p).await;
+    p.store
+        .transition(issue, NeedsYou, "stopped")
+        .await
+        .unwrap();
+    let prunable: Vec<i64> = p
+        .store
+        .prunable_tasks(provefab::store::now() + 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert!(prunable.contains(&id), "{prunable:?}");
+    assert!(!prunable.contains(&issue), "{prunable:?}");
+}

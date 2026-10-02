@@ -1177,13 +1177,14 @@ impl Store {
     }
 
     /// Finished tasks last updated before `before`: failed, a PR that is done
-    /// or archived, or a pull request review that merged or closed, with no
-    /// post-merge check still open.
+    /// or archived, or a pull request review that merged or closed (whatever
+    /// its state: a parked review ends there too), with no post-merge check
+    /// still open.
     pub async fn prunable_tasks(&self, before: i64) -> Result<Vec<TaskRow>, StoreError> {
         let rows = sqlx::query(
             "SELECT * FROM tasks WHERE updated_at < ? \
-             AND (state = ? OR (state = ? AND (pr_state IN ('done', 'archived') \
-                  OR (mode = 'pr_review' AND pr_state IN ('merged', 'closed'))))) \
+             AND (state = ? OR (state = ? AND pr_state IN ('done', 'archived')) \
+                  OR (mode = 'pr_review' AND pr_state IN ('merged', 'closed'))) \
              AND NOT EXISTS (SELECT 1 FROM post_merge_checks c WHERE c.task_id = tasks.id \
                  AND c.state NOT IN ('passed','superseded','revert_open','blocked')) \
              ORDER BY id",
