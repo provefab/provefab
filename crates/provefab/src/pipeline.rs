@@ -502,9 +502,10 @@ pub async fn start_pass<H: Hub>(
     Ok(())
 }
 
-/// The task's branch: `provefab/<issue>-<slug>`, then `-r2`, `-r3`... for each
-/// pass after a requeue, so a new pass never builds on (or force-pushes over)
-/// the rejected one (D46).
+/// The task's branch: `provefab/<number>-<slug>` for a GitHub issue, or
+/// `provefab/<KEY>-<slug>` (for example `ENG-123`) for a Jira or Linear ticket,
+/// then `-r2`, `-r3`... for each pass after a requeue, so a new pass never
+/// builds on (or force-pushes over) the rejected one (D46).
 fn task_branch(task: &TaskRow) -> String {
     let id = task
         .issue_key
