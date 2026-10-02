@@ -28,7 +28,7 @@ use crate::risk::{self, Detected};
 use crate::router::{StageTiers, fallback_tiers, resolve_tier, select, stage_tiers};
 use crate::stage::{Finding, PlanOutput, ReviewOutput, ReviewVerdict, Severity, output_schema};
 use crate::store::{Also, StageRunRecord, Store, StoreError, TaskRow, Write, now, rfc3339};
-use crate::task::{Stage, TaskKind, TaskState, Tier};
+use crate::task::{Stage, TaskKind, TaskMode, TaskState, Tier};
 
 /// Loop detector cadence and window (spec §4.3).
 const LOOP_EVERY: u32 = 15;
@@ -38,7 +38,7 @@ const REPLY_THRESHOLD: f64 = 0.7;
 /// A retry that keeps improving may run at most this many implement attempts per round (D35).
 const MAX_ATTEMPTS: u32 = 4;
 /// The review prompt carries the diff up to this many characters.
-const DIFF_LIMIT: usize = 60_000;
+pub(crate) const DIFF_LIMIT: usize = 60_000;
 /// The `file` of a finding made from a person's comment on a closed pull
 /// request (D52): periodic work reads these as change requests.
 pub(crate) const PR_COMMENT_FILE: &str = "(pull request comment)";
@@ -198,7 +198,7 @@ pub(crate) fn exit_kind(e: &ExitReason) -> &'static str {
     }
 }
 
-fn exit_name(e: &ExitReason) -> String {
+pub(crate) fn exit_name(e: &ExitReason) -> String {
     match e {
         ExitReason::Completed => "completed".into(),
         ExitReason::MaxTurns => "max_turns".into(),
@@ -392,7 +392,7 @@ fn review_notes(review: &ReviewOutput, final_round: &[FindingRow]) -> Option<Str
     ))
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -530,6 +530,12 @@ async fn apply_effect<H: Hub>(hub: &H, effect: &Value) -> Result<(), ForgeError>
             .comment(slug, number, effect["body"].as_str().unwrap_or_default())
             .await;
     }
+    // PR review spec section 7: a review task's messages go to its pull request.
+    if effect["op"].as_str() == Some("pr_comment") {
+        let url = effect["url"].as_str().unwrap_or_default();
+        let body = effect["body"].as_str().unwrap_or_default();
+        return hub.pr_comment(slug, url, body, None).await.map(|_| ());
+    }
     let strs = |key: &str| -> Vec<String> {
         effect[key]
             .as_array()
@@ -562,7 +568,11 @@ async fn github<H: Hub>(
             .await;
     }
     if let Err(e) = apply_effect(hub, &effect).await {
-        eprintln!("provefab: could not apply a tracker effect for task {task_id}: {e}");
+        // gh's stderr is kept as is and can quote a credential (rule R3).
+        eprintln!(
+            "provefab: could not apply a tracker effect for task {task_id}: {}",
+            crate::rules::redact_credentials(&e.to_string())
+        );
         store
             .record_output(task_id, "pending_github", &effect)
             .await?;
@@ -613,6 +623,11 @@ where
                 )
                 .await;
         };
+        // PR review spec section 5: a review has steps of its own; `Waiting`
+        // resumes through `resume_waiting` like any task.
+        if task.mode == TaskMode::PrReview && task.state != TaskState::Waiting {
+            return self.pr_review_step(&task, &repo).await;
+        }
         match task.state {
             TaskState::Queued => self.classify(&task, &repo).await,
             TaskState::Classified => self.prepare(&task, &repo).await,
@@ -650,7 +665,7 @@ where
 
     /// The rolling 24-hour worker budget is spent (D53): park the task in
     /// `Waiting`. The issue hears about it once per day.
-    async fn over_budget(
+    pub(crate) async fn over_budget(
         &self,
         task: &TaskRow,
         repo: &RepoConfig,
@@ -677,7 +692,12 @@ where
                 &repo.slug,
                 task.issue_number,
                 &format!(
-                    "Provefab reached its daily worker budget ({cap} runs in 24 hours, `max_stage_runs_per_day`). This issue continues automatically when the budget allows."
+                    "Provefab reached its daily worker budget ({cap} runs in 24 hours, `max_stage_runs_per_day`). {} continues automatically when the budget allows.",
+                    if task.mode == TaskMode::PrReview {
+                        "This review"
+                    } else {
+                        "This issue"
+                    }
                 ),
             )
             .await?;
@@ -685,7 +705,12 @@ where
         Ok(TaskState::Waiting)
     }
 
-    async fn go(&self, id: i64, to: TaskState, reason: &str) -> Result<TaskState, PipelineError> {
+    pub(crate) async fn go(
+        &self,
+        id: i64,
+        to: TaskState,
+        reason: &str,
+    ) -> Result<TaskState, PipelineError> {
         self.store.transition(id, to, reason).await?;
         Ok(to)
     }
@@ -706,7 +731,7 @@ where
     /// `NeedsYou` or `Failed`: record why, then tell the issue and label it.
     /// `public` goes on GitHub and must never carry tool output (stderr, git or
     /// gh errors can hold tokens: review I7); `detail` stays in the local log.
-    async fn give_up(
+    pub(crate) async fn give_up(
         &self,
         task: &TaskRow,
         repo: Option<&RepoConfig>,
@@ -716,10 +741,10 @@ where
     ) -> Result<TaskState, PipelineError> {
         let reason = reason_text(public, detail);
         self.store.transition(task.id, to, &reason).await?;
-        let what = if to == TaskState::NeedsYou {
-            "needs a person to continue"
-        } else {
-            "gave up on this issue"
+        let what = match (to, task.mode) {
+            (TaskState::NeedsYou, _) => "needs a person to continue",
+            (_, TaskMode::PrReview) => "stopped reviewing this pull request",
+            _ => "gave up on this issue",
         };
         let body = format!(
             "Provefab {what}.\n\nReason: {public}\n\nDetails: `provefab log {}`",
@@ -747,6 +772,10 @@ where
     /// the state change stays local (final review I1).
     async fn misrouted(&self, id: i64, what: &str) -> Result<bool, PipelineError> {
         let task = self.task(id).await?;
+        // A review task never writes to the tracker (plan decision 7).
+        if task.mode == TaskMode::PrReview {
+            return Ok(false);
+        }
         let Some(why) = crate::tracker::key_mismatch(task.issue_key.as_deref(), self.repo(&task))
         else {
             return Ok(false);
@@ -765,16 +794,18 @@ where
         number: u64,
         body: &str,
     ) -> Result<(), PipelineError> {
-        if self.misrouted(id, "commenting on").await? {
-            return Ok(());
-        }
-        github(
-            &self.store,
-            &self.hub,
-            id,
-            json!({"op": "comment", "slug": slug, "number": number, "body": body}),
-        )
-        .await?;
+        // PR review spec section 7: a review task talks on its pull request,
+        // never on the tracker, where its number names another issue.
+        let task = self.task(id).await?;
+        let effect = if task.mode == TaskMode::PrReview {
+            json!({"op": "pr_comment", "slug": slug, "url": task.issue_url, "body": body})
+        } else {
+            if self.misrouted(id, "commenting on").await? {
+                return Ok(());
+            }
+            json!({"op": "comment", "slug": slug, "number": number, "body": body})
+        };
+        github(&self.store, &self.hub, id, effect).await?;
         Ok(())
     }
 
@@ -786,6 +817,10 @@ where
         add: &[&str],
         remove: &[&str],
     ) -> Result<(), PipelineError> {
+        // A person's pull request keeps the labels people put on it (plan decision 7).
+        if self.task(id).await?.mode == TaskMode::PrReview {
+            return Ok(());
+        }
         if self.misrouted(id, "relabelling").await? {
             return Ok(());
         }
@@ -821,7 +856,8 @@ where
             // Kept, not replayed: restoring the repository's tracker sends it
             // to the right issue (final review I1).
             let why = match self.store.task(task_id).await {
-                Ok(task) => task.and_then(|t| {
+                // A review task's effects go to its pull request: never held (plan decision 7).
+                Ok(task) => task.filter(|t| t.mode == TaskMode::Issue).and_then(|t| {
                     crate::tracker::key_mismatch(t.issue_key.as_deref(), self.repo(&t))
                 }),
                 Err(e) => {
@@ -842,7 +878,10 @@ where
                     }
                 }
                 Err(e) => {
-                    eprintln!("provefab: retry of a tracker effect for task {task_id} failed: {e}");
+                    eprintln!(
+                        "provefab: retry of a tracker effect for task {task_id} failed: {}",
+                        crate::rules::redact_credentials(&e.to_string())
+                    );
                     failed.insert(task_id);
                 }
             }
@@ -1119,7 +1158,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// missing), else the local `<base>` directly. Recorded as the `base` stage
     /// output so the rest of the pass reads the same commit even if another task's
     /// fetch later moves `origin/<base>` (issue #9, D48).
-    async fn pin_base(
+    pub(crate) async fn pin_base(
         &self,
         task: &TaskRow,
         repo: &RepoConfig,
@@ -1205,7 +1244,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     }
 
     /// Enters a stage with a fresh attempt counter and tier.
-    async fn enter(
+    pub(crate) async fn enter(
         &self,
         id: i64,
         to: TaskState,
@@ -1221,6 +1260,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
     // ---- model choice ----
 
     async fn tier_for(&self, task: &TaskRow, stage: Stage) -> Result<Tier, PipelineError> {
+        if task.mode == TaskMode::PrReview {
+            return self.pr_review_tier(task).await;
+        }
         // Escalation must land above the tier that actually ran, not above the
         // tier Jev requested: `select` silently resolves a requested tier
         // missing from the catalog to the nearest configured one, so every
@@ -1599,7 +1641,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// `retry_delays[n]` in `Waiting`, then retry from the same state; after the
     /// last delay, the user is needed (D51). The resume time is stored, so a
     /// restart keeps it.
-    async fn transient(
+    pub(crate) async fn transient(
         &self,
         task: &TaskRow,
         repo: &RepoConfig,
@@ -1848,7 +1890,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// daily worker budget in that same section, so parallel workers cannot
     /// both pass the check before either is recorded (issue #12). The slot
     /// frees the model when dropped, whichever way the stage ends.
-    async fn claim(&self, task: &TaskRow, stage: Stage) -> Result<Claim<'_>, PipelineError> {
+    pub(crate) async fn claim(
+        &self,
+        task: &TaskRow,
+        stage: Stage,
+    ) -> Result<Claim<'_>, PipelineError> {
         let tier = self.tier_for(task, stage).await?;
         let avoid = match stage {
             Stage::Review => self.review_avoid(task).await?,
@@ -1890,7 +1936,11 @@ Please reply with what should happen, what happens instead, and how to reproduce
         Ok(Claim::Run(Box::new(model), slot))
     }
 
-    async fn wait(&self, task: &TaskRow, stage: Stage) -> Result<TaskState, PipelineError> {
+    pub(crate) async fn wait(
+        &self,
+        task: &TaskRow,
+        stage: Stage,
+    ) -> Result<TaskState, PipelineError> {
         let tier = self.tier_for(task, stage).await?;
         self.go(
             task.id,
@@ -1939,7 +1989,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// Runs one worker stage, watching for loops when `watch` is set, and keeps
     /// cooldowns and the stage log up to date. `None` when the provider hit a
     /// rate limit: the caller stays in its state and re-routes on the next step.
-    async fn run_stage(
+    pub(crate) async fn run_stage(
         &self,
         task: &TaskRow,
         model: &ModelEntry,
@@ -2153,7 +2203,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
 
     /// A plan or review stage failed to produce its answer (spec §3.4 item 3):
     /// retry, escalate once, then give up.
-    async fn stage_failed(
+    pub(crate) async fn stage_failed(
         &self,
         task: &TaskRow,
         repo: &RepoConfig,
@@ -2351,7 +2401,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// Returns a number no other stage or gate run of this task has used yet,
     /// so a re-run without bumping `attempts` (a rate-limited retry, or a
     /// second reviewer in the same round) still gets its own session dir.
-    async fn next_run_seq(&self, task_id: i64) -> Result<u32, PipelineError> {
+    pub(crate) async fn next_run_seq(&self, task_id: i64) -> Result<u32, PipelineError> {
         Ok(self.store.stage_runs(task_id).await?.len() as u32 + 1)
     }
 
@@ -3249,6 +3299,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
     /// first approver's for a second review (D49), then always the
     /// implementer's (spec §3.2), so a second review avoids both.
     async fn review_avoid(&self, task: &TaskRow) -> Result<Vec<String>, PipelineError> {
+        if task.mode == TaskMode::PrReview {
+            return self.pr_review_avoid(task).await;
+        }
         let mut avoid = Vec::new();
         if let Some(a) = self.first_approval(task).await?
             && let Some(p) = a["provider"].as_str()

@@ -21,6 +21,7 @@ pub mod plugins;
 pub mod policy;
 pub mod ports;
 pub mod post_merge;
+pub mod pr_review;
 pub mod prices;
 pub mod prompts;
 pub mod record;
