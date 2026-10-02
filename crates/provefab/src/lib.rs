@@ -31,6 +31,7 @@ pub mod routing;
 pub mod rules;
 pub mod scheduler;
 pub mod service;
+pub mod setup;
 pub mod stage;
 pub mod store;
 pub mod task;
