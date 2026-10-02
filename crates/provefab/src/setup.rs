@@ -427,6 +427,127 @@ fn node_gates(root: &RepoRoot, slug: &str) -> Result<Vec<String>, SetupError> {
     Ok(gates)
 }
 
+/// `owner/name` as GitHub allows it: letters, digits, `-`, `_`, `.`.
+pub fn valid_slug(slug: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    matches!(slug.split('/').collect::<Vec<_>>().as_slice(), [o, n] if part(o) && part(n))
+}
+
+/// A TOML string, escaped (plan decision 12).
+fn toml_string(s: &str) -> String {
+    toml::Value::String(s.to_string()).to_string()
+}
+
+/// One `[[repos]]` block: slug, label, base, gates; nothing else (spec
+/// section 4).
+pub fn repo_block(slug: &str, base: &str, gates: &[String]) -> String {
+    let gates: Vec<String> = gates.iter().map(|g| toml_string(g)).collect();
+    format!(
+        "[[repos]]\nslug = {}\nlabel = \"provefab\"\nbase = {}\ngates = [{}]\n",
+        toml_string(slug),
+        toml_string(base),
+        gates.join(", ")
+    )
+}
+
+/// Plan decision 18, as amended: Python only; Node gates install from the
+/// lock file.
+pub const DEPENDENCIES_NOTE: &str = "note: a task's worktree starts without installed dependencies; if these commands need them, put the install command first in gates";
+
+/// `provefab repos add` (spec section 4): the block on a dry run, else
+/// what was added. The file is read, checked for the repository (any
+/// case), extended in memory and validated whole, then appended to.
+pub async fn repos_add(
+    paths: &Paths,
+    forge: &impl Forge,
+    git: &Git,
+    slug: &str,
+    checkout: Option<&Path>,
+    dry_run: bool,
+) -> Result<String, SetupError> {
+    if !valid_slug(slug) {
+        return Err(SetupError::Usage(format!(
+            "`{slug}` is not a GitHub repository as owner/name"
+        )));
+    }
+    let file = paths.config();
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SetupError::Usage(format!(
+                "no configuration at {}: run `provefab init` first",
+                file.display()
+            )));
+        }
+        Err(e) => {
+            return Err(SetupError::Other(format!(
+                "cannot read {}: {e}",
+                file.display()
+            )));
+        }
+    };
+    let config = Config::from_toml_str(&existing).map_err(|e| {
+        SetupError::Other(format!(
+            "{} does not load, fix it first: {}",
+            file.display(),
+            one_line(&e.to_string())
+        ))
+    })?;
+    if config
+        .repos
+        .iter()
+        .any(|r| r.slug.eq_ignore_ascii_case(slug))
+    {
+        return Err(SetupError::Exists(format!(
+            "{slug} is already in {}; nothing changed",
+            file.display()
+        )));
+    }
+    let root = read_root(forge, git, slug, checkout).await?;
+    let gates = detect(&root, slug)?;
+    let block = repo_block(slug, &root.default_branch, &gates);
+    let separator = if existing.is_empty() {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let added = format!("{separator}{block}");
+    Config::from_toml_str(&format!("{existing}{added}")).map_err(|e| {
+        SetupError::Other(format!(
+            "{} would not load with {slug}, nothing written: {}",
+            file.display(),
+            one_line(&e.to_string())
+        ))
+    })?;
+    if dry_run {
+        return Ok(block);
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .and_then(|mut f| f.write_all(added.as_bytes()))
+        .map_err(|e| SetupError::Other(format!("cannot write {}: {e}", file.display())))?;
+    let note = match stacks(&root).as_slice() {
+        [Stack::Python] => format!("{DEPENDENCIES_NOTE}\n"),
+        _ => String::new(),
+    };
+    Ok(format!(
+        "added {slug} to {}: base {}, gates: {}\nProvefab keeps its own clone in {} (set local_path by hand to use yours)\n{note}next: provefab doctor --json\n",
+        file.display(),
+        root.default_branch,
+        gates.join("; "),
+        paths.home.join("repos").join(slug).display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1085,170 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code(), 2);
         assert!(e.to_string().contains("cannot read package.json"), "{e}");
+    }
+
+    /// A file in a fresh home: comments, an existing repository, and no
+    /// newline at the end.
+    const MINE: &str = "# my notes\n[jev]\nmodel = \"jev-1.13.0\"\n\n[[models]]\nid = \"c\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"   # keep me\n\n[[repos]]\nslug = \"Acme/Api\"\ngates = [\"make\"]\n# the end, no newline";
+
+    fn home_with(text: &str) -> (tempfile::TempDir, Paths) {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        std::fs::write(paths.config(), text).unwrap();
+        (home, paths)
+    }
+
+    fn go_hub(branch: &str) -> FakeHub {
+        let hub = FakeHub::new("x");
+        *hub.repo_root.lock().unwrap() = Some(root_of(&[("go.mod", "module x\n")], branch));
+        hub
+    }
+
+    /// Spec section 4 and Review Focus 2: one block at the end, every
+    /// earlier byte kept, the whole file loads.
+    #[tokio::test]
+    async fn a_repository_is_appended_and_the_rest_is_kept_byte_for_byte() {
+        let (_h, paths) = home_with(MINE);
+        let said = repos_add(&paths, &go_hub("trunk"), &git(), "o/r", None, false)
+            .await
+            .unwrap();
+        assert!(said.starts_with("added o/r to "), "{said}");
+        assert!(
+            said.contains("base trunk, gates: go vet ./...; go test ./..."),
+            "{said}"
+        );
+        assert!(said.contains("next: provefab doctor --json"), "{said}");
+        let text = std::fs::read_to_string(paths.config()).unwrap();
+        assert!(text.starts_with(MINE), "{text}");
+        assert_eq!(
+            &text[MINE.len()..],
+            "\n\n[[repos]]\nslug = \"o/r\"\nlabel = \"provefab\"\nbase = \"trunk\"\ngates = [\"go vet ./...\", \"go test ./...\"]\n"
+        );
+        let config = Config::from_toml_str(&text).unwrap();
+        let added = config.repos.last().unwrap();
+        assert_eq!(
+            (
+                added.slug.as_str(),
+                added.label.as_str(),
+                added.base.as_str()
+            ),
+            ("o/r", "provefab", "trunk")
+        );
+        assert!(added.local_path.is_none() && added.tracker.is_none() && added.risk.is_none());
+        // A file ending with a newline gets one blank line before the block.
+        let (_h2, paths2) = home_with(&format!("{MINE}\n"));
+        repos_add(&paths2, &go_hub("main"), &git(), "o/r", None, false)
+            .await
+            .unwrap();
+        let text2 = std::fs::read_to_string(paths2.config()).unwrap();
+        assert!(
+            text2.contains("# the end, no newline\n\n[[repos]]\nslug = \"o/r\""),
+            "{text2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_name_with_a_quote_is_escaped() {
+        let (_h, paths) = home_with(MINE);
+        repos_add(&paths, &go_hub("we\"ird"), &git(), "o/r", None, false)
+            .await
+            .unwrap();
+        let config =
+            Config::from_toml_str(&std::fs::read_to_string(paths.config()).unwrap()).unwrap();
+        assert_eq!(config.repos.last().unwrap().base, "we\"ird");
+    }
+
+    /// Spec section 4: any case; plan decision 13: before GitHub is read.
+    #[tokio::test]
+    async fn a_repository_already_configured_in_any_case_is_refused_before_github_is_read() {
+        let (_h, paths) = home_with(MINE);
+        let hub = go_hub("main");
+        let e = repos_add(&paths, &hub, &git(), "acme/API", None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), 3, "{e}");
+        assert!(e.to_string().contains("acme/API is already in"), "{e}");
+        assert!(hub.repo_root_calls.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(paths.config()).unwrap(), MINE);
+    }
+
+    #[tokio::test]
+    async fn dry_run_prints_the_block_and_writes_nothing() {
+        let (_h, paths) = home_with(MINE);
+        let shown = repos_add(&paths, &go_hub("main"), &git(), "o/r", None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            shown,
+            "[[repos]]\nslug = \"o/r\"\nlabel = \"provefab\"\nbase = \"main\"\ngates = [\"go vet ./...\", \"go test ./...\"]\n"
+        );
+        assert_eq!(std::fs::read_to_string(paths.config()).unwrap(), MINE);
+    }
+
+    /// Spec section 4 and Review Focus 4: the whole file is validated before
+    /// writing; the loader's multi-line error becomes one line.
+    #[tokio::test]
+    async fn a_file_that_would_not_load_is_refused_on_one_line() {
+        let inline = "repos = []\n[jev]\nmodel = \"jev-1.13.0\"\n\n[[models]]\nid = \"c\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\n";
+        let (_h, paths) = home_with(inline);
+        let e = repos_add(&paths, &go_hub("main"), &git(), "o/r", None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), 1, "{e}");
+        assert!(!e.to_string().contains('\n'), "{e}");
+        assert!(e.to_string().contains("would not load with o/r"), "{e}");
+        assert_eq!(std::fs::read_to_string(paths.config()).unwrap(), inline);
+    }
+
+    #[tokio::test]
+    async fn usage_errors_exit_2() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let hub = go_hub("main");
+        let e = repos_add(&paths, &hub, &git(), "o/r", None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), 2);
+        assert!(e.to_string().contains("run `provefab init` first"), "{e}");
+        std::fs::write(paths.config(), MINE).unwrap();
+        for bad in ["o", "o/r/x", "../r", "o/", "o r/x", "o/r\"]"] {
+            let e = repos_add(&paths, &hub, &git(), bad, None, false)
+                .await
+                .unwrap_err();
+            assert_eq!(e.code(), 2, "{bad}");
+        }
+        assert!(hub.repo_root_calls.lock().unwrap().is_empty());
+        for good in ["o/r", "my-org/my.repo_2", "O/R"] {
+            assert!(valid_slug(good), "{good}");
+        }
+    }
+
+    /// Plan decision 18, as amended: Python only; Node gates install from the
+    /// lock file, so a Node repository gets no note.
+    #[tokio::test]
+    async fn python_repositories_get_the_dependencies_note() {
+        let (_h, paths) = home_with(MINE);
+        let hub = FakeHub::new("x");
+        *hub.repo_root.lock().unwrap() = Some(root_of(&[("pyproject.toml", "")], "main"));
+        let said = repos_add(&paths, &hub, &git(), "o/py", None, false)
+            .await
+            .unwrap();
+        assert!(said.contains(DEPENDENCIES_NOTE), "{said}");
+        let (_h2, paths2) = home_with(MINE);
+        let hub2 = FakeHub::new("x");
+        *hub2.repo_root.lock().unwrap() = Some(root_of(
+            &[("package.json", r#"{"scripts":{"test":"jest"}}"#)],
+            "main",
+        ));
+        let said = repos_add(&paths2, &hub2, &git(), "o/web", None, false)
+            .await
+            .unwrap();
+        assert!(!said.contains(DEPENDENCIES_NOTE), "{said}");
+        assert!(said.contains("gates: npm install; npm test"), "{said}");
+        let (_h3, paths3) = home_with(MINE);
+        let said = repos_add(&paths3, &go_hub("main"), &git(), "o/r", None, false)
+            .await
+            .unwrap();
+        assert!(!said.contains(DEPENDENCIES_NOTE), "{said}");
     }
 }
