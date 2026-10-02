@@ -68,7 +68,7 @@ fn guard_call(format: GuardFormat, root: Option<&Path>, stdin: &str, review: boo
                 GuardFormat::Codex => adapters::from_codex(tool, args),
             };
             if review {
-                guard::check_review(&call)
+                guard::check_review(&call, &cwd, root)
             } else {
                 guard::check(&call, &cwd, root)
             }
@@ -324,8 +324,9 @@ mod tests {
             );
         }
         for command in ["git diff HEAD~1", "cat src/a.rs | head -20"] {
+            let command = format!("cd {} && {command}", r.path().display());
             assert_eq!(
-                decision(true, GuardFormat::Codex, codex(command)),
+                decision(true, GuardFormat::Codex, codex(&command)),
                 "allow",
                 "{command}"
             );
@@ -344,6 +345,221 @@ mod tests {
             "{}",
             missing.stdout
         );
+    }
+
+    /// The decision `provefab guard` gives one call, as "allow" or "deny".
+    fn decide(review: bool, format: GuardFormat, root: &Path, input: &Value) -> String {
+        let out = if review {
+            run_guard_review(format, Some(root), &input.to_string())
+        } else {
+            run_guard(format, Some(root), &input.to_string())
+        };
+        match format {
+            GuardFormat::Pi => serde_json::from_str::<Value>(&out.stdout).unwrap()["decision"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            _ if out.stdout.is_empty() && out.exit_code == 0 => "allow".to_string(),
+            _ => "deny".to_string(),
+        }
+    }
+
+    /// Controller ruling after the final fix wave: under the review marker
+    /// every read stays inside the worktree, whatever the tool; without it,
+    /// reads keep the stage policy.
+    #[test]
+    fn a_pull_request_review_reads_only_its_worktree() {
+        let r = root();
+        let outside = root();
+        std::fs::write(outside.path().join("secret"), "token").unwrap();
+        std::fs::create_dir(r.path().join("src")).unwrap();
+        std::fs::write(r.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::os::unix::fs::symlink(outside.path(), r.path().join("escape")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), r.path().join("link")).unwrap();
+        let root = r.path();
+        let wt = root.display().to_string();
+        let out = outside.path().display().to_string();
+        let codex = |command: &str| json!({"tool_name": "Bash", "tool_input": {"command": format!("cd {wt} && {command}")}});
+        let denied: Vec<String> = [
+            "cat ~/.codex/auth.json".to_string(),
+            "cat /etc/hosts".into(),
+            "cat ../../outside".into(),
+            "grep -r token $HOME".into(),
+            "grep -r token \"$HOME\"".into(),
+            "git -C / log".into(),
+            "cat escape/secret".into(),
+            "cat link".into(),
+            format!("cat {out}/secret"),
+            "cat < /etc/hosts".into(),
+            "cat {/etc/hosts,src/a.rs}".into(),
+            "cat /e*/hosts".into(),
+            "grep -R token .".into(),
+            "grep -rS token .".into(),
+            "rg -L token".into(),
+            "find -L . -name secret".into(),
+            "git diff --no-index /etc/hosts src/a.rs".into(),
+            "git blame --contents=/etc/hosts src/a.rs".into(),
+            "grep -f/etc/hosts src/a.rs".into(),
+            "cat x=~/.ssh/id_rsa".into(),
+            "cat src/a.rs; cd / && cat etc/hosts".into(),
+        ]
+        .into_iter()
+        .filter(|c| decide(true, GuardFormat::Codex, root, &codex(c)) == "allow")
+        .collect();
+        assert!(denied.is_empty(), "allowed but must be denied: {denied:#?}");
+        // Codex runs a command in a directory its hook does not show: a
+        // review command starts in the worktree, or names nothing relative.
+        let bare = |command: &str| json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        for c in [
+            "grep -rn foo src".to_string(),
+            "git log -1".into(),
+            "ls".into(),
+            format!("cd {wt}; cat src/a.rs"),
+            format!("cd {wt} || cat etc/hosts"),
+            format!("cd {wt} && cat src/a.rs || cat etc/hosts"),
+            format!("cd {wt} && cat src/a.rs & cat etc/hosts"),
+            format!("cd {wt}/missing && cat src/a.rs"),
+            format!("cd {wt}/escape && cat secret"),
+        ] {
+            assert_eq!(
+                decide(true, GuardFormat::Codex, root, &bare(&c)),
+                "deny",
+                "{c}"
+            );
+        }
+        let allowed: Vec<String> = [
+            "cat src/a.rs".to_string(),
+            format!("cat {wt}/src/a.rs"),
+            "cat ./src/../src/a.rs".into(),
+            "grep -rn 'foo$' src".into(),
+            "grep -rn foo".into(),
+            "git diff HEAD~1".into(),
+            "git -C src log -1".into(),
+            "head -n 20 src/a.rs | wc -l".into(),
+            "find src -name '*.rs'".into(),
+            "ls".into(),
+        ]
+        .into_iter()
+        .filter(|c| decide(true, GuardFormat::Codex, root, &codex(c)) != "allow")
+        .collect();
+        assert!(
+            allowed.is_empty(),
+            "denied but must be allowed: {allowed:#?}"
+        );
+        // Even an absolute path needs the leading `cd`: the guard does not
+        // tell commands that read their directory from those that do not.
+        let abs = format!("{wt}/src/a.rs");
+        let refused = run_guard_review(
+            GuardFormat::Codex,
+            Some(root),
+            &bare(&format!("cat {abs} | head -5")).to_string(),
+        );
+        assert!(
+            refused
+                .stdout
+                .contains(&format!("start it with `cd {wt} && `")),
+            "{}",
+            refused.stdout
+        );
+        // Claude Code's and Pi's read tools.
+        let cc =
+            |tool: &str, input: Value| json!({"tool_name": tool, "tool_input": input, "cwd": wt});
+        let pi = |tool: &str, args: Value| json!({"tool": tool, "args": args, "cwd": wt});
+        for (format, input) in [
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": "/etc/hosts"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": format!("{out}/secret")})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": "link"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": "../x"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Grep", json!({"pattern": "token", "path": "/"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Glob", json!({"pattern": "/etc/*"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Glob", json!({"pattern": "*", "path": "escape"})),
+            ),
+            (
+                GuardFormat::Pi,
+                pi("read", json!({"path": "~/.ssh/id_rsa"})),
+            ),
+            (GuardFormat::Pi, pi("read", json!({"path": "@/etc/hosts"}))),
+            (
+                GuardFormat::Pi,
+                pi("read", json!({"file_path": "/etc/hosts"})),
+            ),
+            (GuardFormat::Pi, pi("ls", json!({"path": "/"}))),
+            (
+                GuardFormat::Pi,
+                pi("find", json!({"pattern": "*", "path": "escape"})),
+            ),
+            (
+                GuardFormat::Pi,
+                pi("grep", json!({"pattern": "--pre=./x", "path": "src"})),
+            ),
+            (
+                GuardFormat::Pi,
+                pi("find", json!({"pattern": "--exec=./x"})),
+            ),
+        ] {
+            assert_eq!(decide(true, format, root, &input), "deny", "{input}");
+        }
+        for (format, input) in [
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": "src/a.rs"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": abs.clone()})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Grep", json!({"pattern": "fn"})),
+            ),
+            (
+                GuardFormat::ClaudeCode,
+                cc("Glob", json!({"pattern": "src/**/*.rs"})),
+            ),
+            (GuardFormat::Pi, pi("read", json!({"path": "src/a.rs"}))),
+            (
+                GuardFormat::Pi,
+                pi("grep", json!({"pattern": "fn", "path": "src"})),
+            ),
+            (GuardFormat::Pi, pi("find", json!({"pattern": "*.rs"}))),
+            (GuardFormat::Pi, pi("ls", json!({}))),
+        ] {
+            assert_eq!(decide(true, format, root, &input), "allow", "{input}");
+        }
+        // Without the marker (issue tasks' read-only stages) reads are as before.
+        for (format, input) in [
+            (
+                GuardFormat::ClaudeCode,
+                cc("Read", json!({"file_path": "/etc/hosts"})),
+            ),
+            (
+                GuardFormat::Pi,
+                pi("read", json!({"path": "~/.ssh/id_rsa"})),
+            ),
+            (GuardFormat::Codex, bare("cat /etc/hosts")),
+        ] {
+            assert_eq!(decide(false, format, root, &input), "allow", "{input}");
+        }
     }
 
     #[test]

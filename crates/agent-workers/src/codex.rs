@@ -65,6 +65,13 @@ impl CodexWorker {
             // Its empty scratch directory is no git repository, which Codex
             // refuses without this flag; stages run in worktrees.
             push("--skip-git-repo-check");
+        }
+        // A review of a person's pull request has them off too: nothing it
+        // reads leaves through a search query.
+        if matches!(
+            req.tools,
+            ToolProfile::NoTools | ToolProfile::UntrustedReadOnly
+        ) {
             for setting in ["web_search=\"disabled\"", "features.view_image=false"] {
                 push("-c");
                 push(setting);
@@ -385,6 +392,12 @@ mod tests {
         let review = req(ToolProfile::UntrustedReadOnly, true);
         let args = joined(worker().args(&review, "Review"));
         assert!(args.contains("--sandbox read-only"), "{args}");
+        // No web search or image viewer either: nothing read leaves through them.
+        assert!(
+            args.contains("-c web_search=\"disabled\" -c features.view_image=false"),
+            "{args}"
+        );
+        assert!(!args.contains("--skip-git-repo-check"), "{args}");
         let marker = worker()
             .command(&review, "Review")
             .as_std()

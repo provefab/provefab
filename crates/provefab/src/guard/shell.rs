@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Decision;
-use super::paths::check_write;
+use super::paths::{check_read, check_write};
 
 const DENIED_PROGRAMS: [&str; 20] = [
     "curl",
@@ -120,31 +120,132 @@ const REVIEW_GIT: [&str; 9] = [
 ];
 
 /// Long options of the subcommands above that write a file or run a program.
-const REVIEW_GIT_REFUSED: [&str; 3] = ["output", "ext-diff", "open-files-in-pager"];
+const REVIEW_GIT_REFUSED: [&str; 4] = ["output", "ext-diff", "open-files-in-pager", "no-index"];
 
 /// The shell policy for a review of a person's pull request
 /// (`PROVEFAB_UNTRUSTED_REVIEW`): every segment, piped or not, is one of
-/// `REVIEW_PROGRAMS` with no option that runs a program or writes a file,
-/// and no output goes anywhere but `/dev/null`. Command substitution is
-/// refused by `split_segments`, as for every stage.
-pub(super) fn check_review_command(command: &str) -> Decision {
+/// `REVIEW_PROGRAMS` with no option that runs a program, writes a file or
+/// follows symbolic links, no output goes anywhere but `/dev/null`, and every
+/// path it names resolves inside the worktree. `start` is the directory the
+/// command runs in, `None` when the caller cannot know it (Codex): the
+/// command must then begin with `cd <a directory in the worktree> &&`.
+pub(super) fn check_review_command(command: &str, start: Option<PathBuf>, root: &Path) -> Decision {
+    if let Err(why) = unquoted_expansions(command) {
+        return Decision::Deny(why);
+    }
     let segments = match split_segments(command) {
         Ok(s) => s,
         Err(why) => return Decision::Deny(why),
     };
-    for seg in segments {
-        if let Decision::Deny(why) = check_review_segment(&seg.text) {
+    let mut cur = start;
+    let mut moved = false;
+    for (i, seg) in segments.iter().enumerate() {
+        let words = match shell_words::split(&seg.text) {
+            Ok(w) => w,
+            Err(_) => return Decision::Deny(format!("could not parse `{}`", seg.text)),
+        };
+        if words.first().is_some_and(|w| w == "cd") {
+            if i > 0 {
+                return Decision::Deny(
+                    "in a pull request review, `cd` may only start the command".into(),
+                );
+            }
+            match review_cd(&words[1..], cur.as_deref(), root) {
+                Ok(dir) => cur = Some(dir),
+                Err(why) => return Decision::Deny(why),
+            }
+            moved = true;
+            continue;
+        }
+        // After a `cd`, every command must run only if it succeeded, in the
+        // directory it moved to: no `;`, `||`, `&` or newline, which would
+        // run the rest after a failed `cd` or in another shell.
+        if moved && !matches!(seg.sep.as_str(), "&&" | "|" | "|&") {
+            return Decision::Deny(format!(
+                "after `cd`, a pull request review joins commands with `&&` or `|` only, not `{}`",
+                seg.sep.escape_debug()
+            ));
+        }
+        let Some(dir) = cur.as_deref() else {
+            return Decision::Deny(format!(
+                "the guard cannot see where this command runs: start it with `cd {} && `",
+                root.display()
+            ));
+        };
+        if let Decision::Deny(why) = check_review_segment(&words, dir, root) {
             return Decision::Deny(why);
         }
     }
     Decision::Allow
 }
 
-fn check_review_segment(text: &str) -> Decision {
-    let Ok(words) = shell_words::split(text) else {
-        return Decision::Deny(format!("could not parse `{text}`"));
+/// Refuses what the shell would expand before the program sees it: `$`
+/// outside single quotes, and outside any quotes `~` at the start of a word
+/// or after `=` or `:`, braces, globs and input redirects (`<`).
+fn unquoted_expansions(command: &str) -> Result<(), String> {
+    let chars: Vec<char> = command.chars().collect();
+    let (mut single, mut double) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        if c == '\\' && !single {
+            i += 2;
+            continue;
+        }
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '$' if !single => {
+                return Err("a pull request review refuses `$` expansions in a command".into());
+            }
+            '~' if !single
+                && !double
+                && prev.is_none_or(|p| p.is_whitespace() || "=:;|&(".contains(p)) =>
+            {
+                return Err("a pull request review refuses `~` in a command".into());
+            }
+            '{' | '}' | '*' | '?' | '[' | '<' if !single && !double => {
+                return Err(format!(
+                    "a pull request review refuses an unquoted `{c}` (expansion or redirect)"
+                ));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// A leading `cd`: one operand, no option, an existing directory inside the worktree.
+fn review_cd(args: &[String], cur: Option<&Path>, root: &Path) -> Result<PathBuf, String> {
+    let [target] = args else {
+        return Err("in a pull request review, `cd` takes one directory and no option".into());
     };
-    let (argv, targets) = split_redirects(&words);
+    if target.starts_with('-') {
+        return Err("in a pull request review, `cd` takes no option".into());
+    }
+    let t = Path::new(target);
+    let joined = match cur {
+        _ if t.is_absolute() => t.to_path_buf(),
+        Some(c) => c.join(t),
+        None => {
+            return Err(format!(
+                "`cd {target}`: the guard cannot see where this command runs, so `cd` needs an absolute path"
+            ));
+        }
+    };
+    if let Decision::Deny(why) = check_read(&joined, &joined, root) {
+        return Err(format!("`cd` {why}"));
+    }
+    match joined.canonicalize() {
+        Ok(dir) if dir.is_dir() => Ok(dir),
+        _ => Err(format!("`cd {target}`: not a directory")),
+    }
+}
+
+fn check_review_segment(words: &[String], cwd: &Path, root: &Path) -> Decision {
+    let (argv, targets) = split_redirects(words);
     if let Some(t) = targets.iter().find(|t| *t != "/dev/null") {
         return Decision::Deny(format!(
             "a pull request review writes no file, so the redirect to {t} is refused"
@@ -161,15 +262,26 @@ fn check_review_segment(text: &str) -> Decision {
     }
     let args = &argv[1..];
     let refused = |a: &String| -> bool {
+        let short = |letter: char| short_flags(a).is_some_and(|f| f.contains(letter));
         match program.as_str() {
             "find" => {
                 matches!(
                     a.as_str(),
-                    "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls"
+                    "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls" | "-follow"
                 ) || a.starts_with("-fprint")
+                    || a == "-L"
+                    || a == "-H"
             }
             // `--pre` and `--hostname-bin` run a program of the caller's choice.
-            "rg" => a.starts_with("--pre") || a.starts_with("--hostname-bin"),
+            "rg" => {
+                a.starts_with("--pre")
+                    || a.starts_with("--hostname-bin")
+                    || a == "--follow"
+                    || short('L')
+            }
+            // GNU `-R` and BSD `-S` follow every symbolic link while recursing.
+            "grep" => a.starts_with("--dereference-recursive") || short('R') || short('S'),
+            "ls" => short('L') || a == "--dereference",
             _ => false,
         }
     };
@@ -179,26 +291,85 @@ fn check_review_segment(text: &str) -> Decision {
         ));
     }
     if program == "git" {
-        return check_review_git(args);
+        return check_review_git(args, cwd, root);
+    }
+    check_review_paths(program, args, cwd, root)
+}
+
+/// Every operand, option value and attached path is read relative to `cwd`
+/// and must stay in the worktree. A `grep` or `rg` pattern is not a path.
+fn check_review_paths(program: &str, args: &[String], cwd: &Path, root: &Path) -> Decision {
+    let searches = program == "grep" || program == "rg";
+    let explicit = args.iter().any(|a| {
+        matches!(a.as_str(), "-e" | "-f" | "--regexp" | "--file")
+            || a.starts_with("--regexp=")
+            || a.starts_with("--file=")
+    });
+    let mut pattern_left = searches && !explicit;
+    let mut skip_next = false;
+    let mut operands_only = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let path = if operands_only || !a.starts_with('-') || a == "-" {
+            if a == "-" {
+                continue;
+            }
+            if pattern_left {
+                pattern_left = false;
+                continue;
+            }
+            a.as_str()
+        } else if a == "--" {
+            operands_only = true;
+            continue;
+        } else if searches && matches!(a.as_str(), "-e" | "--regexp") {
+            skip_next = true;
+            continue;
+        } else if let Some((_, value)) = a.split_once('=') {
+            value
+        } else if let Some(at) = a.find('/') {
+            // A short option with a path attached, such as `-f/etc/x`.
+            &a[at..]
+        } else {
+            continue;
+        };
+        if let Decision::Deny(why) = check_read(Path::new(path), cwd, root) {
+            return Decision::Deny(format!("`{program}` reads {why}"));
+        }
     }
     Decision::Allow
 }
 
-/// `git -C <dir>` and `--no-pager` may precede the subcommand; any other
-/// global option (`-c`, `--exec-path`, `--git-dir`, ...) is refused.
-fn check_review_git(args: &[String]) -> Decision {
+/// `git -C <dir in the worktree>` and `--no-pager` may precede the
+/// subcommand; any other global option (`-c`, `--exec-path`, `--git-dir`,
+/// `--work-tree`, ...) is refused.
+fn check_review_git(args: &[String], cwd: &Path, root: &Path) -> Decision {
+    let mut dir = cwd.to_path_buf();
     let mut i = 0;
     while let Some(a) = args.get(i) {
         match a.as_str() {
-            "-C" => i += 2,
+            "-C" => {
+                let target = args.get(i + 1).map(String::as_str).unwrap_or("");
+                let joined = dir.join(target);
+                if let Decision::Deny(why) = check_read(&joined, &dir, root) {
+                    return Decision::Deny(format!("`git -C` {why}"));
+                }
+                dir = joined;
+                i += 2;
+            }
             "--no-pager" | "-P" => i += 1,
             s if s.starts_with('-') => {
                 return Decision::Deny(format!("`git {s}` is refused in a pull request review"));
             }
             sub if REVIEW_GIT.contains(&sub) => {
+                let rest = &args[i + 1..];
                 // `--output` writes a file; `--ext-diff` and `grep -O` run a
-                // program. Git takes any unambiguous prefix of a long option.
-                let refused = args[i + 1..].iter().find(|a| {
+                // program; `--no-index` reads outside the repository. Git
+                // takes any unambiguous prefix of a long option.
+                let refused = rest.iter().find(|a| {
                     let long = a
                         .strip_prefix("--")
                         .map(|l| l.split('=').next().unwrap_or_default())
@@ -209,12 +380,12 @@ fn check_review_git(args: &[String]) -> Decision {
                             .any(|r| r.starts_with(l) || l.starts_with(r))
                     }) || (sub == "grep" && short_flags(a).is_some_and(|f| f.contains('O')))
                 });
-                return match refused {
-                    Some(a) => Decision::Deny(format!(
+                if let Some(a) = refused {
+                    return Decision::Deny(format!(
                         "`git {sub} {a}` is refused in a pull request review"
-                    )),
-                    None => Decision::Allow,
-                };
+                    ));
+                }
+                return check_review_paths("git", rest, &dir, root);
             }
             sub => {
                 return Decision::Deny(format!(
@@ -232,6 +403,8 @@ struct Segment {
     text: String,
     /// Receives another command's output through `|`.
     piped: bool,
+    /// The separator before it (`&&`, `||`, `|`, `;`, `&`, a newline), empty for the first.
+    sep: String,
 }
 
 /// Splits on `;`, `&`, `&&`, `|`, `||` and newlines outside quotes. Rejects
@@ -241,6 +414,7 @@ fn split_segments(command: &str) -> Result<Vec<Segment>, String> {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let mut cur_piped = false;
+    let mut sep = String::new();
     let (mut single, mut double) = (false, false);
     let mut i = 0;
     while i < chars.len() {
@@ -279,9 +453,11 @@ fn split_segments(command: &str) -> Result<Vec<Segment>, String> {
                     segments.push(Segment {
                         text: text.to_string(),
                         piped: cur_piped,
+                        sep: std::mem::take(&mut sep),
                     });
                     cur_piped = is_pipe;
                 }
+                sep.push(c);
                 cur.clear();
                 i += 1;
                 continue;
@@ -299,6 +475,7 @@ fn split_segments(command: &str) -> Result<Vec<Segment>, String> {
         segments.push(Segment {
             text: text.to_string(),
             piped: cur_piped,
+            sep,
         });
     }
     Ok(segments)
@@ -926,6 +1103,12 @@ mod tests {
     /// runs; only read-only programs, piped into each other.
     #[test]
     fn a_pull_request_review_runs_only_read_only_commands() {
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::create_dir(wt.path().join("src")).unwrap();
+        std::fs::write(wt.path().join("src/a.rs"), "fn a() {}").unwrap();
+        let root = wt.path();
+        let check_review_command =
+            |c: &str| check_review_command(c, Some(root.to_path_buf()), root);
         let leaked: Vec<&str> = [
             "python3 tools/check.py",
             "bash -c 'cat x'",
@@ -975,7 +1158,8 @@ mod tests {
             "ls; python3 x.py",
             "cat a && cargo build",
             "sed -n 1p a",
-            "cd src",
+            "ls && cd src",
+            "cd / && cat etc/hosts",
         ]
         .into_iter()
         .filter(|c| check_review_command(c) == Decision::Allow)

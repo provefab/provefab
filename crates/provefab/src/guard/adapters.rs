@@ -1,6 +1,6 @@
 //! Maps each worker's tool-call format onto `ToolCall`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -8,6 +8,38 @@ use super::ToolCall;
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// A read tool's paths: each key present, or the default directory `.`.
+fn read(args: &Value, keys: &[&str], default_dir: bool, pattern: Option<&str>) -> ToolCall {
+    let mut paths: Vec<PathBuf> = keys
+        .iter()
+        .filter_map(|k| str_arg(args, k))
+        .map(PathBuf::from)
+        .collect();
+    if paths.is_empty() && default_dir {
+        paths.push(PathBuf::from("."));
+    }
+    ToolCall::Read {
+        paths,
+        pattern_is_option: pattern
+            .and_then(|k| str_arg(args, k))
+            .is_some_and(|p| p.starts_with('-')),
+    }
+}
+
+/// The directories a glob pattern starts from: its leading components
+/// without a wildcard (`/etc/*` reads `/etc`), under `base`.
+fn glob_base(base: &str, pattern: &str) -> PathBuf {
+    let fixed: PathBuf = Path::new(pattern)
+        .components()
+        .take_while(|c| {
+            !c.as_os_str()
+                .to_string_lossy()
+                .contains(['*', '?', '[', '{'])
+        })
+        .collect();
+    Path::new(base).join(fixed)
 }
 
 fn malformed(tool: &str, key: &str) -> ToolCall {
@@ -27,6 +59,10 @@ pub fn from_pi(tool: &str, args: &Value) -> ToolCall {
                 path: PathBuf::from(p),
             })
             .unwrap_or_else(|| malformed(tool, "path")),
+        "read" => read(args, &["path", "file_path"], false, None),
+        "grep" => read(args, &["path"], true, Some("pattern")),
+        "find" => read(args, &["path"], true, Some("pattern")),
+        "ls" => read(args, &["path"], true, None),
         // Pi's Windows shell tool: never expected on macOS, and the shell policy only parses sh.
         "powershell" => ToolCall::Blocked {
             reason: "`powershell` is disabled in provefab workers".into(),
@@ -52,6 +88,16 @@ pub fn from_claude_code(tool: &str, input: &Value) -> ToolCall {
             .unwrap_or_else(|| malformed(tool, "command")),
         "Edit" | "Write" | "MultiEdit" => write("file_path"),
         "NotebookEdit" => write("notebook_path"),
+        "Read" => read(input, &["file_path"], false, None),
+        "Grep" => read(input, &["path"], true, None),
+        "Glob" => {
+            let base = str_arg(input, "path").unwrap_or_else(|| ".".into());
+            let pattern = str_arg(input, "pattern").unwrap_or_default();
+            ToolCall::Read {
+                paths: vec![PathBuf::from(&base), glob_base(&base, &pattern)],
+                pattern_is_option: false,
+            }
+        }
         "WebFetch" | "WebSearch" => ToolCall::Blocked {
             reason: format!("`{tool}` is disabled in provefab workers"),
         },
@@ -151,8 +197,16 @@ mod tests {
         );
         assert_eq!(
             from_pi("read", &json!({"path": "a.rs"})),
-            ToolCall::Other {
-                name: "read".into()
+            ToolCall::Read {
+                paths: vec!["a.rs".into()],
+                pattern_is_option: false
+            }
+        );
+        assert_eq!(
+            from_pi("grep", &json!({"pattern": "-x"})),
+            ToolCall::Read {
+                paths: vec![".".into()],
+                pattern_is_option: true
             }
         );
         assert!(matches!(
@@ -189,8 +243,22 @@ mod tests {
         ));
         assert_eq!(
             from_claude_code("Grep", &json!({})),
+            ToolCall::Read {
+                paths: vec![".".into()],
+                pattern_is_option: false
+            }
+        );
+        assert_eq!(
+            from_claude_code("Glob", &json!({"pattern": "/etc/**/*.conf", "path": "src"})),
+            ToolCall::Read {
+                paths: vec!["src".into(), "/etc".into()],
+                pattern_is_option: false
+            }
+        );
+        assert_eq!(
+            from_claude_code("TodoWrite", &json!({})),
             ToolCall::Other {
-                name: "Grep".into()
+                name: "TodoWrite".into()
             }
         );
     }

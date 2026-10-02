@@ -54,6 +54,41 @@ pub(super) fn check_write(path: &Path, cwd: &Path, root: &Path) -> Decision {
     Decision::Allow
 }
 
+/// A read in a review of a person's pull request (`PROVEFAB_UNTRUSTED_REVIEW`):
+/// the path must resolve inside the worktree, symbolic links followed.
+/// `~`, `$` and Pi's `@` prefix are refused rather than guessed at; `..` is
+/// allowed only when the whole path exists, so the OS resolves it.
+pub(super) fn check_read(path: &Path, cwd: &Path, root: &Path) -> Decision {
+    let raw = path.to_string_lossy();
+    if raw.starts_with('~') || raw.starts_with('@') || raw.contains('$') {
+        return deny(path, "paths using `~`, `@` or variables are refused");
+    }
+    let Ok(root) = root.canonicalize() else {
+        return deny(path, "the worktree root does not exist");
+    };
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let resolved = if joined.components().any(|c| c == Component::ParentDir) {
+        joined.canonicalize().ok()
+    } else {
+        resolve_existing_prefix(&joined)
+    };
+    let Some(resolved) = resolved else {
+        return deny(path, "path cannot be resolved");
+    };
+    if resolved.starts_with(&root) {
+        Decision::Allow
+    } else {
+        deny(
+            path,
+            "a pull request review reads nothing outside the worktree",
+        )
+    }
+}
+
 /// Canonicalises the longest existing ancestor (following symlinks), then
 /// re-appends the components that do not exist yet.
 fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {

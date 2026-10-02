@@ -29,6 +29,16 @@ pub enum ToolCall {
     Blocked {
         reason: String,
     },
+    /// A read or search tool (Claude Code's Read, Grep, Glob; Pi's read,
+    /// grep, find, ls) and the paths it reads, its default directory included.
+    /// Allowed for every stage; a review of a person's pull request keeps it
+    /// inside the worktree.
+    Read {
+        paths: Vec<PathBuf>,
+        /// A search pattern starting with `-`, which Pi passes to `rg` or
+        /// `fd` where an option goes.
+        pattern_is_option: bool,
+    },
     /// Read-only and other harmless tools.
     Other {
         name: String,
@@ -56,18 +66,31 @@ pub fn check(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
             .find(|d| *d != Decision::Allow)
             .unwrap_or(Decision::Allow),
         ToolCall::Blocked { reason } => Decision::Deny(reason.clone()),
-        ToolCall::Other { .. } => Decision::Allow,
+        ToolCall::Read { .. } | ToolCall::Other { .. } => Decision::Allow,
     }
 }
 
 /// `check` for a review of a person's pull request (`PROVEFAB_UNTRUSTED_REVIEW`,
-/// final review I1): no file is written and the shell runs only read-only
-/// programs, so nothing the pull request wrote runs during its review.
-pub fn check_review(call: &ToolCall) -> Decision {
+/// final review I1): no file is written, the shell runs only read-only
+/// programs, so nothing the pull request wrote runs during its review, and
+/// every read stays inside the worktree.
+pub fn check_review(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
     match call {
-        ToolCall::Shell { command } | ToolCall::ShellUnknownCwd { command } => {
-            shell::check_review_command(command)
+        ToolCall::Shell { command } => {
+            shell::check_review_command(command, Some(cwd.to_path_buf()), root)
         }
+        ToolCall::ShellUnknownCwd { command } => shell::check_review_command(command, None, root),
+        ToolCall::Read {
+            pattern_is_option: true,
+            ..
+        } => Decision::Deny(
+            "a search pattern starting with `-` is refused in a pull request review".into(),
+        ),
+        ToolCall::Read { paths, .. } => paths
+            .iter()
+            .map(|p| paths::check_read(p, cwd, root))
+            .find(|d| *d != Decision::Allow)
+            .unwrap_or(Decision::Allow),
         ToolCall::Write { .. } | ToolCall::Patch { .. } => {
             Decision::Deny("a pull request review writes no file".into())
         }

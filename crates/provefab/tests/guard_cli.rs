@@ -87,7 +87,7 @@ fn the_review_marker_refuses_running_the_pull_requests_code() {
     let out = guard_with(
         "codex",
         Some(root.path()),
-        &call("git diff HEAD~1"),
+        &call(&format!("cd {} && git diff HEAD~1", root.path().display())),
         &marker,
     );
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
