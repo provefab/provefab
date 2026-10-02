@@ -1,6 +1,6 @@
 # Set up Provefab with a coding agent
 
-This page is for a coding agent, such as Claude Code or Codex, that a person asked to set up Provefab on the repository they are in. The agent writes and checks Provefab's configuration with three commands that need no editor. The person keeps the installation, the sign-ins, the keys and the service, and runs those commands themselves.
+This page is for a coding agent, such as Claude Code or Codex, that a person asked to set up Provefab on the repository they are in. The agent writes and checks Provefab's configuration with Provefab commands that need no editor (`provefab init`, `provefab repos add`, `provefab doctor --json`). The person keeps the installation, the sign-ins, the keys and the service, and runs those commands themselves.
 
 ## Rules
 
@@ -26,14 +26,14 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
    - Exit code 1: report the error, and stop.
 
 3. **Add the repository the person is in.**
-   1. Run `git remote get-url origin`. Take `<owner/name>` from it: the two parts after `github.com/` or `github.com:`, without a trailing `.git`. The URL can hold a token before an `@`: never repeat the URL, only `<owner/name>`. When the URL is not on `github.com`, tell the person that Provefab works with GitHub repositories, and go to step 4.
+   1. In the clone, run `gh repo view --json nameWithOwner -q .nameWithOwner`. It prints `<owner/name>` and no URL (do not print the remote's URL yourself: it can hold a token). When it fails because the clone is not on GitHub, tell the person that Provefab works with GitHub repositories, and go to step 4. When it fails because `gh` is not signed in, ask the person to run `gh auth login` in their own terminal, then run this step again. On any other failure, report its error and go to step 4.
    2. Run, with that `<owner/name>`:
 
       ```bash
       provefab repos add <owner/name> --path "$(git rev-parse --show-toplevel)"
       ```
 
-   - Exit code 0: one `[[repos]]` block was added at the end of the file, with the repository's default branch as `base` and the checks detected from the files at its root as `gates`. The output names both. Keep them for the summary. When the output has a line starting with `note:`, show it to the person, and change `gates` only if they ask you to.
+   - Exit code 0: one `[[repos]]` block was added at the end of the file, with the repository's default branch as `base` and the checks detected from the files at its root as `gates`. The output names both. Keep them for the summary. It also says that Provefab keeps its own clone in its directory (`set local_path by hand to use yours`): Provefab works in that clone, not in the person's, which `--path` only read. Tell the person, and that they can set `local_path` in the block by hand to use theirs. When the output has a line starting with `note:`, show it to the person, and change `gates` only if they ask you to.
    - Exit code 3: the repository is already configured. Go to step 4.
    - Exit code 4: the repository was not recognised: no Rust, Node, Python or Go project at its root, several of them, or a `package.json` without a `lint`, `typecheck` or `test` script. Report the error, tell the person that its `[[repos]]` block is written by hand (see the [configuration guide](configuration.md)), and go to step 4.
    - Exit code 2: report the error. It names the cause: `<owner/name>` is not in that form; there is no configuration yet (go back to step 2); the directory is not a git clone, or its `origin` is not that repository (check `<owner/name>`); the default branch or one of its files cannot be read from the clone (ask the person to run `git fetch origin` in the clone, then run this step again).
@@ -41,16 +41,19 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
    - Exit code 1: the file does not load, or cannot be read or written. Report the error, and go to step 4.
 
 4. **Check everything:** run `provefab doctor --json`. It prints one JSON object per line: `name`, `ok`, `detail`, and `fix` when a command fixes the problem.
-   - For each line with `"ok": false` and a `fix`, show the person the `fix` command to run in their own terminal. Do not run it yourself: these commands sign in or store a key. The one exception is `provefab init`, the `fix` of a missing configuration: run step 2.
+   - For the lines with `"ok": false` and a `fix`, show the person each distinct `fix` command once, in the order of the lines, to run in their own terminal. Several lines can share one `fix`: `provefab login codex` signs Codex in and also sets up the `codex guard hook` (the hook Provefab installs in its own Codex directory). Do not run a `fix` yourself: these commands sign in or store a key. The one exception is `provefab init`, the `fix` of a missing configuration: run step 2.
    - For each line with `"ok": false` and no `fix`, show the person its `name` and `detail`. A missing tool (`git`, `gh`, `claude`, `codex`) is theirs to install.
-   - Lines named `warning` have `"ok": true`: show their `detail`, they need no command.
+   - Lines with `"ok": true` need nothing: they report what was found (tools and versions, gates, rules, prices, the repository's risk policy, and so on).
+   - Show the person the `detail` of every line whose `detail` contains the word "warning" in any case, on `"ok": true` lines too, and of every line named `warning`. They need no command.
+   - The `codex` lines appear only when the catalog has a Codex model: `provefab init` adds one when `codex` is on `PATH`. A person who does not want Codex can delete that model's `[[models]]` block (the one with `worker = "codex"`) from `provefab.toml` by hand, or ask you to, then run `provefab doctor --json` again.
    - The `jev key` line is optional: without a TypeSafe key, Provefab runs with cautious defaults, and the exit code ignores that line.
    - Exit code 0: every other check passed. Exit code 1: at least one failed.
    - When the person says they ran the commands, run `provefab doctor --json` again, and repeat this step. Stop when the exit code is 0, or when the person does not want to go on.
 
 5. **End with a short summary for the person:**
-   - what is configured: the file's path, the models, the repository with its `base` and `gates` (or why it was not added);
-   - the commands left for them, to run in their own terminal: each `fix` that still fails, `provefab run --dry-run` to preview how the open issues would be handled, `provefab service install --workers 1` to start the service, and the `provefab` label on an issue when they want Provefab to work on it.
+   - what is configured: the file's path, the models, the repository with its `base` and `gates` (or why it was not added), and that Provefab keeps its own clone;
+   - the commands left for them, to run in their own terminal: each distinct `fix` that still fails, `provefab run --dry-run` to preview how the open issues would be handled, `provefab service install --workers 1` to start the service, and the `provefab` label on an issue when they want Provefab to work on it;
+   - when `doctor` still fails, what that means: at startup, Provefab drops each model whose worker (`claude`, `codex`) fails its `doctor` lines, and stops when no model is left; Provefab reads issues and opens pull requests through `gh`, so the `gh login` line has to pass first.
 
 ## Exit codes
 
