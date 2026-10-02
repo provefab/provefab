@@ -522,6 +522,16 @@ mod tests {
         assert_eq!(stop_reason("c2", &mut seen, 3, 3), Some("page cap"));
     }
 
+    #[test]
+    fn docs_name_both_stop_reasons() {
+        let guide = include_str!("../../../docs/guide/trackers.md");
+        let readme = include_str!("../../../README.md");
+        for reason in ["page cap", "repeated cursor"] {
+            assert!(guide.contains(&format!("({reason})")), "guide: {reason}");
+            assert!(readme.contains(reason), "readme: {reason}");
+        }
+    }
+
     fn linear(server: &MockServer) -> Linear {
         Linear::new(&server.uri(), "ENG", KEY.into())
     }

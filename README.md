@@ -90,7 +90,7 @@ Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in commen
 - [Configuration](docs/guide/configuration.md): every field of `provefab.toml`, with its default.
 - [Usage](docs/guide/usage.md): writing issues that land, answering Provefab, restarting, reading states.
 - [Repository rules](docs/guide/rules.md): conventions in `.provefab/rules.md`, given to every stage and checked by the reviewer.
-- [Jira and Linear](docs/guide/trackers.md) (beta): issues from a Jira Cloud project or a Linear team, pull requests on GitHub.
+- [Jira and Linear](docs/guide/trackers.md) (beta): issues from a Jira Cloud project or a Linear team, pull requests on GitHub. When Linear paging stops early, the log says why (`page cap` or `repeated cursor`).
 - [Operations](docs/guide/operations.md): the service, logs, budgets, troubleshooting.
 - [Security](docs/guide/security.md): what agents can and cannot do, and who can trigger Provefab.
 
