@@ -532,6 +532,23 @@ mod tests {
         }
     }
 
+    /// The docs quote the message as the code builds it, with `N` for the
+    /// page count: a reason named elsewhere in the text is not enough.
+    #[test]
+    fn docs_quote_the_stop_message() {
+        let guide = include_str!("../../../docs/guide/trackers.md");
+        let readme = include_str!("../../../README.md");
+        for reason in ["page cap", "repeated cursor"] {
+            let line = stop_message("issues", 7, reason).replace("after 7 pages", "after N pages");
+            let quoted = format!("`{line}`");
+            assert!(guide.contains(&quoted), "guide: {quoted}");
+            assert!(readme.contains(&quoted), "readme: {quoted}");
+        }
+        let comments = stop_message("comments", 7, "page cap");
+        let prefix = comments.split("stopped").next().unwrap().trim_end();
+        assert!(guide.contains(&format!("`{prefix}`")), "guide: {prefix}");
+    }
+
     fn linear(server: &MockServer) -> Linear {
         Linear::new(&server.uri(), "ENG", KEY.into())
     }

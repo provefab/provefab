@@ -52,7 +52,7 @@ Put the repository's `label` (`provefab` by default) on a ticket. Provefab polls
 
 - Jira labels are free text: nothing is created. A Jira label cannot contain a space, so the repository's `label` cannot either.
 - Linear labels are created on the team at startup, with their colour, when none of that name exists in the team or the workspace.
-- When listing Linear issues stops early, the log line says why: `linear issues: stopped after N pages (page cap)` when the page limit is reached, or `(repeated cursor)` when the server returns a cursor already seen.
+- When listing Linear issues stops early, the log line says why: `linear issues: stopped after N pages (page cap)` when the page limit is reached, or `linear issues: stopped after N pages (repeated cursor)` when the server returns a cursor already seen. The line starts with `linear comments:` when it is a ticket's comments that stop early.
 - Provefab adds and removes only its own labels. A label a person adds to the ticket at the same moment is kept.
 
 ## What Provefab writes
