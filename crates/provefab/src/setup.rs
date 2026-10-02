@@ -1471,4 +1471,29 @@ mod tests {
             "{bad:?}"
         );
     }
+
+    /// A configuration error that quotes a secret is redacted in its JSON line.
+    #[test]
+    fn the_configuration_line_redacts_a_secret() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        std::fs::write(paths.config(), "[x").unwrap();
+        let e =
+            anyhow::anyhow!("provefab.toml: bad token ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+        let check = config_check(&paths, &e);
+        let out = doctor_json(&[check], None);
+        assert!(!out.contains("ghp_"), "{out}");
+        let line: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(line["detail"], "provefab.toml: bad token <redacted>");
+    }
+
+    /// A multi-line detail stays on one JSON line.
+    #[test]
+    fn a_multi_line_detail_stays_on_one_json_line() {
+        let out = doctor_json(&[failed("git", "first\nsecond\nthird")], None);
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.ends_with('\n') && !out.trim_end().contains('\n'));
+        let line: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(line["detail"], "first\nsecond\nthird");
+    }
 }
