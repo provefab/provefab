@@ -21,10 +21,10 @@ Return `ApiError` from handlers; `anyhow` stays in the CLI.
 - A rule starts with a level-2 heading `## R<number>: <summary>`. The number is a positive integer without leading zeros, unique in the file. Gaps are fine. **Never reuse a number**: earlier findings cite rules by number.
 - `paths:` (optional) limits the rule to some files, as comma-separated patterns: `/`-separated from the repository root, `**` for any number of directories, `*` for any characters inside one name, everything else literal. They are the risk policy's patterns (see [Configuration](configuration.md#reposrisk-risk-aware-policy)).
 - `sources:` (optional) is free text for people: where the rule comes from. Provefab never reads it.
-- Then the rule's text, in Markdown, until the next `## ` heading. Use `###` headings inside a rule if you need them. After the first rule, every line that starts with `## ` is a rule heading, and a line that starts with `paths:` or `sources:` after the text has begun is an error, even inside a fenced code block: Provefab does not track code fences. Indent such a line, or rephrase it.
+- Then the rule's text, in Markdown, until the next `## ` heading. Use `###` headings inside a rule if you need them. After the first rule, every line that starts with `## ` is a rule heading, and a line that starts with `paths:` or `sources:` after the text has begun is an error. Inside a fenced code block (three or more backticks or tildes, closed by the same character at least as long) these lines are rule text, so a rule can show a Markdown or YAML example. A fence that is never closed makes the file invalid.
 - Limits: 100 rules, 120 characters per summary, 2000 characters per rule text.
 
-**An invalid file never stops a task.** A malformed heading, a number used twice, an invalid pattern, a limit exceeded or a `paths:` or `sources:` line out of place makes the whole file invalid: the task runs without rules, its log shows `rules_invalid` with the reason, and `provefab doctor` prints it. No file means no rules, and nothing changes (no message, no log line).
+**An invalid file never stops a task.** A malformed heading, a number used twice, an invalid pattern, a limit exceeded, a code fence never closed or a `paths:` or `sources:` line out of place makes the whole file invalid: the task runs without rules, its log shows `rules_invalid` with the reason, and `provefab doctor` prints it. No file means no rules, and nothing changes (no message, no log line).
 
 ## Which rules each stage gets
 
