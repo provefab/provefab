@@ -654,11 +654,7 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
                 (file, None) if !file.is_empty() => file.clone(),
                 _ => "-".to_string(),
             };
-            let rule = f
-                .rule
-                .as_deref()
-                .map(|r| format!("{r} · "))
-                .unwrap_or_default();
+            let rule = crate::rules::prefix(f.rule.as_deref());
             let _ = writeln!(
                 out,
                 "  {} · {rule}{} · {place} · round {} · {}",
@@ -836,6 +832,17 @@ pub async fn prune(store: &Store, before: &str, yes: bool) -> Result<String, Com
 /// process holds it.
 pub fn lock_run(paths: &Paths) -> std::io::Result<Option<File>> {
     lock(&paths.home.join("run.lock"))
+}
+
+/// What `provefab run` says when another process holds the run lock.
+pub const QUEUE_LOCK_HELD: &str = "another Provefab process holds the queue lock (`provefab run` or a command that needs the queue); it exits when that process ends";
+
+/// `lock_run`, with the error to show when another process holds the lock.
+pub fn lock_run_or_explain(paths: &Paths) -> anyhow::Result<File> {
+    match lock_run(paths)? {
+        Some(file) => Ok(file),
+        None => anyhow::bail!(QUEUE_LOCK_HELD),
+    }
 }
 
 /// One process drives the queue at a time: a second `provefab run` would race
@@ -1497,6 +1504,17 @@ mod tests {
         assert!(held.is_some());
         assert!(lock(&dir.path().join("run.lock")).unwrap().is_none());
         assert!(lock_run(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn queue_lock_message_names_any_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let _held = lock_run(&paths).unwrap().unwrap();
+        let err = lock_run_or_explain(&paths).unwrap_err().to_string();
+        assert_eq!(err, QUEUE_LOCK_HELD);
+        assert!(err.contains("another Provefab process holds the queue lock"));
+        assert!(!err.contains("already working"));
     }
 
     fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {

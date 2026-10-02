@@ -33,7 +33,7 @@ Return `ApiError` from handlers; `anyhow` stays in the CLI.
 - Validation errors (malformed heading, duplicate number, invalid pattern, a limit exceeded, a `paths:` or `sources:` line out of place) make the whole file invalid. An invalid file never stops a task: the task runs without rules, the task's log records `rules_invalid` with the reason, and `provefab doctor` prints it.
 - A missing file means no rules (no message).
 - Format details (amended 2026-10-01 in the plan): blank lines between a heading and its `paths:` or `sources:` lines are allowed, and the blank line before the text is optional; in the introduction a `## ` heading is ignored unless it starts with `## R` and a digit (a malformed rule heading there is an error); after the first rule, every `## ` line is a rule heading; `R0` and leading zeros are malformed; `paths:` values are split on commas and trimmed; Windows line endings and a byte order mark read like plain text. `RulesError` never quotes the file (line numbers, rule numbers and pattern positions only).
-- (amended 2026-10-01 during implementation): a `## ` or `paths:` line inside a fenced code block in a rule text is not special-cased (there is no fence tracking): it is read as a heading or a misplaced key, and makes the file invalid.
+- (amended 2026-10-01 during implementation): fenced code blocks in a rule are tracked (an opening fence of 3 or more backticks or tildes, closed by the same character at least as long): a `## ` or `paths:` line inside one is rule text. A fence still open at the end of the file makes the file invalid (`UnclosedFence`, naming the opening line). The introduction is not tracked.
 
 ## 4. Reading
 

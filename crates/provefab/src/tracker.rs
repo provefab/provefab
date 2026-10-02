@@ -179,13 +179,30 @@ async fn security_out(security: &Path, args: &[&str], with_stderr: bool) -> Opti
 }
 
 /// The item comment in a `security find-generic-password` listing:
-/// `    "icmt"<blob>="bot@acme.test"`.
+/// `    "icmt"<blob>="bot@acme.test"`. A non-ASCII comment is printed as hex
+/// followed by a quoted rendering, `0x6A6F73C3A9  "jos\303\251"`; the hex
+/// digits are decoded as UTF-8.
 fn keychain_comment(listing: &str) -> Option<String> {
     listing.lines().find_map(|l| {
         let v = l.trim().strip_prefix("\"icmt\"<blob>=")?;
+        if let Some(rest) = v.strip_prefix("0x") {
+            let digits = rest.split_whitespace().next().unwrap_or("");
+            return decode_hex_utf8(digits).filter(|s| !s.is_empty());
+        }
         let v = v.strip_prefix('"')?.strip_suffix('"')?;
         (!v.is_empty()).then(|| v.to_string())
     })
+}
+
+fn decode_hex_utf8(digits: &str) -> Option<String> {
+    if !digits.len().is_multiple_of(2) || !digits.is_ascii() {
+        return None;
+    }
+    let bytes = (0..digits.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Jira credentials for `site`: `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN`,
@@ -862,6 +879,48 @@ esac"#;
             err.contains("provefab login jira --site other.atlassian.net"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn keychain_comment_decodes_hex_utf8() {
+        let hex = |h: &str| format!("    \"icmt\"<blob>=0x{h}  \"jos\\303\\251@acme.test\"");
+        assert_eq!(
+            keychain_comment(&hex("6A6F73C3A94061636D652E74657374")).as_deref(),
+            Some("josé@acme.test")
+        );
+        assert_eq!(
+            keychain_comment(&hex("6a6f73c3a94061636d652e74657374")).as_deref(),
+            Some("josé@acme.test")
+        );
+        // Odd length, invalid UTF-8, no digits.
+        assert_eq!(keychain_comment(&hex("6A6F7")), None);
+        assert_eq!(keychain_comment(&hex("C328")), None);
+        assert_eq!(keychain_comment(&hex("")), None);
+        assert_eq!(keychain_comment("    \"icmt\"<blob>=<NULL>"), None);
+    }
+
+    #[tokio::test]
+    async fn jira_email_in_hex_form_is_decoded_without_leaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"case "$*" in
+  *"-s provefab-jira -a acme.atlassian.net -w") echo "kc-token" ;;
+  *"-s provefab-jira -a acme.atlassian.net") echo 'attributes:'; echo '    "icmt"<blob>=0x6A6F73C3A94061636D652E74657374  "jos\303\251@acme.test"' ;;
+  *) exit 44 ;;
+esac"#;
+        let security = fake_security(dir.path(), "security", script);
+        let a = jira_auth(&security, "acme.atlassian.net", &env_of(&[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (a.email.as_str(), a.token.as_str()),
+            ("josé@acme.test", "kc-token")
+        );
+        let debug = format!("{a:?}");
+        assert!(!debug.contains("kc-token") && !debug.contains("acme.test"));
+        let err = jira_auth(&security, "other.atlassian.net", &env_of(&[]))
+            .await
+            .unwrap_err();
+        assert!(!err.contains("kc-token") && !err.contains("acme.test"));
     }
 
     #[tokio::test]

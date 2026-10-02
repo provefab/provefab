@@ -446,9 +446,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 }
                 return Ok(ExitCode::SUCCESS);
             }
-            let Some(_lock) = commands::lock_run(&paths)? else {
-                bail!("another `provefab run` is already working on this queue");
-            };
+            let _lock = commands::lock_run_or_explain(&paths)?;
             let store = Store::open(&paths.db()).await?;
             commands::tracker_history(&store, &config).await?;
             let pipeline =

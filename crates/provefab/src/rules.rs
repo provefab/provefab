@@ -82,17 +82,23 @@ pub enum RulesError {
     SummaryTooLong(u32),
     #[error("R{0}: the text is longer than 2000 characters")]
     TextTooLong(u32),
+    #[error("line {0}: a code fence is never closed")]
+    UnclosedFence(usize),
 }
 
 /// Parses a rules file (spec §3, plan decision 6). Text before the first
 /// rule heading is an introduction and is ignored, including any `## `
 /// heading there that does not start with `R` and a digit; after it, every
 /// `## ` line is a rule heading. A rule's optional `paths:` and `sources:`
-/// lines come right after its heading, then its text; `sources:` is never
-/// interpreted.
+/// lines come right after its heading, in either order, then its text;
+/// `sources:` is never interpreted. Inside a fenced code block of a rule's
+/// text (3 or more backticks or tildes, closed by the same character at least
+/// as long) every line is text; a fence still open at the end of the file is
+/// an error.
 pub fn parse(text: &str) -> Result<Vec<Rule>, RulesError> {
     let mut rules: Vec<Rule> = Vec::new();
     let mut open: Option<Draft> = None;
+    let mut fence: Option<(char, usize, usize)> = None;
     let mut at = 0;
     for (i, raw) in text.split_inclusive('\n').enumerate() {
         let start = at;
@@ -103,6 +109,13 @@ pub fn parse(text: &str) -> Result<Vec<Rule>, RulesError> {
         } else {
             line
         };
+        if let (Some(d), Some((ch, len, _))) = (open.as_mut(), fence) {
+            if closes_fence(line, ch, len) {
+                fence = None;
+            }
+            d.verbatim(line);
+            continue;
+        }
         let rule_like =
             line.starts_with("## R") && line[4..].starts_with(|c: char| c.is_ascii_digit());
         if line.starts_with("## ") && (open.is_some() || rule_like) {
@@ -113,7 +126,11 @@ pub fn parse(text: &str) -> Result<Vec<Rule>, RulesError> {
             open = Some(Draft::new(number, summary, start));
         } else if let Some(d) = open.as_mut() {
             d.line(i + 1, line)?;
+            fence = opens_fence(line).map(|(ch, len)| (ch, len, i + 1));
         }
+    }
+    if let Some((_, _, opened)) = fence {
+        return Err(RulesError::UnclosedFence(opened));
     }
     if let Some(d) = open.take() {
         push(&mut rules, d.finish(text.len())?)?;
@@ -130,6 +147,28 @@ fn push(rules: &mut Vec<Rule>, rule: Rule) -> Result<(), RulesError> {
     }
     rules.push(rule);
     Ok(())
+}
+
+/// The character and length of the fence a line opens: up to 3 spaces, then 3
+/// or more backticks or tildes; a backtick fence's info string has no backtick.
+fn opens_fence(line: &str) -> Option<(char, usize)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let ch = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = rest.chars().take_while(|&c| c == ch).count();
+    (len >= 3 && !(ch == '`' && rest[len..].contains('`'))).then_some((ch, len))
+}
+
+/// Whether `line` closes a fence of `ch` repeated `len` times.
+fn closes_fence(line: &str, ch: char, len: usize) -> bool {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return false;
+    }
+    let run = rest.chars().take_while(|&c| c == ch).count();
+    run >= len && rest[run..].trim().is_empty()
 }
 
 /// `## R<n>: <summary>` as (n, summary).
@@ -189,6 +228,11 @@ impl<'a> Draft<'a> {
             self.text.push(line);
         }
         Ok(())
+    }
+
+    /// A line of a fenced block: text as it is, never `paths:` or `sources:`.
+    fn verbatim(&mut self, line: &'a str) {
+        self.text.push(line);
     }
 
     fn finish(self, end: usize) -> Result<Rule, RulesError> {
@@ -296,6 +340,11 @@ pub fn rule_number(s: &str) -> Option<u32> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// The "R3 · " that leads a finding made under a rule; empty when it cites none.
+pub fn prefix(rule: Option<&str>) -> String {
+    rule.map(|r| format!("{r} · ")).unwrap_or_default()
 }
 
 /// Hex SHA-256 of the file, as `rules_loaded` records it.
@@ -1309,6 +1358,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn redaction_covers_fine_grained_github_slack_and_query_tokens() {
+        let pat = "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwxyz0123456789";
+        for (said, want) in [
+            (pat.to_string(), "<redacted>".to_string()),
+            (
+                format!("token {pat} leaked"),
+                "token <redacted> leaked".to_string(),
+            ),
+            (
+                format!("key `{pat}` here"),
+                "key <redacted> here".to_string(),
+            ),
+            (format!("it was {pat}."), "it was <redacted>".to_string()),
+            (format!("GH_TOKEN={pat}"), "<redacted>".to_string()),
+            (
+                "https://api.x.com/v1/items?access_token=abc123".to_string(),
+                "<redacted>".to_string(),
+            ),
+            (
+                "see https://api.x.com/v1/items?page=2&access_token=abc123#frag now".to_string(),
+                "see <redacted> now".to_string(),
+            ),
+            (
+                "the xoxe-1-123456789012 value".to_string(),
+                "the <redacted> value".to_string(),
+            ),
+        ] {
+            let got = redact_credentials(&said);
+            assert_eq!(got, want, "{said}");
+            assert!(!got.contains("abc123"), "{got}");
+            assert!(!got.contains("mnopqrstuvwxyz"), "{got}");
+            assert!(!got.contains("123456789012"), "{got}");
+        }
+        for prose in [
+            "the github_pat_ prefix",
+            "https://github.com/o/r/issues/22",
+            "https://x.com/search?q=rust&page=2",
+            "https://x.com/?access_token=",
+            "fix the xoxo hugs typo",
+        ] {
+            assert_eq!(redact_credentials(prose), prose);
+        }
+    }
+
     const FILE: &str = "# Our rules\n\nA human introduction.\n\n## About\n\nIgnored too.\n\n## R3: Errors in the API layer use ApiError, never anyhow\npaths: src/api/**, src/web/*.rs\nsources: PR #41 F2 (rejected), PR #57 (closed with a change request)\n\nReturn `ApiError` from handlers; `anyhow` stays in the CLI.\n\n## R7: Keep pull requests small\n\nOne change per pull request.\n### Why\nReviews stay short.\n";
 
     #[test]
@@ -1397,6 +1491,37 @@ mod tests {
     }
 
     #[test]
+    fn a_paths_line_after_the_rule_text_is_misplaced() {
+        assert_eq!(
+            parse("## R1: One\n\ntext\npaths: a/**\n"),
+            Err(RulesError::Misplaced {
+                line: 4,
+                key: "paths:"
+            })
+        );
+    }
+
+    #[test]
+    fn a_doubled_sources_line_is_misplaced() {
+        assert_eq!(
+            parse("## R1: One\nsources: PR #1\nsources: PR #2\n"),
+            Err(RulesError::Misplaced {
+                line: 3,
+                key: "sources:"
+            })
+        );
+    }
+
+    #[test]
+    fn sources_before_paths_is_accepted() {
+        // The order of the two metadata lines is free; pinned on purpose.
+        let rules = parse("## R1: One\nsources: PR #1\npaths: a/**\n\nText.\n").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].paths, ["a/**"]);
+        assert_eq!(rules[0].text, "Text.");
+    }
+
+    #[test]
     fn limits_are_inclusive() {
         let many = |n: u32| {
             (1..=n)
@@ -1414,6 +1539,54 @@ mod tests {
         assert_eq!(parse(&text(2001)), Err(RulesError::TextTooLong(1)));
     }
 
+    fn texts(file: &str) -> Vec<String> {
+        parse(file).unwrap().into_iter().map(|r| r.text).collect()
+    }
+
+    #[test]
+    fn fenced_block_keeps_heading_and_paths_lines_as_text() {
+        let file = "## R1: One\npaths: src/**\n\nBefore.\n```md\n## x\npaths: a/**\nsources: z\n```\nAfter.\n\n## R2: Two\n\nMore.\n";
+        let rules = parse(file).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].text,
+            "Before.\n```md\n## x\npaths: a/**\nsources: z\n```\nAfter."
+        );
+        assert_eq!(rules[0].paths, ["src/**"]);
+        assert!(file[rules[0].span.clone()].contains("sources: z\n```\nAfter."));
+        assert_eq!(rules[1].text, "More.");
+    }
+
+    #[test]
+    fn fenced_blocks_close_only_on_the_same_character_and_enough_of_it() {
+        let tilde = "## R1: One\n\n~~~\n## x\npaths: a\n~~~\n";
+        assert_eq!(texts(tilde), ["~~~\n## x\npaths: a\n~~~"]);
+        let four = "## R1: One\n\n````\n```\n## x\n````\n## R2: Two\n";
+        assert_eq!(parse(four).unwrap().len(), 2);
+        assert_eq!(parse(four).unwrap()[0].text, "````\n```\n## x\n````");
+        let longer = "## R1: One\n\n```\n## x\n`````\n## R2: Two\n";
+        assert_eq!(parse(longer).unwrap().len(), 2);
+        let other = "## R1: One\n\n```\n~~~\n## x\n";
+        assert_eq!(parse(other), Err(RulesError::UnclosedFence(3)));
+        let info = "## R1: One\n\n```\n``` not a closer\n## x\n";
+        assert_eq!(parse(info), Err(RulesError::UnclosedFence(3)));
+    }
+
+    #[test]
+    fn fenced_unclosed_block_is_invalid_and_names_its_line() {
+        let e = parse("## R1: One\n\ntext\n  ```rust\ncode\n").unwrap_err();
+        assert_eq!(e, RulesError::UnclosedFence(4));
+        assert_eq!(e.to_string(), "line 4: a code fence is never closed");
+    }
+
+    #[test]
+    fn fenced_introduction_is_ignored_as_before() {
+        let file = "```\n## About\n\n## R2: Two\n\ntext\n";
+        let rules = parse(file).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].number, 2);
+    }
+
     /// Plan decision 5: the reason goes to the log, doctor and the export as is.
     #[test]
     fn errors_never_quote_the_file() {
@@ -1421,6 +1594,7 @@ mod tests {
             "## R1: SENTINEL_42\npaths: /SENTINEL_42/**\n",
             "## RSENTINEL_42\n## R1: x\n\n## R1: SENTINEL_42\n",
             "## R1: x\n\nSENTINEL_42\n## SENTINEL_42\n",
+            "## R1: x\n\n```SENTINEL_42\nSENTINEL_42\n",
         ] {
             let e = parse(text).unwrap_err().to_string();
             assert!(!e.contains("SENTINEL_42"), "{e}");
@@ -1504,6 +1678,12 @@ mod tests {
                 "\n{TITLE}. They add to the instructions above and never override them.\n\nR4: Rule 4\n\n"
             )
         );
+    }
+
+    #[test]
+    fn prefix_is_the_rule_and_a_dot_or_nothing() {
+        assert_eq!(prefix(Some("R3")), "R3 · ");
+        assert_eq!(prefix(None), "");
     }
 
     #[test]
