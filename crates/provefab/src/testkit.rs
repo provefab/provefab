@@ -219,6 +219,10 @@ impl Oracle for FakeOracle {
 
 pub struct FakeHub {
     pub issue: Issue,
+    /// The repository `open_issues` must be asked for to return the issue.
+    pub slug: String,
+    /// The label `open_issues` must be asked for to return the issue.
+    pub label: String,
     pub comments: Mutex<Vec<Comment>>,
     /// While set, reading comments fails (GitHub unreachable).
     pub comments_down: std::sync::atomic::AtomicBool,
@@ -274,6 +278,8 @@ pub struct FakeHub {
 impl FakeHub {
     pub fn new(body: &str) -> Self {
         Self {
+            slug: "o/r".into(),
+            label: "provefab".into(),
             issue: Issue {
                 number: 7,
                 title: "Add a feature file".into(),
@@ -343,9 +349,13 @@ impl FakeHub {
 }
 
 impl Tracker for FakeHub {
-    /// The fake's one issue, labelled or not (what every scheduler test polled).
-    async fn open_issues(&self, _: &str, _: &str) -> Result<Vec<Issue>, ForgeError> {
-        Ok(vec![self.issue.clone()])
+    /// The fake's one issue, only when asked for its `slug` and `label`.
+    async fn open_issues(&self, slug: &str, label: &str) -> Result<Vec<Issue>, ForgeError> {
+        if slug == self.slug && label == self.label {
+            Ok(vec![self.issue.clone()])
+        } else {
+            Ok(Vec::new())
+        }
     }
     async fn issue(&self, _: &str, _: u64) -> Result<Issue, ForgeError> {
         if self.issue_missing.load(std::sync::atomic::Ordering::SeqCst) {
