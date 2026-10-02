@@ -581,7 +581,11 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     println!("FAIL {:<22} {}", c.name, c.detail);
                 }
             }
-            let oracle = oracle(&config).await?;
+            let (oracle, jev_failed) = match oracle(&config).await {
+                Ok(o) => (o, None),
+                Err(e) if json => (None, Some(e)),
+                Err(e) => return Err(e),
+            };
             let mut checks = commands::doctor(
                 &Tools::default(),
                 &config,
@@ -594,6 +598,9 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     .await,
             );
             checks.extend(commands::rules_checks(&Tools::default(), &config, &paths, &gh()).await);
+            if let Some(e) = &jev_failed {
+                setup::jev_unavailable(&mut checks, e);
+            }
             if json {
                 // Plan decision 6: every finding is a line.
                 let mut all: Vec<Check> = warnings

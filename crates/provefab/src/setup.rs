@@ -620,6 +620,18 @@ pub fn doctor_json(checks: &[Check], config: Option<&Config>) -> String {
     out
 }
 
+/// `doctor --json` when the Jev client cannot be set up although a key
+/// exists: a failed `jev` line, redacted, replaces the `jev key` line that
+/// a missing client otherwise gives (final review: every finding is a line).
+pub fn jev_unavailable(checks: &mut Vec<Check>, e: &anyhow::Error) {
+    checks.retain(|c| c.name != "jev key");
+    checks.push(Check {
+        name: "jev".into(),
+        ok: false,
+        detail: crate::rules::redact_credentials(&one_line(&format!("{e:#}"))),
+    });
+}
+
 /// The `configuration` line when the file is missing or does not load
 /// (plan decision 6).
 pub fn config_check(paths: &Paths, e: &anyhow::Error) -> Check {
@@ -1498,5 +1510,27 @@ mod tests {
         assert!(out.ends_with('\n') && !out.trim_end().contains('\n'));
         let line: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
         assert_eq!(line["detail"], "first\nsecond\nthird");
+    }
+
+    /// Final review: with --json, a Jev client that cannot be set up is a
+    /// `jev` line (redacted) in place of the `jev key` one, not an exit
+    /// without any line.
+    #[test]
+    fn a_jev_client_that_cannot_start_is_a_jev_line() {
+        let mut checks = vec![
+            Check {
+                name: "git".into(),
+                ok: true,
+                detail: "git version 2".into(),
+            },
+            failed("jev key", "missing: set TYPESAFE_API_KEY"),
+        ];
+        let e = anyhow::anyhow!("transport: bad key ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+        jev_unavailable(&mut checks, &e);
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["git", "jev"]);
+        assert!(!checks[1].ok);
+        assert_eq!(checks[1].detail, "transport: bad key <redacted>");
+        assert!(!doctor_passed(&checks));
     }
 }
