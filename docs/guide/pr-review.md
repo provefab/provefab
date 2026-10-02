@@ -17,7 +17,7 @@ The label is the authorization, as for issues: only people who can triage the re
 
 Read a pull request before you ask for its review: its title, description and diff reach the reviewer as untrusted data (see [Security](security.md)).
 
-A push does not start a review by itself. To review new commits, comment `/provefab review` again, or remove the label and add it back. A label removed and put back between two polls is seen; one flipped while a review is running is not.
+A push does not start a review by itself. To review new commits, comment `/provefab review` again, or remove the label and add it back. A label removed and put back between two polls is seen.
 
 Provefab creates the `provefab:review` label at startup when GitHub is the repository's tracker. On a Jira or Linear repository, create it on GitHub once by hand, or use the comment.
 
@@ -66,6 +66,7 @@ After a push, comment `/provefab review` for another review. Provefab does not a
 
 - Answer findings with `/provefab F<n> accepted|rejected|fixed|waived`, as on Provefab's own pull requests (see [Usage](usage.md#recording-decisions-on-review-findings)).
 - When the pull request merges, the last review's findings nobody answered are recorded as unaddressed at merge. Provefab runs no post-merge check and opens no revert for it.
+- A label flipped while a review is running is not seen; ask again once the comment is up.
 - When it closes, the review ends. A reopened pull request is reviewed again when asked.
 - A review that stopped (`needs_you` or `failed`) is watched only for the pull request merging or closing. Decisions on its findings are read at that point, or at the next review.
 - An ended review (merged or closed) keeps its state and `provefab prune` can delete its record.
