@@ -757,3 +757,410 @@ async fn run_once_reviews_a_labelled_pull_request() {
             .contains(&"provefab:review".to_string())
     );
 }
+
+/// Reviews pull request 12 once (round 0) and returns the task id.
+async fn reviewed(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>) -> i64 {
+    let id = queue_pr(p, 12).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    id
+}
+
+fn set_comments(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>, comments: Vec<Comment>) {
+    p.hub.pr_status.lock().unwrap().comments = comments;
+}
+
+/// Spec sections 4, 5 and 6: a new command reviews the new head as round 2;
+/// keys continue; the one comment is edited; decisions are recorded.
+#[tokio::test]
+async fn a_new_command_reviews_the_new_head_and_edits_the_one_comment() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = reviewed(&p).await;
+    let first = pr_comments(&p)[0].0;
+    let head = push_head(&f, 12, &[("src/b.rs", "fn b() {}\n")]);
+    let now = provefab::store::now();
+    set_comments(
+        &p,
+        vec![
+            said(
+                "bob",
+                "MEMBER",
+                "/provefab F1 rejected: on purpose",
+                now + 5,
+            ),
+            said("bob", "MEMBER", "/provefab review", now + 6),
+        ],
+    );
+    assert_eq!(p.watch_pr(id).await.unwrap(), Queued);
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    assert_eq!(
+        p.watch_pr(id).await.unwrap(),
+        PrOpen,
+        "the command was answered"
+    );
+    let comments = pr_comments(&p);
+    assert_eq!(comments.len(), 1, "edited, not posted again");
+    assert_eq!(comments[0].0, first);
+    assert!(
+        comments[0]
+            .2
+            .contains(&format!("at commit `{}` (round 2)", &head[..12])),
+        "{}",
+        comments[0].2
+    );
+    assert!(
+        comments[0].2.contains("- F3 · blocking"),
+        "{}",
+        comments[0].2
+    );
+    let keys: Vec<String> = p
+        .store
+        .findings(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.key)
+        .collect();
+    assert_eq!(keys, ["F1", "F2", "F3", "F4"]);
+    let decided = p.store.current_dispositions(id).await.unwrap();
+    assert_eq!(
+        decided.get("F1"),
+        Some(&provefab::record::Disposition::Rejected)
+    );
+    let t = p.store.task(id).await.unwrap().unwrap();
+    assert_eq!(
+        (t.review_rounds, t.pr_head.as_deref()),
+        (1, Some(head.as_str()))
+    );
+}
+
+/// Spec decision 6: the author's own `/provefab review` is recorded once as ignored.
+#[tokio::test]
+async fn the_authors_review_request_is_recorded_as_ignored() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = reviewed(&p).await;
+    set_comments(
+        &p,
+        vec![said(
+            "carol",
+            "CONTRIBUTOR",
+            "/provefab review",
+            provefab::store::now() + 5,
+        )],
+    );
+    assert_eq!(p.watch_pr(id).await.unwrap(), PrOpen);
+    assert_eq!(p.watch_pr(id).await.unwrap(), PrOpen);
+    let ignored: Vec<_> = p
+        .store
+        .events(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "command_ignored")
+        .collect();
+    assert_eq!(ignored.len(), 1);
+    assert_eq!(ignored[0].payload["why"], "not authorized");
+    assert_eq!(p.runner.calls().len(), 1);
+}
+
+/// Spec section 7 and plan decision 12: on merge, the last round's
+/// unanswered findings are inferred unaddressed; no post-merge check; the
+/// task is not watched again.
+#[tokio::test]
+async fn a_merge_infers_the_last_rounds_open_findings_and_ends_the_review() {
+    let mut f = fixture(&["false"]);
+    f.config.repos[0].post_merge_checks = vec!["true".into()];
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = reviewed(&p).await;
+    {
+        let mut s = p.hub.pr_status.lock().unwrap();
+        s.state = provefab::forge::PrState::Merged;
+        s.merge_sha = Some("m".repeat(40));
+        s.base_ref = Some("main".into());
+        s.comments = vec![said(
+            "bob",
+            "MEMBER",
+            "/provefab F1 rejected: fine",
+            provefab::store::now() + 5,
+        )];
+    }
+    assert_eq!(p.watch_pr(id).await.unwrap(), PrOpen);
+    let t = p.store.task(id).await.unwrap().unwrap();
+    assert_eq!(t.pr_state.as_deref(), Some("merged"));
+    let events = p.store.events(id).await.unwrap();
+    let merged = events.iter().find(|e| e.kind == "merged").unwrap();
+    assert_eq!(merged.payload["by"], "human");
+    let inferred: Vec<String> = events
+        .iter()
+        .filter(|e| e.kind == "finding_unaddressed_at_merge")
+        .map(|e| e.payload["finding"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(inferred, ["F2"]);
+    assert!(p.store.post_merge_checks(id).await.unwrap().is_empty());
+    assert!(!p.paths.worktree(id).exists());
+    p.hub
+        .pr_status_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        p.watch_pr(id).await.unwrap(),
+        PrOpen,
+        "ended: GitHub not asked"
+    );
+}
+
+/// Spec section 7: closing ends the review quietly; it is then prunable.
+#[tokio::test]
+async fn a_closed_pull_request_ends_the_review_quietly() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = reviewed(&p).await;
+    p.hub.pr_status.lock().unwrap().state = provefab::forge::PrState::Closed;
+    assert_eq!(p.watch_pr(id).await.unwrap(), PrOpen);
+    let t = p.store.task(id).await.unwrap().unwrap();
+    assert_eq!((t.state, t.pr_state.as_deref()), (PrOpen, Some("closed")));
+    assert_eq!(pr_comments(&p).len(), 1, "nothing more said");
+    assert!(p.hub.comments.lock().unwrap().is_empty());
+    assert!(!p.paths.worktree(id).exists(), "the worktree is removed");
+    let prunable = p
+        .store
+        .prunable_tasks(provefab::store::now() + 10)
+        .await
+        .unwrap();
+    assert!(prunable.iter().any(|t| t.id == id));
+}
+
+/// Review Focus 2: a summary GitHub refused is posted at the next poll, once.
+#[tokio::test]
+async fn a_refused_summary_is_posted_at_the_next_poll_once() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    p.hub
+        .pr_comment_failures
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let id = reviewed(&p).await;
+    assert!(pr_comments(&p).is_empty());
+    assert_eq!(p.watch_pr(id).await.unwrap(), PrOpen);
+    assert_eq!(p.watch_pr(id).await.unwrap(), PrOpen);
+    assert_eq!(pr_comments(&p).len(), 1);
+}
+
+/// Review Focus 2: a summary a person deleted is posted again by the next round.
+#[tokio::test]
+async fn a_deleted_summary_is_posted_again() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = reviewed(&p).await;
+    let first = pr_comments(&p)[0].0;
+    p.hub.deleted_comments.lock().unwrap().push(first);
+    set_comments(
+        &p,
+        vec![said(
+            "bob",
+            "MEMBER",
+            "/provefab review",
+            provefab::store::now() + 5,
+        )],
+    );
+    assert_eq!(p.watch_pr(id).await.unwrap(), Queued);
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let comments = pr_comments(&p);
+    assert_eq!(comments.len(), 2);
+    assert!(comments[1].2.contains("(round 2)"), "{}", comments[1].2);
+    let posted = p
+        .store
+        .last_output(id, "pr_summary_posted")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(posted["comment"], json!(comments[1].0));
+}
+
+/// Spec section 7 (pre-flight S2): a review parked in `needs_you` or
+/// `failed` is still watched for its end: a merge ends it with the merge
+/// inference, a close ends it quietly; nothing else is read or said.
+#[tokio::test]
+async fn a_parked_review_still_ends_on_merge_or_close() {
+    for (parked, end) in [
+        (NeedsYou, provefab::forge::PrState::Merged),
+        (Failed, provefab::forge::PrState::Closed),
+    ] {
+        let f = fixture(&["false"]);
+        push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+        let p = pipeline(
+            &f,
+            Box::new(finds),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await;
+        let id = reviewed(&p).await;
+        p.store.transition(id, parked, "stopped").await.unwrap();
+        let now = provefab::store::now();
+        // Open: the watch reads nothing for a parked review (poll_prs does).
+        set_comments(
+            &p,
+            vec![
+                said("carol", "CONTRIBUTOR", "/provefab review", now + 5),
+                said("bob", "MEMBER", "/provefab review", now + 6),
+            ],
+        );
+        assert_eq!(p.watch_pr(id).await.unwrap(), parked);
+        let t = p.store.task(id).await.unwrap().unwrap();
+        assert_eq!((t.state, t.pr_state.as_deref()), (parked, Some("open")));
+        {
+            let mut s = p.hub.pr_status.lock().unwrap();
+            s.state = end;
+            s.merge_sha = Some("m".repeat(40));
+            s.base_ref = Some("main".into());
+            s.comments = vec![said(
+                "bob",
+                "MEMBER",
+                "/provefab F1 rejected: fine",
+                now + 7,
+            )];
+        }
+        assert_eq!(p.watch_pr(id).await.unwrap(), parked);
+        let t = p.store.task(id).await.unwrap().unwrap();
+        let events = p.store.events(id).await.unwrap();
+        let inferred: Vec<String> = events
+            .iter()
+            .filter(|e| e.kind == "finding_unaddressed_at_merge")
+            .map(|e| e.payload["finding"].as_str().unwrap().to_string())
+            .collect();
+        if end == provefab::forge::PrState::Merged {
+            assert_eq!(t.pr_state.as_deref(), Some("merged"));
+            assert_eq!(inferred, ["F2"]);
+        } else {
+            assert_eq!(t.pr_state.as_deref(), Some("closed"));
+            assert!(inferred.is_empty(), "{inferred:?}");
+        }
+        assert_eq!(t.state, parked);
+        assert!(
+            !events.iter().any(|e| e.kind == "command_ignored"),
+            "a parked review records no ignored request"
+        );
+        assert!(!p.paths.worktree(id).exists(), "the worktree is removed");
+        assert_eq!(p.runner.calls().len(), 1);
+        assert_eq!(pr_comments(&p).len(), 1, "nothing more said");
+        p.hub
+            .pr_status_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(p.watch_pr(id).await.unwrap(), parked, "ended");
+    }
+}
+
+/// Spec section 7 (pre-flight S2) and plan decision 12, through the
+/// scheduler: a parked review's merge is seen; an ended review is not
+/// watched again, not even hourly.
+#[tokio::test]
+async fn the_scheduler_watches_parked_reviews_and_skips_ended_ones() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = Arc::new(
+        pipeline(
+            &f,
+            Box::new(finds),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let id = reviewed(&p).await;
+    p.store.transition(id, NeedsYou, "stopped").await.unwrap();
+    p.hub.pr_status.lock().unwrap().state = provefab::forge::PrState::Merged;
+    let once = || provefab::scheduler::RunOptions {
+        workers: 1,
+        once: true,
+    };
+    provefab::scheduler::run(p.clone(), once(), std::future::pending::<()>())
+        .await
+        .unwrap();
+    let t = p.store.task(id).await.unwrap().unwrap();
+    assert_eq!((t.state, t.pr_state.as_deref()), (NeedsYou, Some("merged")));
+    // An ended review in `pr_open` is skipped before the hourly stamp.
+    p.store
+        .transition(id, PrOpen, "as if reviewed")
+        .await
+        .unwrap();
+    provefab::scheduler::run(p.clone(), once(), std::future::pending::<()>())
+        .await
+        .unwrap();
+    assert!(
+        p.store
+            .last_output(id, "watched_at")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A review held by the daily budget resumes into its review round, never
+/// into the issue pipeline.
+#[tokio::test]
+async fn a_review_held_by_the_budget_resumes_into_its_round() {
+    let mut f = fixture(&["false"]);
+    f.config.limits.max_stage_runs_per_day = 0;
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let mut p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue_pr(&p, 12).await;
+    assert_eq!(p.drive(id).await.unwrap(), Waiting);
+    p.config.limits.max_stage_runs_per_day = 10;
+    assert_eq!(p.step(id).await.unwrap(), Reviewing);
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let stages: Vec<String> = p.runner.calls().into_iter().map(|(_, s, _)| s).collect();
+    assert_eq!(stages, ["review"]);
+    assert_eq!(
+        pr_comments(&p).len(),
+        2,
+        "the budget notice and the summary"
+    );
+}

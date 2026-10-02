@@ -362,11 +362,28 @@ where
                         eprintln!("provefab: post-merge verification for task {}: {e}", t.id);
                     }
                 }
-                // Merged, closed or reopened: the PR watcher (D52).
-                for t in listed(&p, &[TaskState::PrOpen]).await {
+                // Merged, closed or reopened: the PR watcher (D52). A parked
+                // review is still watched for its end (PR review pre-flight S2).
+                let mut watched = listed(&p, &[TaskState::PrOpen]).await;
+                watched.extend(
+                    listed(&p, &[TaskState::NeedsYou, TaskState::Failed])
+                        .await
+                        .into_iter()
+                        .filter(|t| {
+                            t.mode == crate::task::TaskMode::PrReview
+                                && t.pr_state.as_deref() == Some("open")
+                        }),
+                );
+                for t in watched {
                     if !in_flight.contains(&t.id)
                         && repo_of(&p.config, &t.repo).is_some_and(|r| r.slug == repo.slug)
                     {
+                        // An ended review costs no GitHub call (PR review plan decision 12).
+                        if t.mode == crate::task::TaskMode::PrReview
+                            && t.pr_state.as_deref() != Some("open")
+                        {
+                            continue;
+                        }
                         // After the merge only a reopen matters: check hourly (Plan 4 review I2).
                         if matches!(t.pr_state.as_deref(), Some("merged" | "done")) {
                             let recent = p
@@ -386,9 +403,9 @@ where
                                 eprintln!("provefab: task {}: {e}", t.id);
                             }
                         }
-                        match p.watch_pr(t.id).await {
-                            Ok(TaskState::PrOpen) => {}
-                            other => report(t.id, other),
+                        let result = p.watch_pr(t.id).await;
+                        if should_report(t.state, &result) {
+                            report(t.id, result);
                         }
                     }
                 }

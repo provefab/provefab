@@ -10,14 +10,14 @@ use serde_json::{Value, json};
 
 use crate::agents::StageRunner;
 use crate::config::RepoConfig;
-use crate::forge::{Comment, ForgeError, is_bot_comment};
+use crate::forge::{Comment, ForgeError, PrState, is_bot_comment};
 use crate::intake::IntakeError;
 use crate::pipeline::{
     Claim, DIFF_LIMIT, Outcome, Pipeline, PipelineError, exit_name, pass_of, truncate,
 };
 use crate::ports::{Forge, Hub, Oracle};
 use crate::prompts::{Template, render};
-use crate::record::{Event, FindingRow, requests_review};
+use crate::record::{Event, FindingRow, MergedBy, REVIEW_REQUEST, Rule, requests_review};
 use crate::risk::{self, Detected};
 use crate::router::resolve_tier;
 use crate::stage::{ReviewOutput, ReviewVerdict, output_schema};
@@ -742,6 +742,128 @@ where
             ),
         }
         Ok(())
+    }
+
+    /// Follows a reviewed pull request once per poll (spec section 7): posts
+    /// a summary still owed, records `/provefab F<n>` decisions, starts a
+    /// round on a new `/provefab review`, and ends the task when the pull
+    /// request merges (the last round's open findings are then inferred
+    /// unaddressed) or closes (plan decision 12). A review parked in
+    /// `needs_you` or `failed` is watched for its end only (pre-flight S2):
+    /// its next round comes from `poll_prs`.
+    pub(crate) async fn watch_pr_review(&self, task: &TaskRow) -> Result<TaskState, PipelineError> {
+        let Some(repo) = self.repo(task).cloned() else {
+            return Ok(task.state);
+        };
+        let parked = matches!(task.state, TaskState::NeedsYou | TaskState::Failed);
+        if !(task.state == TaskState::PrOpen || parked) || task.pr_state.as_deref() != Some("open")
+        {
+            return Ok(task.state);
+        }
+        if !parked {
+            self.post_summary(task, &repo.slug).await?;
+        }
+        let status = match self.hub.pr_status(&repo.slug, &task.issue_url).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "provefab: could not read {}: {}",
+                    task.issue_url,
+                    detail(&e)
+                );
+                return Ok(task.state);
+            }
+        };
+        if parked && status.state == PrState::Open {
+            return Ok(task.state);
+        }
+        // Before a merge is recorded: a decision posted since the last poll
+        // must not be inferred unaddressed.
+        self.apply_finding_commands(task, &status.comments).await?;
+        match status.state {
+            PrState::Open => {
+                self.ignore_refused_requests(task, &status.comments).await?;
+                let seen = last_seen(&self.store, task.id).await?;
+                if let Some(c) = newest_request(&status.comments, seen.as_deref()) {
+                    start_round(
+                        &self.store,
+                        task,
+                        "command",
+                        Some(c.author.as_str()),
+                        Some(c.created_at.as_str()),
+                    )
+                    .await?;
+                    return Ok(TaskState::Queued);
+                }
+                Ok(task.state)
+            }
+            PrState::Merged => {
+                let pass = pass_of(task);
+                // Provefab never merges a person's pull request: always a
+                // human. No post-merge check, no revert (spec section 7).
+                self.store
+                    .write_with_inference(
+                        task.id,
+                        Write::SetPrState("merged"),
+                        &[Event::Merged {
+                            sha: status.merge_sha.clone(),
+                            base: status.base_ref.clone(),
+                            by: MergedBy::Human,
+                            pass,
+                        }],
+                        Some((Rule::UnaddressedAtMerge, pass)),
+                    )
+                    .await?;
+                self.discard_pr_worktree(task, &repo).await;
+                Ok(task.state)
+            }
+            PrState::Closed => {
+                self.store.set_pr_state(task.id, "closed").await?;
+                self.discard_pr_worktree(task, &repo).await;
+                Ok(task.state)
+            }
+        }
+    }
+
+    /// A `/provefab review` from someone who may not ask is recorded once as
+    /// ignored (spec decision 6, plan decision 13).
+    async fn ignore_refused_requests(
+        &self,
+        task: &TaskRow,
+        comments: &[Comment],
+    ) -> Result<(), PipelineError> {
+        let refused = comments
+            .iter()
+            .filter(|c| !is_bot_comment(&c.body) && !may_request(c) && requests_review(&c.body));
+        for c in refused {
+            self.store
+                .record_human(
+                    task.id,
+                    &Event::CommandIgnored {
+                        comment: format!("{}@{}", c.author, c.created_at),
+                        login: c.author.clone(),
+                        line: REVIEW_REQUEST.into(),
+                        why: "not authorized".into(),
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The round's worktree is not needed once the pull request is gone.
+    async fn discard_pr_worktree(&self, task: &TaskRow, repo: &RepoConfig) {
+        let lock = self.repo_lock(repo);
+        let _guard = lock.lock().await;
+        let wt = self.paths.worktree(task.id);
+        if let Err(e) = self.git.worktree_discard(&self.checkout(repo), &wt).await {
+            eprintln!(
+                "provefab: task {}: could not remove {}: {}",
+                task.id,
+                wt.display(),
+                detail(&e)
+            );
+        }
     }
 }
 

@@ -1348,6 +1348,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
     ///   GitHub calls (Plan 4 review I2).
     pub async fn watch_pr(&self, id: i64) -> Result<TaskState, PipelineError> {
         let task = self.task(id).await?;
+        if task.mode == TaskMode::PrReview {
+            return self.watch_pr_review(&task).await;
+        }
         let (Some(repo), Some(url)) = (self.repo(&task).cloned(), task.pr_url.clone()) else {
             return Ok(task.state);
         };
