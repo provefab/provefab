@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::agents::AgentRunner;
 use crate::cli::{GuardFormat, run_guard, run_guard_no_tools, run_guard_review};
-use crate::commands::{self, Tools};
+use crate::commands::{self, Check, Tools};
 use crate::config::{Auth, Config, WorkerKind};
 use crate::cooldown::Cooldowns;
 use crate::forge::{Gh, Git};
@@ -17,6 +17,7 @@ use crate::pipeline::Pipeline;
 use crate::policy::{OpenPrOnly, ReviewPolicy};
 use crate::ports::JevOracle;
 use crate::scheduler::{self, RunOptions};
+use crate::setup::{self, SetupError};
 use crate::store::Store;
 use crate::{codex_setup, plugins};
 use anyhow::{Context, bail};
@@ -72,7 +73,26 @@ enum Cmd {
         yes: bool,
     },
     /// Check tools, logins, the Jev key and the repos.
-    Doctor,
+    #[command(after_help = setup::EXIT_CODES)]
+    Doctor {
+        /// One JSON object per check and line: name, ok, detail, and fix
+        /// when a command fixes it.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write ~/.provefab/provefab.toml, with the models of the worker CLIs on PATH.
+    #[command(after_help = setup::EXIT_CODES)]
+    Init {
+        /// Print the file instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The repositories Provefab watches.
+    #[command(after_help = setup::EXIT_CODES)]
+    Repos {
+        #[command(subcommand)]
+        action: ReposAction,
+    },
     /// Run `provefab run` as a launchd agent (start at login, restart on exit).
     Service {
         #[command(subcommand)]
@@ -122,6 +142,38 @@ enum ServiceAction {
     Uninstall,
     /// Whether the agent is loaded and running.
     Status,
+}
+
+#[derive(Subcommand)]
+enum ReposAction {
+    /// Append one [[repos]] block to provefab.toml: base from the default
+    /// branch, gates detected from the files at the repository's root.
+    #[command(after_help = setup::EXIT_CODES)]
+    Add {
+        /// The GitHub repository, as owner/name.
+        slug: String,
+        /// A local clone of that repository, read instead of GitHub.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Print the block instead of adding it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// A setup command's output, or its error on one stderr line with its exit
+/// code (spec section 6).
+fn setup_exit(r: Result<String, SetupError>) -> ExitCode {
+    match r {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("provefab: {e}");
+            ExitCode::from(e.code())
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -500,19 +552,33 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             print!("{}", commands::prune(&store, &before, yes).await?);
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Doctor => {
-            let config = load_config(&paths)?;
-            let policy = ext.policy.clone();
-            for w in policy.warnings(&config) {
-                println!("warn {w}");
-            }
-            let policy_ok = match policy.check(&config) {
-                Ok(()) => true,
-                Err(e) => {
-                    println!("FAIL {:<22} {e}", "merge settings");
-                    false
+        Cmd::Doctor { json } => {
+            let config = match load_config(&paths) {
+                Ok(c) => c,
+                Err(e) if json => {
+                    print!(
+                        "{}",
+                        setup::doctor_json(&[setup::config_check(&paths, &e)], None)
+                    );
+                    return Ok(ExitCode::FAILURE);
                 }
+                Err(e) => return Err(e),
             };
+            let policy = ext.policy.clone();
+            let warnings = policy.warnings(&config);
+            let refused = policy.check(&config).err().map(|e| Check {
+                name: "merge settings".into(),
+                ok: false,
+                detail: e.to_string(),
+            });
+            if !json {
+                for w in &warnings {
+                    println!("warn {w}");
+                }
+                if let Some(c) = &refused {
+                    println!("FAIL {:<22} {}", c.name, c.detail);
+                }
+            }
             let oracle = oracle(&config).await?;
             let mut checks = commands::doctor(
                 &Tools::default(),
@@ -526,10 +592,26 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     .await,
             );
             checks.extend(commands::rules_checks(&Tools::default(), &config, &paths, &gh()).await);
-            let mut ok = policy_ok;
+            if json {
+                // Plan decision 6: every finding is a line.
+                let mut all: Vec<Check> = warnings
+                    .into_iter()
+                    .map(|w| Check {
+                        name: "warning".into(),
+                        ok: true,
+                        detail: w,
+                    })
+                    .collect();
+                all.extend(refused);
+                all.extend(checks);
+                print!("{}", setup::doctor_json(&all, Some(&config)));
+                return Ok(if setup::doctor_passed(&all) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                });
+            }
             for c in &checks {
-                // The Jev key is optional: its absence is reported, not fatal.
-                ok &= c.ok || c.name == "jev key";
                 println!(
                     "{} {:<22} {}",
                     if c.ok { "ok  " } else { "FAIL" },
@@ -537,11 +619,31 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     c.detail
                 );
             }
-            Ok(if ok {
+            Ok(if refused.is_none() && setup::doctor_passed(&checks) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
             })
+        }
+        Cmd::Init { dry_run } => Ok(setup_exit(setup::init(
+            &paths,
+            &std::env::var_os("PATH").unwrap_or_default(),
+            dry_run,
+        ))),
+        Cmd::Repos {
+            action:
+                ReposAction::Add {
+                    slug,
+                    path,
+                    dry_run,
+                },
+        } => {
+            let git = Git {
+                program: "git".into(),
+            };
+            Ok(setup_exit(
+                setup::repos_add(&paths, &gh(), &git, &slug, path.as_deref(), dry_run).await,
+            ))
         }
         Cmd::Service { action } => {
             let service = crate::service::Service::for_user(&paths.home);
