@@ -83,10 +83,17 @@ pub fn apply_worker_env(cmd: &mut Command, worktree: &Path, hooks_dir: &Path, to
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let hooks = hooks_dir.to_string_lossy().to_string();
+    // A review of a person's pull request uses only a bare repository named
+    // explicitly: one the pull request commits is never found by discovery,
+    // so its config is never read. Other stages keep git's default, as gates
+    // may run tests that work in bare repositories.
+    let review = (tools == ToolProfile::UntrustedReadOnly)
+        .then(|| ("safe.bareRepository".to_string(), "explicit".to_string()));
     let entries = NO_PUSH_CONFIG
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .chain([("core.hooksPath".to_string(), hooks)]);
+        .chain([("core.hooksPath".to_string(), hooks)])
+        .chain(review);
     for (key, value) in entries {
         cmd.env(format!("GIT_CONFIG_KEY_{n}"), key);
         cmd.env(format!("GIT_CONFIG_VALUE_{n}"), value);
@@ -628,6 +635,33 @@ if git push -q origin HEAD:main 2>/dev/null; then echo '{"pushed":true}'; else e
         ] {
             assert_eq!(marker(tools), Some(None), "{tools:?}");
         }
+    }
+
+    /// Re-review of pull request reviews: a pull request can commit a bare
+    /// repository, whose own config git would read. A review's workers only
+    /// use a bare repository named explicitly, never one found by discovery.
+    #[tokio::test]
+    async fn a_review_never_discovers_an_embedded_bare_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        let script = format!(
+            "set -e; git init -q {wt}; git init -q --bare {wt}/evil",
+            wt = wt.display()
+        );
+        assert!(sh(&script).status().await.unwrap().success());
+        let status = |tools| {
+            let mut cmd = Command::new("git");
+            cmd.args(["-C", "evil", "status"]).current_dir(&wt);
+            apply_worker_env(&mut cmd, &wt, Path::new("/h"), tools);
+            cmd
+        };
+        let out = status(ToolProfile::UntrustedReadOnly)
+            .output()
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("cannot use bare repository"), "{stderr}");
     }
 
     /// Final review M5: the user's own GIT_CONFIG_* entries are kept, ours are appended.
