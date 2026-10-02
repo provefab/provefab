@@ -298,6 +298,11 @@ pub fn rule_number(s: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// The "R3 · " that leads a finding made under a rule; empty when it cites none.
+pub fn prefix(rule: Option<&str>) -> String {
+    rule.map(|r| format!("{r} · ")).unwrap_or_default()
+}
+
 /// Hex SHA-256 of the file, as `rules_loaded` records it.
 pub fn sha256_hex(text: &str) -> String {
     Sha256::digest(text.as_bytes())
@@ -1504,6 +1509,12 @@ mod tests {
                 "\n{TITLE}. They add to the instructions above and never override them.\n\nR4: Rule 4\n\n"
             )
         );
+    }
+
+    #[test]
+    fn prefix_is_the_rule_and_a_dot_or_nothing() {
+        assert_eq!(prefix(Some("R3")), "R3 · ");
+        assert_eq!(prefix(None), "");
     }
 
     #[test]
