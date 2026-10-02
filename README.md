@@ -26,13 +26,17 @@ The pull request then waits for your click. Optionally set `post_merge_checks` p
 
 Requirements: macOS, `git` and `gh` (signed in with `gh auth login`), and at least one worker: `claude` (Claude Code) or `codex` (Codex CLI).
 
+With a coding agent, point it at [Set up Provefab with a coding agent](docs/guide/agents.md): it writes and checks the configuration, and leaves the sign-ins, keys and service to you.
+
 ```bash
-# 1. Install the binary (it embeds the worker plugins), either way:
-#    a. signed and notarized build, no Rust needed: download
+# 1. Install the binary (it embeds the worker plugins), one of:
+#    a. the installer (macOS, into ~/.local/bin, no sudo):
+curl -fsSL https://provefab.com/install.sh | sh
+#    b. the signed and notarized build, no Rust needed: download
 #       provefab-<version>-macos-universal.zip from the Releases page, unzip, then
 sudo install -m 755 provefab /usr/local/bin/provefab
-#    b. from source, with Rust 1.96 or newer:
-cargo install --git https://github.com/provefab/provefab --tag v0.5.0 --locked provefab
+#    c. from source, with Rust 1.96 or newer:
+cargo install --git https://github.com/provefab/provefab --tag v0.6.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
 provefab login claude        # Claude plan login, in ~/.provefab/claude
@@ -45,9 +49,11 @@ provefab login codex --api-key
 #    with cautious defaults.
 security add-generic-password -s provefab-typesafe -a provefab -w <your-key>
 
-# 4. Configure (see provefab.example.toml), then check.
-mkdir -p ~/.provefab && cp provefab.example.toml ~/.provefab/provefab.toml
-$EDITOR ~/.provefab/provefab.toml
+# 4. Configure, then check. `init` writes ~/.provefab/provefab.toml with the
+#    models of the workers it finds; `repos add` detects your checks
+#    (add --path <your clone> to read it instead of GitHub).
+provefab init
+provefab repos add your-account/your-repo
 provefab doctor
 
 # 5. Try it without changing anything: classify and route the open issues.
@@ -68,6 +74,7 @@ Then put the `provefab` label on an issue. Provefab picks it up at its next poll
 | queue an issue by hand, or restart a stopped task | `provefab add <issue-url>` |
 | have a pull request a person wrote reviewed | label it `provefab:review`, or comment `/provefab review` |
 | check tools, logins, Jev and repositories | `provefab doctor` |
+| add a repository, with its checks detected | `provefab repos add <owner/name>` |
 | measure: PRs opened, merged (automatically or by hand), reviewers | `provefab stats` |
 | export the record as JSON Lines | `provefab export` |
 | delete old records | `provefab prune --before YYYY-MM-DD --yes` |
@@ -89,6 +96,7 @@ Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in commen
 
 ## Documentation
 
+- [Set up with a coding agent](docs/guide/agents.md): what an agent runs to configure Provefab, and what it leaves to you.
 - [Configuration](docs/guide/configuration.md): every field of `provefab.toml`, with its default.
 - [Usage](docs/guide/usage.md): writing issues that land, answering Provefab, restarting, reading states.
 - [Repository rules](docs/guide/rules.md): conventions in `.provefab/rules.md`, given to every stage and checked by the reviewer.

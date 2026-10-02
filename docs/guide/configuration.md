@@ -4,6 +4,21 @@ Provefab reads `provefab.toml` from its home directory, `~/.provefab` by default
 
 `provefab doctor` checks the file and everything it depends on. Run it after every change.
 
+## Writing the file with commands
+
+`provefab init` writes `provefab.toml` when there is none: the `[jev]` section and a catalog with the models of the worker CLIs on your `PATH` (`claude` gives `claude-sonnet` and `claude-opus`, `codex` gives `codex-gpt`, as in the example). It adds no repository, and never changes an existing file. `--dry-run` prints the file instead.
+
+`provefab repos add <owner/name>` appends one `[[repos]]` block at the end of the file and keeps the rest as you wrote it: `slug`, `label = "provefab"`, `base` (the repository's default branch) and `gates`, detected from the files at the root of the default branch:
+
+| At the root | `gates` |
+|---|---|
+| `Cargo.toml` | `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
+| `package.json` | the install from the lock file (`pnpm install --frozen-lockfile` with `pnpm-lock.yaml`, `yarn install --frozen-lockfile` with `yarn.lock`, `npm ci` with `package-lock.json`, `npm install` otherwise), then `<pm> run lint`, `<pm> run typecheck`, `<pm> test`, for the scripts that exist; `<pm>` is the same package manager |
+| `pyproject.toml`, or `setup.py` or `setup.cfg` with a `tests` directory | `ruff check .` when ruff is configured (`[tool.ruff]` or `ruff.toml`), then `pytest` |
+| `go.mod` | `go vet ./...`, `go test ./...` |
+
+It reads these files through `gh` without cloning, or from your clone with `--path <checkout>`: its `origin` must be that GitHub repository, and the files are read from its committed default branch, not from your working tree. A repository with none of these, with several, or with a `package.json` without any of the three scripts (npm's placeholder `test` script does not count) is refused: write its block by hand. `repos add` never writes `local_path`, so Provefab keeps its own clone; set `local_path` by hand to use yours. It never writes a tracker, a risk policy or post-merge checks either: add them by hand. A task's worktree starts without installed dependencies: for a Python repository whose checks need them, put the install command first in `gates` (`repos add` prints a note). `--dry-run` prints the block instead. The commands' exit codes are in [Operations](operations.md#exit-codes).
+
 ## Secrets
 
 No secret goes in `provefab.toml`.
@@ -82,6 +97,8 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 **Tip:** list at least two providers, for example Claude and Codex, so that reviews are cross-checked by a different model family.
 
 ## `[[repos]]`: watched repositories
+
+`provefab repos add <owner/name>` writes this block for you (see [Writing the file with commands](#writing-the-file-with-commands)).
 
 | Field | Default | Role |
 |---|---|---|
@@ -192,4 +209,4 @@ Switch a repository's `kind` (or its `project`) only when the repository has no 
 
 - **Service running:** edit the file, then run `provefab service install --workers N`. It reloads the service and takes the current `PATH`.
 - **New tool installed** (`claude`, `codex`, `cargo`...): same command, so the service finds it.
-- **New repository:** add a `[[repos]]` block, run `provefab doctor`, then `provefab run --dry-run` to see how its issues would be handled.
+- **New repository:** `provefab repos add <owner/name>`, or add a `[[repos]]` block by hand; then run `provefab doctor`, then `provefab run --dry-run` to see how its issues would be handled.

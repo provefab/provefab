@@ -66,9 +66,24 @@ Provefab stops itself rather than spend quota in a loop:
 - **Transient failures** (network, GitHub, busy repository): waits of 5, 15 then 45 minutes, then `needs_you`.
 - **Steps per task:** at most `max_drive_steps` in one go (200 by default).
 
+## Exit codes
+
+`provefab init`, `provefab repos add` and `provefab doctor` exit with:
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | a `doctor` check failed (the Jev key is optional and never fails it), or another error |
+| 2 | usage error, or `repos add` before `provefab init` |
+| 3 | the configuration or the repository already exists |
+| 4 | stack or worker not recognised |
+| 5 | `gh` or network error |
+
+A wrong argument or option prints the command's usage and exits 2. Every other error is one line on stderr starting with `provefab:`.
+
 ## Troubleshooting
 
-Always start with `provefab doctor`. Each `FAIL` line says what to do.
+Always start with `provefab doctor`. Each `FAIL` line says what to do. `provefab doctor --json` prints the same checks and warnings as one JSON object per line (`name`, `ok`, `detail`), with `fix`, the command to run, for sign-ins and keys.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
