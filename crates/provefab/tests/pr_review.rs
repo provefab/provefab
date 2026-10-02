@@ -425,6 +425,42 @@ async fn a_round_already_reviewed_finishes_without_another_review() {
     assert_eq!(pr_comments(&p).len(), 1);
 }
 
+/// Final review M1: a crash between recording the review and keeping the
+/// round's reviewer list still finishes the round from the review event.
+#[tokio::test]
+async fn a_recorded_review_alone_finishes_the_round_without_another() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue_pr(&p, 12).await;
+    assert_eq!(p.step(id).await.unwrap(), Reviewing);
+    let task = p.store.task(id).await.unwrap().unwrap();
+    // As if the process stopped right after `record_review`.
+    p.store
+        .record_review(
+            id,
+            &json!({"verdict": "approve", "findings": []}),
+            "std-claude",
+            1,
+            task.review_rounds,
+            "approve",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(p.step(id).await.unwrap(), PrOpen);
+    assert!(p.runner.calls().is_empty(), "no second paid review");
+    let comments = pr_comments(&p);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].2.contains("std-claude"), "{}", comments[0].2);
+}
+
 /// Starts the next round on a new head, as a `/provefab review` after a push.
 async fn next_round(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>, f: &Fixture, id: i64) -> String {
     let head = push_head(f, 12, &[("src/b.rs", "fn b() {}\n")]);

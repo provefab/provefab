@@ -319,19 +319,47 @@ where
             }))
     }
 
-    /// The (model, provider) pairs that reviewed the current round, oldest first.
+    /// The (model, provider) pairs that reviewed the current round, oldest
+    /// first. The round's `review` events say who reviewed: they are written
+    /// with the findings, so a crash before `pr_reviewed` never pays for a
+    /// second review (final review M1). The provider comes from `pr_reviewed`
+    /// when it was kept, else from the configured model.
     async fn pr_reviewers(&self, task: &TaskRow) -> Result<Vec<(String, String)>, PipelineError> {
-        Ok(self
+        let kept = self
             .store
             .recent_outputs(task.id, "pr_reviewed", u32::MAX)
+            .await?;
+        Ok(self
+            .store
+            .events(task.id)
             .await?
-            .into_iter()
-            .filter(|v| v["round"].as_u64() == Some(u64::from(task.review_rounds)))
-            .map(|v| {
-                (
-                    v["model"].as_str().unwrap_or_default().to_string(),
-                    v["provider"].as_str().unwrap_or_default().to_string(),
-                )
+            .iter()
+            .filter_map(|e| match e.typed() {
+                Some(Event::Review {
+                    reviewer_model,
+                    pass,
+                    round,
+                    ..
+                }) if pass == pass_of(task) && round == task.review_rounds => Some(reviewer_model),
+                _ => None,
+            })
+            .map(|model| {
+                let provider = kept
+                    .iter()
+                    .find(|v| {
+                        v["round"].as_u64() == Some(u64::from(task.review_rounds))
+                            && v["model"].as_str() == Some(model.as_str())
+                    })
+                    .and_then(|v| v["provider"].as_str().map(str::to_string))
+                    .or_else(|| {
+                        self.config
+                            .models
+                            .iter()
+                            .find(|m| m.id == model)
+                            .map(|m| m.provider_key())
+                    })
+                    .unwrap_or_default();
+                (model, provider)
             })
             .collect())
     }
