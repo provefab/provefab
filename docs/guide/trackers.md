@@ -77,7 +77,7 @@ A ticket's text is data for the agents, never instructions.
 `provefab add <url>` accepts `https://<site>/browse/ENG-123` (Jira) and `https://linear.app/<workspace>/issue/ENG-123` (Linear).
 
 - A Linear URL is matched by team key. A ticket from another workspace than the one your key belongs to is refused.
-- When several repositories share a project or team, the ticket's label picks the repository. A ticket with no matching label, or with the labels of several repositories, is an error that names the candidates.
+- When several repositories share a project or team, the ticket's label picks the repository (the match ignores case, so `Web` matches `web`). A ticket with no matching label, or with the labels of several repositories, is an error that names the candidates.
 
 ## Limits
 
