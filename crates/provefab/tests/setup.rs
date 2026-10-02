@@ -276,6 +276,13 @@ fn the_new_commands_document_their_exit_codes() {
             help.contains("3 the configuration or the repository already exists"),
             "{args:?}: {help}"
         );
+        // Final review: clap prints the usage for its own errors only.
+        assert!(
+            help.contains(
+                "2 usage error (clap prints the usage), or `repos add` before `provefab init`;"
+            ),
+            "{args:?}: {help}"
+        );
     }
 }
 

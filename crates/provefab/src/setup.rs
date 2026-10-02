@@ -15,7 +15,7 @@ use crate::ports::Forge;
 
 /// The exit codes of `init`, `repos add` and `doctor` (spec section 6),
 /// shown by their `--help`.
-pub const EXIT_CODES: &str = "Exit codes: 0 success; 1 a doctor check failed, or another error; 2 usage error, or `repos add` before `provefab init` (clap prints the usage); 3 the configuration or the repository already exists; 4 stack or worker not recognised; 5 gh or network error. Errors are one line on stderr starting with `provefab:`.";
+pub const EXIT_CODES: &str = "Exit codes: 0 success; 1 a doctor check failed, or another error; 2 usage error (clap prints the usage), or `repos add` before `provefab init`; 3 the configuration or the repository already exists; 4 stack or worker not recognised; 5 gh or network error. Errors are one line on stderr starting with `provefab:`.";
 
 /// Why a setup command stopped; each kind has its exit code (spec section 6).
 #[derive(Debug, thiserror::Error)]
