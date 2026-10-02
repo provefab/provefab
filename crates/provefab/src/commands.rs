@@ -948,10 +948,21 @@ impl Default for Tools {
 async fn probe(program: &Path, args: &[&str], envs: &[(&str, &Path)]) -> Result<String, String> {
     probe_text(program, args, envs)
         .await
-        .map(|t| t.lines().next().unwrap_or_default().trim().to_string())
+        .map(|t| detail_line(&t))
 }
 
-/// Runs the program; its whole output on success, its first line on failure.
+/// The first line of a tool's output that is not a leading `WARNING:` line
+/// (final review: codex prints environment warnings before its answer).
+fn detail_line(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim);
+    let first = lines.clone().next().unwrap_or_default();
+    lines
+        .find(|l| !l.starts_with("WARNING:"))
+        .unwrap_or(first)
+        .to_string()
+}
+
+/// Runs the program; its whole output on success, its detail line on failure.
 async fn probe_text(
     program: &Path,
     args: &[&str],
@@ -975,14 +986,16 @@ async fn probe_text(
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let first = text.lines().next().unwrap_or_default().trim().to_string();
+    let first = detail_line(&text);
     if out.status.success() {
         Ok(text)
     } else {
-        Err(if first.is_empty() {
-            format!("exit {:?}", out.status.code())
-        } else {
+        Err(if !first.is_empty() {
             first
+        } else if let Some(code) = out.status.code() {
+            format!("exit {code}")
+        } else {
+            "exit (signal)".to_string()
         })
     }
 }
@@ -1176,22 +1189,30 @@ pub async fn doctor(
     }
     if uses_mode(WorkerKind::Codex, Auth::Subscription) {
         let codex_home = paths.codex_home();
-        checks.push(check(
-            "codex login",
-            probe(
-                &tools.codex,
-                &["login", "status"],
-                &[("CODEX_HOME", codex_home.as_path())],
-            )
-            .await,
-        ));
-        checks.push(check(
-            "codex guard hook",
-            crate::codex_setup::check(&tools.codex, &codex_home, &codex_home)
-                .await
-                .map(|_| "trusted, and no project is".to_string())
-                .map_err(|e| format!("{e} (run `provefab login codex`)")),
-        ));
+        if !codex_home.is_dir() {
+            // Final review: before `provefab login codex` creates it, codex
+            // only complains that CODEX_HOME is missing.
+            for name in ["codex login", "codex guard hook"] {
+                checks.push(check(name, Err("not signed in".into())));
+            }
+        } else {
+            checks.push(check(
+                "codex login",
+                probe(
+                    &tools.codex,
+                    &["login", "status"],
+                    &[("CODEX_HOME", codex_home.as_path())],
+                )
+                .await,
+            ));
+            checks.push(check(
+                "codex guard hook",
+                crate::codex_setup::check(&tools.codex, &codex_home, &codex_home)
+                    .await
+                    .map(|_| "trusted, and no project is".to_string())
+                    .map_err(|e| format!("{e} (run `provefab login codex`)")),
+            ));
+        }
     }
     if uses_mode(WorkerKind::Codex, Auth::ApiKey) {
         let home = paths.codex_home_api();
@@ -1582,6 +1603,60 @@ mod tests {
         let checks = doctor(&tools, &config, &Paths::new(d), None).await;
         let c = checks.iter().find(|c| c.name == "claude login").unwrap();
         assert_eq!((c.ok, c.detail.as_str()), (false, "not signed in"));
+    }
+
+    /// Final review: a silent failure reads `exit 1`, not Rust's Debug
+    /// `exit Some(1)`; a signal reads `exit (signal)`.
+    #[tokio::test]
+    async fn a_silent_failure_reads_its_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let silent = fake(d, "silent", "exit 1");
+        assert_eq!(probe(&silent, &[], &[]).await, Err("exit 1".to_string()));
+        let killed = fake(d, "killed", "kill -9 $$");
+        assert_eq!(
+            probe(&killed, &[], &[]).await,
+            Err("exit (signal)".to_string())
+        );
+    }
+
+    /// Final review: before `provefab login codex` created its directory,
+    /// both codex lines read `not signed in`; after, a leading `WARNING:`
+    /// line from codex is not the detail.
+    #[tokio::test]
+    async fn codex_lines_read_not_signed_in_and_skip_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tools = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: d.join("missing-claude"),
+            codex: fake(
+                d,
+                "codex-cli",
+                "if [ \"$1\" = login ]; then echo 'WARNING: proceeding, even though we could not update PATH'; echo 'Not logged in'; exit 1; fi; echo 'codex-cli 0.130.0'",
+            ),
+            pi: d.join("missing-pi"),
+            security: d.join("missing-security"),
+        };
+        let config = Config::from_toml_str(
+            "[jev]\nmodel = \"jev-1.13\"\n[[models]]\nid = \"x\"\nworker = \"codex\"\nmodel = \"gpt-5.5\"\ntier = \"standard\"\n",
+        )
+        .unwrap();
+        let paths = Paths::new(d);
+        let checks = doctor(&tools, &config, &paths, None).await;
+        let get = |n: &str| checks.iter().find(|c| c.name == n).cloned().unwrap();
+        for name in ["codex login", "codex guard hook"] {
+            assert_eq!(
+                (get(name).ok, get(name).detail.as_str()),
+                (false, "not signed in"),
+                "{name}"
+            );
+        }
+        std::fs::create_dir_all(paths.codex_home()).unwrap();
+        let checks = doctor(&tools, &config, &paths, None).await;
+        let login = checks.iter().find(|c| c.name == "codex login").unwrap();
+        assert_eq!((login.ok, login.detail.as_str()), (false, "Not logged in"));
     }
 
     #[tokio::test]
