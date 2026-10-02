@@ -966,6 +966,18 @@ esac"#;
     }
 
     #[test]
+    fn keychain_timeout_is_documented_in_readme_and_guide() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for file in ["README.md", "docs/guide/trackers.md"] {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(
+                text.contains("Keychain reads") && text.contains("time out after 10 seconds"),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
     fn references_titles_and_first_lines() {
         assert_eq!(issue_ref(7, None), "#7");
         assert_eq!(issue_ref(7, Some("ENG-7")), "ENG-7");
