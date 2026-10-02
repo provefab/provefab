@@ -1,4 +1,5 @@
-//! The README documents the Jira `site` rule (R5).
+//! The README documents the Jira `site` rule: the stricter validation is visible
+//! to users, and repository rule R5 wants the README updated with `docs/guide/`.
 
 #[test]
 fn readme_states_the_jira_site_rule() {
