@@ -562,7 +562,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     );
                     return Ok(ExitCode::FAILURE);
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(anyhow::anyhow!(setup::one_line(&format!("{e:#}")))),
             };
             let policy = ext.policy.clone();
             let warnings = policy.warnings(&config);

@@ -1126,6 +1126,14 @@ pub async fn doctor(
                 &[("CLAUDE_CONFIG_DIR", claude_config.as_path())],
             )
             .await
+            .map_err(|e| {
+                // A signed-out `claude auth status` exits non-zero with JSON.
+                if e.starts_with('{') {
+                    "not signed in".to_string()
+                } else {
+                    e
+                }
+            })
             .and_then(|t| claude_login(&t)),
         ));
     }
@@ -1549,6 +1557,31 @@ mod tests {
             "{}",
             checks[0].detail
         );
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_claude_reads_not_signed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tools = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: fake(
+                d,
+                "claude",
+                "if [ \"$1\" = auth ]; then printf '{\\n  \"loggedIn\": false\\n}\\n'; exit 1; fi; echo '2.1.281 (Claude Code)'",
+            ),
+            codex: d.join("missing-codex"),
+            pi: d.join("missing-pi"),
+            security: d.join("missing-security"),
+        };
+        let config = Config::from_toml_str(
+            "[jev]\nmodel = \"jev-1.13\"\n[[models]]\nid = \"c\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&tools, &config, &Paths::new(d), None).await;
+        let c = checks.iter().find(|c| c.name == "claude login").unwrap();
+        assert_eq!((c.ok, c.detail.as_str()), (false, "not signed in"));
     }
 
     #[tokio::test]

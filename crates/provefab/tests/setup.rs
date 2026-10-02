@@ -278,3 +278,22 @@ fn the_new_commands_document_their_exit_codes() {
         );
     }
 }
+
+/// An unparsable configuration is one `provefab:` line in text mode and one
+/// `configuration` line with --json; both exit 1.
+#[test]
+fn doctor_with_an_unparsable_configuration_stays_one_line() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("provefab.toml"), "[jev\nmodel = = 1\n[[repos]\n").unwrap();
+    let bin = bin_dir(t.path());
+    refused(&provefab(&home, &bin, &["doctor"]), 1);
+    let out = provefab(&home, &bin, &["doctor", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    let line: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(line["name"], "configuration");
+    assert_eq!(line["ok"], false);
+}
