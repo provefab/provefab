@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::commands::Check;
 use crate::config::Config;
 use crate::forge::{ForgeError, Git, RepoRoot};
 use crate::paths::Paths;
@@ -546,6 +547,89 @@ pub async fn repos_add(
         gates.join("; "),
         paths.home.join("repos").join(slug).display()
     ))
+}
+
+/// The start of the `configuration` line when there is no file.
+pub const NO_CONFIG: &str = "no configuration at";
+
+/// The command that fixes a failed check, when one does (spec section 5,
+/// plan decision 7). Installing a missing tool is left to the person.
+pub fn fix_for(check: &Check, config: Option<&Config>) -> Option<String> {
+    if check.ok {
+        return None;
+    }
+    let fix = match check.name.as_str() {
+        "configuration" if check.detail.starts_with(NO_CONFIG) => "provefab init",
+        "gh login" => "gh auth login",
+        "claude login" => "provefab login claude",
+        "claude api key" => "provefab login claude --api-key",
+        "codex login" | "codex guard hook" => "provefab login codex",
+        "codex api login" | "codex api guard hook" => "provefab login codex --api-key",
+        "jev key" => {
+            return Some(format!(
+                "security add-generic-password -s {} -a provefab -w",
+                crate::commands::KEYCHAIN_SERVICE
+            ));
+        }
+        name => {
+            let slug = name.strip_prefix("tracker ")?;
+            let tracker = config?
+                .repos
+                .iter()
+                .find(|r| r.slug == slug)?
+                .tracker
+                .as_ref()?;
+            return match tracker.kind {
+                crate::tracker::TrackerKind::Jira => Some(format!(
+                    "provefab login jira --site {}",
+                    tracker.site.as_deref()?
+                )),
+                crate::tracker::TrackerKind::Linear => Some("provefab login linear".into()),
+                crate::tracker::TrackerKind::Github => None,
+            };
+        }
+    };
+    Some(fix.to_string())
+}
+
+/// Whether `doctor` succeeds: every check passed, the Jev key being
+/// optional (plan decision 5, as `provefab doctor` always did).
+pub fn doctor_passed(checks: &[Check]) -> bool {
+    checks.iter().all(|c| c.ok || c.name == "jev key")
+}
+
+/// `doctor --json` (spec section 5): one object per check and line, with
+/// `fix` when a command fixes it. Details are redacted (plan decision 8).
+pub fn doctor_json(checks: &[Check], config: Option<&Config>) -> String {
+    let mut out = String::new();
+    for c in checks {
+        let mut line = serde_json::json!({
+            "name": c.name,
+            "ok": c.ok,
+            "detail": crate::rules::redact_credentials(&c.detail),
+        });
+        if let Some(fix) = fix_for(c, config) {
+            line["fix"] = Value::String(fix);
+        }
+        out.push_str(&line.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// The `configuration` line when the file is missing or does not load
+/// (plan decision 6).
+pub fn config_check(paths: &Paths, e: &anyhow::Error) -> Check {
+    let detail = if paths.config().exists() {
+        crate::rules::redact_credentials(&one_line(&e.to_string()))
+    } else {
+        format!("{NO_CONFIG} {}", paths.config().display())
+    };
+    Check {
+        name: "configuration".into(),
+        ok: false,
+        detail,
+    }
 }
 
 #[cfg(test)]
@@ -1250,5 +1334,141 @@ mod tests {
             .await
             .unwrap();
         assert!(!said.contains(DEPENDENCIES_NOTE), "{said}");
+    }
+
+    fn failed(name: &str, detail: &str) -> Check {
+        Check {
+            name: name.into(),
+            ok: false,
+            detail: detail.into(),
+        }
+    }
+
+    const TRACKED: &str = "[jev]\nmodel = \"jev-1.13.0\"\n[[models]]\nid = \"m\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\n[[repos]]\nslug = \"acme/api\"\ngates = [\"make\"]\n[repos.tracker]\nkind = \"jira\"\nsite = \"acme.atlassian.net\"\nproject = \"ENG\"\n[[repos]]\nslug = \"acme/web\"\ngates = [\"make\"]\n[repos.tracker]\nkind = \"linear\"\nproject = \"WEB\"\n";
+
+    /// Spec section 5: `fix` for sign-in and key checks, only when failed.
+    #[test]
+    fn sign_in_and_key_checks_carry_the_command_that_fixes_them() {
+        let config = Config::from_toml_str(TRACKED).unwrap();
+        for (name, fix) in [
+            ("gh login", Some("gh auth login")),
+            ("claude login", Some("provefab login claude")),
+            ("claude api key", Some("provefab login claude --api-key")),
+            ("codex login", Some("provefab login codex")),
+            ("codex guard hook", Some("provefab login codex")),
+            ("codex api login", Some("provefab login codex --api-key")),
+            (
+                "codex api guard hook",
+                Some("provefab login codex --api-key"),
+            ),
+            (
+                "jev key",
+                Some("security add-generic-password -s provefab-typesafe -a provefab -w"),
+            ),
+            (
+                "tracker acme/api",
+                Some("provefab login jira --site acme.atlassian.net"),
+            ),
+            ("tracker acme/web", Some("provefab login linear")),
+            ("tracker other/repo", None),
+            ("git", None),
+            ("claude", None),
+            ("repo acme/api", None),
+            ("gates acme/api", None),
+        ] {
+            assert_eq!(
+                fix_for(&failed(name, "x"), Some(&config)).as_deref(),
+                fix,
+                "{name}"
+            );
+            let passed = Check {
+                ok: true,
+                ..failed(name, "x")
+            };
+            assert_eq!(fix_for(&passed, Some(&config)), None, "{name}");
+        }
+        let missing = failed("configuration", &format!("{NO_CONFIG} /h/provefab.toml"));
+        assert_eq!(fix_for(&missing, None).as_deref(), Some("provefab init"));
+        let invalid = failed(
+            "configuration",
+            "provefab.toml: repo `x` is not `owner/name`",
+        );
+        assert_eq!(fix_for(&invalid, None), None);
+    }
+
+    /// Spec section 5 and Review Focus 5: the line shape, and no secret in
+    /// any field.
+    #[test]
+    fn json_lines_have_the_shape_and_no_secret() {
+        let checks = vec![
+            Check {
+                name: "git".into(),
+                ok: true,
+                detail: "git version 2.50".into(),
+            },
+            failed(
+                "gh login",
+                "token ghp_abcdefghijklmnopqrstuvwxyz0123456789 is invalid",
+            ),
+        ];
+        let out = doctor_json(&checks, None);
+        assert!(!out.contains("ghp_"), "{out}");
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            serde_json::json!({"name": "git", "ok": true, "detail": "git version 2.50"})
+        );
+        assert_eq!(
+            lines[1],
+            serde_json::json!({
+                "name": "gh login",
+                "ok": false,
+                "detail": "token <redacted> is invalid",
+                "fix": "gh auth login",
+            })
+        );
+    }
+
+    /// Plan decision 5: the exit code ignores the optional Jev key only.
+    #[test]
+    fn doctor_passes_when_every_check_but_the_jev_key_passes() {
+        let ok = Check {
+            name: "git".into(),
+            ok: true,
+            detail: String::new(),
+        };
+        assert!(doctor_passed(&[ok.clone(), failed("jev key", "missing")]));
+        assert!(!doctor_passed(&[ok.clone(), failed("gh login", "no")]));
+        assert!(!doctor_passed(&[failed("merge settings", "refused")]));
+        assert!(doctor_passed(&[]));
+    }
+
+    /// Plan decision 6: a missing file says so and points to `init`; a file
+    /// that does not load is reported on one line.
+    #[test]
+    fn a_configuration_that_does_not_load_is_one_failed_line() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let missing = config_check(&paths, &anyhow::anyhow!("reading x: No such file"));
+        assert_eq!(
+            (missing.name.as_str(), missing.ok),
+            ("configuration", false)
+        );
+        assert_eq!(
+            missing.detail,
+            format!("{NO_CONFIG} {}", paths.config().display())
+        );
+        std::fs::write(paths.config(), "[x").unwrap();
+        let e = Config::from_toml_str("[x").unwrap_err();
+        let bad = config_check(&paths, &anyhow::Error::from(e));
+        assert!(!bad.ok && !bad.detail.contains('\n'), "{bad:?}");
+        assert!(
+            bad.detail.starts_with("provefab.toml: TOML parse error"),
+            "{bad:?}"
+        );
     }
 }
