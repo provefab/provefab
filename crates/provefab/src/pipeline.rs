@@ -772,9 +772,17 @@ where
     /// the state change stays local (final review I1).
     async fn misrouted(&self, id: i64, what: &str) -> Result<bool, PipelineError> {
         let task = self.task(id).await?;
-        // A review task never writes to the tracker (plan decision 7).
+        // A review task never writes to the tracker (plan decision 7): `tell`
+        // sends its messages to the pull request and `relabel` returns before
+        // asking, and `risk_labels` only runs for Provefab's own changes. A
+        // future caller is refused, so a person's pull request is never
+        // labelled through here.
+        debug_assert!(
+            task.mode != TaskMode::PrReview,
+            "a review task never asks to write to the tracker"
+        );
         if task.mode == TaskMode::PrReview {
-            return Ok(false);
+            return Ok(true);
         }
         let Some(why) = crate::tracker::key_mismatch(task.issue_key.as_deref(), self.repo(&task))
         else {

@@ -424,3 +424,71 @@ async fn a_round_already_reviewed_finishes_without_another_review() {
     assert_eq!(p.runner.calls().len(), 1, "no second paid review");
     assert_eq!(pr_comments(&p).len(), 1);
 }
+
+/// Starts the next round on a new head, as a `/provefab review` after a push.
+async fn next_round(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>, f: &Fixture, id: i64) -> String {
+    let head = push_head(f, 12, &[("src/b.rs", "fn b() {}\n")]);
+    p.store.bump_review_rounds(id).await.unwrap();
+    p.store
+        .transition(id, Queued, "review again")
+        .await
+        .unwrap();
+    head
+}
+
+/// Spec section 6: a later round edits the one comment, and its finding
+/// keys continue after the earlier round's.
+#[tokio::test]
+async fn a_second_round_edits_the_comment_and_continues_the_keys() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue_pr(&p, 12).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let head = next_round(&p, &f, id).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    assert_eq!(p.runner.calls().len(), 2);
+    let comments = pr_comments(&p);
+    assert_eq!(comments.len(), 1, "edited, not posted again");
+    let body = &comments[0].2;
+    assert!(body.contains("- F3 · blocking · `src/a.rs:12`"), "{body}");
+    assert!(body.contains("- F4 · minor · `notes.md`"), "{body}");
+    assert!(!body.contains("- F1 ") && !body.contains("- F2 "), "{body}");
+    assert!(
+        body.contains(&format!("at commit `{}` (round 2).", &head[..12])),
+        "{body}"
+    );
+    assert!(
+        body.contains("reply `/provefab F3 rejected: <reason>`"),
+        "{body}"
+    );
+}
+
+/// Plan decision 3: a summary a person deleted is posted again, once.
+#[tokio::test]
+async fn a_deleted_summary_is_posted_again_once() {
+    let f = fixture(&["false"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue_pr(&p, 12).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let first = pr_comments(&p)[0].0;
+    p.hub.deleted_comments.lock().unwrap().push(first);
+    next_round(&p, &f, id).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let comments = pr_comments(&p);
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(comments[1].2.contains("(round 2)"), "{}", comments[1].2);
+}

@@ -97,9 +97,10 @@ fn detail(e: &ForgeError) -> String {
     crate::rules::redact_credentials(&e.to_string())
 }
 
-/// A comment a person deleted: editing it answers GitHub's 404.
+/// A comment a person deleted: editing it answers GitHub's 404. A
+/// repository that is gone also reads "not found" and is never one.
 fn gone(e: &ForgeError) -> bool {
-    e.is_not_found()
+    !e.is_permanent() && e.is_not_found()
 }
 
 impl<R, O, H> Pipeline<R, O, H>
@@ -673,6 +674,13 @@ mod tests {
             detail(&e)
         );
         assert!(!gone(&e));
+        // A repository gone is permanent, never a deleted comment.
+        assert!(!gone(&ForgeError::Failed {
+            program: "gh".into(),
+            args: "api".into(),
+            code: Some(1),
+            stderr: "ERROR: Repository not found.".into(),
+        }));
         assert!(gone(&ForgeError::Failed {
             program: "gh".into(),
             args: "api".into(),
