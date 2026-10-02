@@ -191,26 +191,27 @@ pub const BY_HAND: &str =
 const READ: &[&str] = &["package.json", "pyproject.toml"];
 
 /// Whether `url` (an `origin` remote) is github.com/`slug`, over HTTPS (with
-/// or without credentials) or SSH, any case, with or without `.git`.
+/// or without credentials), SSH or scp-style, any case, with or without
+/// `.git`. For a scheme URL the authority ends at the first `/`, `?` or `#`,
+/// its host follows the last `@`, and must be exactly github.com (no port),
+/// so userinfo cannot hide another host.
 pub fn origin_matches(url: &str, slug: &str) -> bool {
     let u = url.trim().trim_end_matches('/');
     let u = u.strip_suffix(".git").unwrap_or(u).to_ascii_lowercase();
     let want = slug.to_ascii_lowercase();
-    let plain = [
-        "https://github.com/",
-        "http://github.com/",
-        "git@github.com:",
-        "ssh://git@github.com/",
-    ]
-    .iter()
-    .any(|p| u.strip_prefix(p) == Some(want.as_str()));
-    let with_credentials = u.split_once("@github.com/").is_some_and(|(user, rest)| {
-        rest == want
-            && user
-                .strip_prefix("https://")
-                .is_some_and(|info| !info.contains('/'))
-    });
-    plain || with_credentials
+    if let Some(path) = u.strip_prefix("git@github.com:") {
+        return path == want;
+    }
+    let Some(rest) = ["https://", "http://", "ssh://"]
+        .iter()
+        .find_map(|scheme| u.strip_prefix(scheme))
+    else {
+        return false;
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    host == "github.com" && path.strip_prefix('/') == Some(want.as_str())
 }
 
 /// A gh failure as fixed text (plan decision 15, R3).
@@ -273,10 +274,20 @@ pub async fn read_root(
     })?;
     let mut files = std::collections::BTreeMap::new();
     for name in READ {
-        if entries.contains(*name)
-            && let Ok(Some(text)) = git.show_file(dir, &rev, name).await
-        {
-            files.insert(name.to_string(), text);
+        if !entries.contains(*name) {
+            continue;
+        }
+        match git.show_file(dir, &rev, name).await {
+            Ok(Some(text)) => {
+                files.insert(name.to_string(), text);
+            }
+            Ok(None) => {}
+            // Fixed text: git's own message is not shown.
+            Err(_) => {
+                return Err(SetupError::Usage(format!(
+                    "--path {shown}: cannot read {name} on {default_branch}"
+                )));
+            }
         }
     }
     Ok(RepoRoot {
@@ -728,6 +739,11 @@ mod tests {
                 Ok(vec!["ruff check .", "pytest"]),
             ),
             (
+                "python with a pyproject that does not parse",
+                vec![("pyproject.toml", "[project\nname = \n")],
+                Ok(vec!["pytest"]),
+            ),
+            (
                 "python without ruff",
                 vec![("pyproject.toml", "[project]\nname = \"x\"\n")],
                 Ok(vec!["pytest"]),
@@ -828,6 +844,12 @@ mod tests {
             "https://evil.example/@github.com/o/r",
             "/tmp/r",
             "git@github.com:o/r.git.bak",
+            "https://evil.example#@github.com/o/r",
+            "https://evil.example?@github.com/o/r",
+            "https://github.com.evil.example/o/r",
+            "https://evil.example/github.com/o/r",
+            "ssh://git@evil.example/github.com/o/r",
+            "https://github.com:8443/o/r",
         ] {
             assert!(!origin_matches(url, "o/r"), "{url}");
         }
@@ -900,5 +922,47 @@ mod tests {
                 "GitHub did not answer through gh; check `gh auth status` and the network"
             )
         );
+    }
+
+    /// Detection reads the default branch as committed, never the worktree.
+    #[tokio::test]
+    async fn a_file_only_in_the_working_tree_is_ignored() {
+        let b = both(&[("go.mod", "module x\n")]);
+        std::fs::write(b.checkout.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(b.checkout.join("package.json"), "{}").unwrap();
+        let root = read_root(&b.hub, &git(), "o/r", Some(&b.checkout))
+            .await
+            .unwrap();
+        assert!(!root.entries.contains("Cargo.toml"));
+        assert_eq!(stacks(&root), vec![Stack::Go]);
+        assert!(root.files.is_empty());
+    }
+
+    /// A package.json that git cannot read is an error, not "no scripts".
+    #[tokio::test]
+    async fn an_unreadable_manifest_is_an_error() {
+        use crate::testkit::git as sh;
+        let b = both(&[("go.mod", "module x\n")]);
+        // A package.json whose blob is missing: listed, but not readable.
+        std::fs::write(b.checkout.join("package.json"), "{\"name\":\"gone\"}").unwrap();
+        sh(&b.checkout, &["add", "package.json"]);
+        sh(&b.checkout, &["commit", "-q", "-m", "manifest"]);
+        let blob = sh(&b.checkout, &["rev-parse", "HEAD:package.json"]);
+        let blob = blob.trim();
+        let object = b
+            .checkout
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        std::fs::remove_file(object).unwrap();
+        sh(
+            &b.checkout,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let e = read_root(&b.hub, &git(), "o/r", Some(&b.checkout))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), 2);
+        assert!(e.to_string().contains("cannot read package.json"), "{e}");
     }
 }
