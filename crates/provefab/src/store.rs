@@ -293,10 +293,11 @@ impl Store {
         // first gets SQLITE_BUSY when another writer commits in between (review C1).
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let t = now();
-        // A review's pull request is the task's own from the start.
-        let (pr_url, pr_state) = match mode {
-            TaskMode::Issue => (None, None),
-            TaskMode::PrReview => (Some(issue.url.as_str()), Some("open")),
+        // A review's pull request is the task's own from the start, and it
+        // has no tracker key (spec section 3).
+        let (issue_key, pr_url, pr_state) = match mode {
+            TaskMode::Issue => (issue.issue_key.as_deref(), None, None),
+            TaskMode::PrReview => (None, Some(issue.url.as_str()), Some("open")),
         };
         let inserted = sqlx::query(
             "INSERT INTO tasks (repo, issue_number, issue_key, issue_url, title, author, state, created_at, updated_at, mode, pr_url, pr_state)
@@ -306,7 +307,7 @@ impl Store {
         // GitHub slugs are case-insensitive; (repo, mode, number) is the task's identity.
         .bind(issue.repo.to_lowercase())
         .bind(issue.number as i64)
-        .bind(&issue.issue_key)
+        .bind(issue_key)
         .bind(&issue.url)
         .bind(&issue.title)
         .bind(&issue.author)
@@ -2121,6 +2122,19 @@ mod tests {
             s.task(id).await.unwrap().unwrap().pr_head.as_deref(),
             Some("abc123")
         );
+    }
+
+    /// Spec section 3: a review has no tracker key, whatever the caller passes.
+    #[tokio::test]
+    async fn a_pull_request_review_never_keeps_an_issue_key() {
+        let (_d, s) = store().await;
+        let pr = NewIssue {
+            issue_key: Some("ENG-12".into()),
+            url: "https://github.com/o/r/pull/12".into(),
+            ..issue(12)
+        };
+        let id = s.add_pr_review(&pr, &[]).await.unwrap().unwrap();
+        assert_eq!(s.task(id).await.unwrap().unwrap().issue_key, None);
     }
 
     /// Plan decision 12: a merged or closed review is finished.
