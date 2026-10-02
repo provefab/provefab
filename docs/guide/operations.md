@@ -52,7 +52,7 @@ Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume 
 
 Provefab never deletes remote `provefab/revert-*` branches.
 
-The record (`change_events`, `findings`) is kept without limit. `provefab prune --before YYYY-MM-DD --yes` removes the record rows of finished tasks; the tasks themselves stay. `provefab export` never contains command output, which stays in `~/.provefab/sessions/`.
+The record (`change_events`, `findings`) and the maintenance runs (`maintenance_runs`) are kept without limit. `provefab prune --before YYYY-MM-DD --yes` removes the record rows of finished tasks and the maintenance runs that finished before the date, except the latest run of each repository and kind; the tasks themselves stay. `provefab export` never contains command output, which stays in `~/.provefab/sessions/`.
 
 `PROVEFAB_HOME` moves all of this elsewhere.
 

@@ -237,6 +237,17 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The WHERE clause of the maintenance runs a prune removes: finished before
+/// `?`, and not the latest of their repository and kind (as
+/// `last_maintenance_run` orders them).
+macro_rules! prunable_runs {
+    () => {
+        "finished_at < ? AND id != (SELECT m.id FROM maintenance_runs m \
+         WHERE LOWER(m.repo) = LOWER(maintenance_runs.repo) AND m.kind = maintenance_runs.kind \
+         ORDER BY m.started_at DESC, m.id DESC LIMIT 1)"
+    };
+}
+
 impl Store {
     /// Opens (creating if needed) the database and applies the migrations.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
@@ -1146,6 +1157,31 @@ impl Store {
         Ok((events, findings))
     }
 
+    /// How many maintenance runs `prune_maintenance_runs(before)` would delete.
+    pub async fn prunable_maintenance_runs(&self, before: i64) -> Result<u64, StoreError> {
+        let n: i64 = sqlx::query_scalar(concat!(
+            "SELECT COUNT(*) FROM maintenance_runs WHERE ",
+            prunable_runs!()
+        ))
+        .bind(before)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n as u64)
+    }
+
+    /// Deletes maintenance runs finished before `before`, except the latest
+    /// run of each repository (any case) and kind; returns how many.
+    pub async fn prune_maintenance_runs(&self, before: i64) -> Result<u64, StoreError> {
+        Ok(sqlx::query(concat!(
+            "DELETE FROM maintenance_runs WHERE ",
+            prunable_runs!()
+        ))
+        .bind(before)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
     /// Worker runs (stage runs with a model, not gates) started at or after `since`,
     /// across all tasks (the daily budget, D53).
     pub async fn worker_runs_since(&self, since: i64) -> Result<u32, StoreError> {
@@ -1741,6 +1777,62 @@ mod tests {
             .map(|f| f.rule)
             .collect();
         assert_eq!(rules, [Some("R3".to_string()), None]);
+    }
+
+    #[tokio::test]
+    async fn pruning_maintenance_runs_keeps_the_latest_of_each_repository_and_kind() {
+        let (_d, s) = store().await;
+        let run = |repo: &str, kind: &str, at: i64, done: bool| MaintenanceRun {
+            id: 0,
+            repo: repo.into(),
+            kind: kind.into(),
+            started_at: at,
+            finished_at: done.then_some(at + 5),
+            model_id: None,
+            cost_usd: None,
+            quota_units: None,
+            outcome: "ok".into(),
+            pr_url: None,
+            detail: None,
+        };
+        for (repo, kind, at, done) in [
+            ("O/R", "periodic", 10, true),
+            ("O/R", "periodic", 20, true),
+            ("O/R", "periodic", 30, true),
+            ("o/r", "rules", 10, true),
+            ("x/y", "periodic", 10, true),
+            ("x/y", "periodic", 500, true),
+            ("O/R", "rules", 5, false),
+        ] {
+            s.record_maintenance_run(&run(repo, kind, at, done))
+                .await
+                .unwrap();
+        }
+        assert_eq!(s.prunable_maintenance_runs(100).await.unwrap(), 3);
+        assert_eq!(s.maintenance_runs(None).await.unwrap().len(), 7);
+        assert_eq!(s.prune_maintenance_runs(100).await.unwrap(), 3);
+        let mut left: Vec<(String, String, i64)> = s
+            .maintenance_runs(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.repo, r.kind, r.started_at))
+            .collect();
+        left.sort();
+        let want = [
+            ("O/R", "periodic", 30),
+            ("O/R", "rules", 5),
+            ("o/r", "rules", 10),
+            ("x/y", "periodic", 500),
+        ]
+        .map(|(r, k, a)| (r.to_string(), k.to_string(), a));
+        assert_eq!(left, want);
+        let last = s
+            .last_maintenance_run("o/r", "periodic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.started_at, 30);
     }
 
     #[tokio::test]

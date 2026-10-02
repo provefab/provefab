@@ -52,7 +52,7 @@ Provefab Pro can propose rules from your team's decisions, at most once a week p
 
 `provefab log <id>` shows `rules_loaded` (the rule numbers, and how many the budget left out of the plan prompt) or `rules_invalid` (the reason). A pass can show the line more than once when its base is pinned again; the last one is the one in force.
 
-Known limits: a rule that was merged and removed again before any task read it leaves no trace in a task's log. `provefab prune` deletes the record of the tasks it removes, so the number of a removed rule that no remaining pass loaded can be forgotten, and Provefab Pro could propose that number again.
+Known limits: a rule that was merged and removed again before any task read it leaves no trace in a task's log. `provefab prune` deletes the record of the tasks it removes, so the number of a removed rule that no remaining pass loaded can be forgotten, and Provefab Pro could propose that number again. It also deletes old maintenance runs, so a proposal pull request recorded only by a pruned run is no longer counted as merged or refused.
 
 ## Security
 

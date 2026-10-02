@@ -69,7 +69,7 @@ Then put the `provefab` label on an issue. Provefab picks it up at its next poll
 | check tools, logins, Jev and repositories | `provefab doctor` |
 | measure: PRs opened, merged (automatically or by hand), reviewers | `provefab stats` |
 | export the record as JSON Lines | `provefab export` |
-| delete old records | `provefab prune --before YYYY-MM-DD --yes` |
+| delete old records and maintenance runs | `provefab prune --before YYYY-MM-DD --yes` |
 | see whether the service runs | `provefab service status` |
 | follow the service live | `tail -f ~/.provefab/logs/run.log` |
 | stop the service | `provefab service uninstall` |

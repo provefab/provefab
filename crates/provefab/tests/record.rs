@@ -783,6 +783,70 @@ async fn prune_keeps_a_task_whose_post_merge_check_is_still_running() {
     assert!(!p.store.events(id).await.unwrap().is_empty());
 }
 
+async fn record_periodic_runs(store: &provefab::store::Store, starts: &[i64]) {
+    for at in starts {
+        store
+            .record_maintenance_run(&provefab::store::MaintenanceRun {
+                id: 0,
+                repo: "o/r".into(),
+                kind: "periodic".into(),
+                started_at: *at,
+                finished_at: Some(*at + 5),
+                model_id: None,
+                cost_usd: None,
+                quota_units: None,
+                outcome: "ok".into(),
+                pr_url: None,
+                detail: None,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn prune_deletes_old_maintenance_runs_but_the_latest_of_each_kind() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    record_periodic_runs(&p.store, &[10, 20, 30]).await;
+    let dry = provefab::commands::prune(&p.store, "2999-01-01", false)
+        .await
+        .unwrap();
+    assert!(dry.contains("2 maintenance runs"), "{dry}");
+    assert!(dry.contains("dry run: pass --yes to delete"), "{dry}");
+    assert_eq!(p.store.maintenance_runs(None).await.unwrap().len(), 3);
+    let done = provefab::commands::prune(&p.store, "2999-01-01", true)
+        .await
+        .unwrap();
+    assert!(done.contains("2 maintenance runs"), "{done}");
+    let left = p.store.maintenance_runs(None).await.unwrap();
+    assert_eq!(left.iter().map(|r| r.started_at).collect::<Vec<_>>(), [30]);
+}
+
+#[tokio::test]
+async fn prune_keeps_maintenance_runs_finished_after_the_date() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    record_periodic_runs(&p.store, &[1_700_000_000, 1_700_086_400]).await;
+    let out = provefab::commands::prune(&p.store, "2000-01-01", true)
+        .await
+        .unwrap();
+    assert!(out.contains("0 maintenance runs"), "{out}");
+    assert_eq!(p.store.maintenance_runs(None).await.unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn log_shows_the_record_with_sources_and_current_dispositions() {
     let (_f, p, id) = open_task_with_findings().await;
