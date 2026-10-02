@@ -3,6 +3,7 @@
 const PLAN: &str = include_str!("../prompts/plan.md");
 const IMPLEMENT: &str = include_str!("../prompts/implement.md");
 const REVIEW: &str = include_str!("../prompts/review.md");
+const PR_REVIEW: &str = include_str!("../prompts/pr_review.md");
 
 /// The exact sentence every template carries, word for word, so an agent
 /// reading a rendered prompt always sees the same warning regardless of stage.
@@ -13,6 +14,8 @@ pub enum Template {
     Plan,
     Implement,
     Review,
+    /// A pull request a person wrote (PR review spec section 5).
+    PrReview,
 }
 
 /// Returns a backtick fence one longer than the longest run of consecutive
@@ -43,6 +46,7 @@ pub fn render(template: Template, vars: &[(&str, &str)]) -> String {
         Template::Plan => PLAN,
         Template::Implement => IMPLEMENT,
         Template::Review => REVIEW,
+        Template::PrReview => PR_REVIEW,
     };
     let computed_fence;
     let mut all_vars = vars.to_vec();
@@ -94,6 +98,7 @@ mod tests {
             (Template::Plan, PLAN),
             (Template::Implement, IMPLEMENT),
             (Template::Review, REVIEW),
+            (Template::PrReview, PR_REVIEW),
         ] {
             let before = text.strip_suffix("{{rules}}").expect("ends with {{rules}}");
             assert!(before.ends_with(".\n"), "{before}");
@@ -165,7 +170,12 @@ mod tests {
 
     #[test]
     fn every_template_marks_untrusted_text() {
-        for template in [Template::Plan, Template::Implement, Template::Review] {
+        for template in [
+            Template::Plan,
+            Template::Implement,
+            Template::Review,
+            Template::PrReview,
+        ] {
             let rendered = render(template, &[("diff", "+added line")]);
             assert!(rendered.contains(DATA_NOTICE), "{rendered}");
             assert!(rendered.contains("BEGIN UNTRUSTED"), "{rendered}");
@@ -206,5 +216,38 @@ mod tests {
             .find("END UNTRUSTED reviewer findings")
             .expect("end marker");
         assert!(begin < value && value < end, "{p}");
+    }
+
+    /// PR review spec section 5: the title and description are data, and
+    /// the scope rule is the description's, not an issue's.
+    #[test]
+    fn the_pull_request_prompt_keeps_its_text_between_markers() {
+        let p = render(
+            Template::PrReview,
+            &[
+                ("ref", "#12"),
+                ("title", "TITLE"),
+                ("body", "BODY"),
+                ("base", "main at 0123456789ab"),
+                ("diff", "+added line"),
+            ],
+        );
+        assert!(p.starts_with("You are the review stage"), "{p}");
+        let begin = p.find("BEGIN UNTRUSTED pull request").expect("begin");
+        let end = p.find("END UNTRUSTED pull request").expect("end");
+        for v in ["TITLE", "BODY"] {
+            let at = p.find(v).unwrap();
+            assert!(begin < at && at < end, "{p}");
+        }
+        assert!(p.contains("Pull request #12"), "{p}");
+        assert!(
+            p.contains("does not do what the description says, or does more"),
+            "{p}"
+        );
+        assert!(!p.contains("issue's scope"), "{p}");
+        assert!(
+            p.contains("+added line") && p.contains("main at 0123456789ab"),
+            "{p}"
+        );
     }
 }

@@ -390,7 +390,9 @@ pub struct Command {
 /// (after trimming) outside code fences. `Err(line)` for one that does not parse.
 pub fn parse_commands(body: &str) -> Vec<Result<Command, String>> {
     let mut out = Vec::new();
-    for (_, raw) in command_lines(body).filter(|(command, _)| *command) {
+    // A review request is a command of its own, never a finding's (plan decision 14).
+    for (_, raw) in command_lines(body).filter(|(command, raw)| *command && !is_review_request(raw))
+    {
         let line = raw.trim();
         // ASCII prefix, checked by `command_lines`: slicing after it is safe.
         let rest = line[PREFIX.len()..].trim();
@@ -429,6 +431,19 @@ pub fn strip_commands(body: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+/// The line that asks for a review of a pull request (PR review spec section 4).
+pub const REVIEW_REQUEST: &str = "/provefab review";
+
+/// Whether `body` asks for a review: a line that is exactly `/provefab
+/// review` (any case, surrounding spaces ignored) outside a code fence.
+pub fn requests_review(body: &str) -> bool {
+    command_lines(body).any(|(command, raw)| command && is_review_request(raw))
+}
+
+fn is_review_request(raw: &str) -> bool {
+    raw.trim().eq_ignore_ascii_case(REVIEW_REQUEST)
 }
 
 const PREFIX: &str = "/provefab ";
@@ -506,6 +521,24 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// PR review spec section 4 and Review Focus 3: the line alone, any
+    /// case, outside a code fence; never a finding command; never kept as a
+    /// change request.
+    #[test]
+    fn a_review_request_is_its_own_line_outside_code() {
+        assert!(requests_review("/provefab review"));
+        assert!(requests_review("Thanks!\n  /Provefab REVIEW  \n"));
+        assert!(!requests_review("/provefab review please"));
+        assert!(!requests_review("please /provefab review"));
+        assert!(!requests_review("> /provefab review"));
+        assert!(!requests_review("```\n/provefab review\n```"));
+        assert!(parse_commands("/provefab review").is_empty());
+        let parsed = parse_commands("/provefab review\n/provefab F1 fixed");
+        assert_eq!(parsed.len(), 1);
+        assert!(matches!(&parsed[0], Ok(c) if c.key == "F1"));
+        assert_eq!(strip_commands("Looks odd.\n/provefab review"), "Looks odd.");
+    }
     use super::*;
 
     #[test]
