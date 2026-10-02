@@ -594,11 +594,7 @@ pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
                 (file, None) if !file.is_empty() => file.clone(),
                 _ => "-".to_string(),
             };
-            let rule = f
-                .rule
-                .as_deref()
-                .map(|r| format!("{r} · "))
-                .unwrap_or_default();
+            let rule = crate::rules::prefix(f.rule.as_deref());
             let _ = writeln!(
                 out,
                 "  {} · {rule}{} · {place} · round {} · {}",
