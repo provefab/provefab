@@ -867,9 +867,81 @@ where
     }
 }
 
+/// `provefab status`'s words for a review task (spec section 8):
+/// `review queued`, `reviewing`, `reviewed (2 blocking)`, `merged`,
+/// `closed`, or `<state>: <reason>`.
+pub fn status_text(task: &TaskRow, blocking: usize, why: &str) -> String {
+    match (task.state, task.pr_state.as_deref()) {
+        (TaskState::PrOpen, Some("merged")) => "merged".into(),
+        (TaskState::PrOpen, Some("closed")) => "closed".into(),
+        (TaskState::PrOpen, _) if blocking == 0 => "reviewed (no blocking finding)".into(),
+        (TaskState::PrOpen, _) => format!("reviewed ({blocking} blocking)"),
+        (TaskState::Queued, _) => "review queued".into(),
+        (TaskState::Reviewing, _) => "reviewing".into(),
+        (s, _) => format!("{}: {why}", s.as_str()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_words_follow_the_review() {
+        let row = |state: TaskState, pr_state: &str| TaskRow {
+            id: 1,
+            repo: "o/r".into(),
+            issue_number: 12,
+            issue_key: None,
+            issue_url: "https://github.com/o/r/pull/12".into(),
+            title: "t".into(),
+            author: "carol".into(),
+            state,
+            kind: None,
+            attempts: 0,
+            review_rounds: 0,
+            branch: None,
+            worktree: None,
+            pr_url: Some("https://github.com/o/r/pull/12".into()),
+            pr_state: Some(pr_state.into()),
+            reopen_count: 0,
+            escalated: false,
+            mode: crate::task::TaskMode::PrReview,
+            pr_head: None,
+        };
+        assert_eq!(
+            status_text(&row(TaskState::Queued, "open"), 0, "intake"),
+            "review queued"
+        );
+        assert_eq!(
+            status_text(&row(TaskState::Reviewing, "open"), 0, "x"),
+            "reviewing"
+        );
+        assert_eq!(
+            status_text(&row(TaskState::PrOpen, "open"), 2, "x"),
+            "reviewed (2 blocking)"
+        );
+        assert_eq!(
+            status_text(&row(TaskState::PrOpen, "open"), 0, "x"),
+            "reviewed (no blocking finding)"
+        );
+        assert_eq!(
+            status_text(&row(TaskState::PrOpen, "merged"), 2, "x"),
+            "merged"
+        );
+        assert_eq!(
+            status_text(&row(TaskState::PrOpen, "closed"), 0, "x"),
+            "closed"
+        );
+        assert_eq!(
+            status_text(
+                &row(TaskState::Waiting, "open"),
+                0,
+                "no Standard model is free"
+            ),
+            "waiting: no Standard model is free"
+        );
+    }
 
     /// Plan decision 5: the label is created where GitHub is the tracker only.
     #[test]

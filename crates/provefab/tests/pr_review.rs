@@ -1198,3 +1198,84 @@ async fn a_parked_review_that_ended_is_prunable() {
     assert!(prunable.contains(&id), "{prunable:?}");
     assert!(!prunable.contains(&issue), "{prunable:?}");
 }
+
+/// Spec section 8 and plan decision 18.
+#[tokio::test]
+async fn status_log_export_and_stats_show_reviews_apart() {
+    let f = fixture(&["test -f feature.txt"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let issue = queue(&p).await;
+    let id = queue_pr(&p, 12).await;
+    let status = provefab::commands::status(&p.store).await.unwrap();
+    assert!(
+        status.contains(&format!("{id:>4}  o/r PR #12 · review queued\n")),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("{issue:>4}  o/r#7  queued")),
+        "{status}"
+    );
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let status = provefab::commands::status(&p.store).await.unwrap();
+    assert!(
+        status.contains(&format!("{id:>4}  o/r PR #12 · reviewed (1 blocking)\n")),
+        "{status}"
+    );
+    let log = provefab::commands::log(&p.store, id).await.unwrap();
+    assert!(
+        log.contains("state pr_open  mode pr_review  kind -"),
+        "{log}"
+    );
+    let log = provefab::commands::log(&p.store, issue).await.unwrap();
+    assert!(log.contains("state queued  mode issue  kind -"), "{log}");
+    let export = provefab::commands::export(&p.store, None, None, false)
+        .await
+        .unwrap();
+    for line in export.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let task = v["task"].as_i64().unwrap();
+        let want = if task == id { "pr_review" } else { "issue" };
+        assert_eq!(v["mode"], want, "{line}");
+    }
+    let stats = provefab::commands::stats(&p.store).await.unwrap();
+    assert!(
+        stats.contains("o/r: 1 tasks · 0 PRs (0%)"),
+        "the review is not an issue task: {stats}"
+    );
+    assert!(
+        stats.contains(
+            "  pull request reviews: 1 pull request · 1 round · 2 findings (1 blocking)\n"
+        ),
+        "{stats}"
+    );
+}
+
+/// Review Focus 1: `provefab run` starts on a Jira repository holding a review task.
+#[tokio::test]
+async fn tracker_history_leaves_pull_request_reviews_alone() {
+    let mut f = fixture(&["false"]);
+    f.config.repos[0].tracker = Some(provefab::tracker::TrackerConfig {
+        kind: provefab::tracker::TrackerKind::Jira,
+        site: Some("acme.atlassian.net".into()),
+        project: Some("ENG".into()),
+    });
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    queue_ticket(&p, 12, "ENG-12", "https://acme.atlassian.net/browse/ENG-12").await;
+    queue_pr(&p, 12).await;
+    provefab::commands::tracker_history(&p.store, &p.config)
+        .await
+        .unwrap();
+}

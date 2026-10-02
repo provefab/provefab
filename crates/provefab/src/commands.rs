@@ -17,7 +17,7 @@ use crate::ports::{Forge, Hub};
 use crate::post_merge::CheckState;
 use crate::record::{Event, MergedBy, StoredEvent, parse_date, redact_event, redact_text};
 use crate::store::{NewIssue, Store, StoreError};
-use crate::task::TaskState;
+use crate::task::{TaskMode, TaskState};
 use crate::tracker::{TicketUrl, TrackerKind, parse_ticket_url, split_key};
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +86,10 @@ pub async fn tracker_history(store: &Store, config: &Config) -> Result<(), Comma
         .collect();
     let mut lines = Vec::new();
     for task in store.tasks_in(&TaskState::ALL).await? {
+        // A review task never writes to the tracker (PR review plan decision 7).
+        if task.mode == TaskMode::PrReview {
+            continue;
+        }
         if !still_touches_tracker(&task) && !pending.contains(&task.id) {
             continue;
         }
@@ -284,6 +288,22 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
             .map(|r| r.reason.clone())
             .unwrap_or_default();
         let why = why.lines().next().unwrap_or_default();
+        if t.mode == TaskMode::PrReview {
+            let blocking = store
+                .final_round_findings(t.id, crate::pipeline::pass_of(&t))
+                .await?
+                .iter()
+                .filter(|f| f.severity == "blocking")
+                .count();
+            let _ = writeln!(
+                out,
+                "{:>4}  {} · {}",
+                t.id,
+                t.repo_reference(),
+                crate::pr_review::status_text(&t, blocking, why)
+            );
+            continue;
+        }
         let _ = writeln!(
             out,
             "{:>4}  {}  {:<12} {}{}",
@@ -348,10 +368,31 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
         stopped: u32,
         seconds_to_pr: Vec<i64>,
         reviewers: BTreeMap<String, u32>,
+        pr_reviews: u32,
+        pr_rounds: u32,
+        pr_findings: u32,
+        pr_blocking: u32,
     }
     let mut repos: BTreeMap<String, Repo> = BTreeMap::new();
     for t in store.tasks_in(&TaskState::ALL).await? {
         let r = repos.entry(t.repo.clone()).or_default();
+        // Reviews of people's pull requests are counted apart (spec section 8).
+        if t.mode == TaskMode::PrReview {
+            r.pr_reviews += 1;
+            let rounds: std::collections::BTreeSet<u64> = store
+                .events(t.id)
+                .await?
+                .iter()
+                .filter(|e| e.kind == "review")
+                .filter_map(|e| e.payload["round"].as_u64())
+                .collect();
+            r.pr_rounds += rounds.len() as u32;
+            for f in store.findings(t.id).await? {
+                r.pr_findings += 1;
+                r.pr_blocking += u32::from(f.severity == "blocking");
+            }
+            continue;
+        }
         r.tasks += 1;
         if matches!(t.state, TaskState::Failed | TaskState::NeedsYou) {
             r.stopped += 1;
@@ -419,38 +460,56 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
             }
         });
         let pct = (r.prs * 100).checked_div(r.tasks).unwrap_or(0);
-        let _ = writeln!(
-            out,
-            "{slug}: {} tasks · {} PRs ({pct}%) · merged {} (auto {}, by hand {}) · closed {} · stopped {} · reopened after merge {} · post-merge passed {} · flaky {} · superseded {} · reverts opened {} · blocked {}",
-            r.tasks,
-            r.prs,
-            r.merged,
-            r.auto,
-            r.merged - r.auto,
-            r.closed,
-            r.stopped,
-            r.reopened_after_merge,
-            r.post_merge_passed,
-            r.post_merge_flaky,
-            r.post_merge_superseded,
-            r.revert_prs,
-            r.post_merge_blocked
-        );
-        let _ = writeln!(out, "  median issue to PR: {median}");
-        let pairs: Vec<String> = r
-            .reviewers
-            .iter()
-            .map(|(k, n)| format!("{k} ({n})"))
-            .collect();
-        let _ = writeln!(
-            out,
-            "  reviewers: {}",
-            if pairs.is_empty() {
-                "-".to_string()
-            } else {
-                pairs.join(", ")
-            }
-        );
+        if r.tasks > 0 {
+            let _ = writeln!(
+                out,
+                "{slug}: {} tasks · {} PRs ({pct}%) · merged {} (auto {}, by hand {}) · closed {} · stopped {} · reopened after merge {} · post-merge passed {} · flaky {} · superseded {} · reverts opened {} · blocked {}",
+                r.tasks,
+                r.prs,
+                r.merged,
+                r.auto,
+                r.merged - r.auto,
+                r.closed,
+                r.stopped,
+                r.reopened_after_merge,
+                r.post_merge_passed,
+                r.post_merge_flaky,
+                r.post_merge_superseded,
+                r.revert_prs,
+                r.post_merge_blocked
+            );
+            let _ = writeln!(out, "  median issue to PR: {median}");
+            let pairs: Vec<String> = r
+                .reviewers
+                .iter()
+                .map(|(k, n)| format!("{k} ({n})"))
+                .collect();
+            let _ = writeln!(
+                out,
+                "  reviewers: {}",
+                if pairs.is_empty() {
+                    "-".to_string()
+                } else {
+                    pairs.join(", ")
+                }
+            );
+        } else {
+            let _ = writeln!(out, "{slug}:");
+        }
+        if r.pr_reviews > 0 {
+            let s = |n: u32| if n == 1 { "" } else { "s" };
+            let _ = writeln!(
+                out,
+                "  pull request reviews: {} pull request{} · {} round{} · {} finding{} ({} blocking)",
+                r.pr_reviews,
+                s(r.pr_reviews),
+                r.pr_rounds,
+                s(r.pr_rounds),
+                r.pr_findings,
+                s(r.pr_findings),
+                r.pr_blocking
+            );
+        }
     }
     Ok(out)
 }
@@ -459,12 +518,13 @@ pub async fn stats(store: &Store) -> Result<String, CommandError> {
 pub async fn log(store: &Store, id: i64) -> Result<String, CommandError> {
     let t = store.task(id).await?.ok_or(CommandError::UnknownTask(id))?;
     let mut out = format!(
-        "task {} {} \"{}\" ({})\nstate {}  kind {}  attempts {}  review rounds {}{}\n",
+        "task {} {} \"{}\" ({})\nstate {}  mode {}  kind {}  attempts {}  review rounds {}{}\n",
         t.id,
         t.repo_reference(),
         t.title,
         t.issue_url,
         t.state.as_str(),
+        t.mode.as_str(),
         t.kind.map(|k| k.as_str()).unwrap_or("-"),
         t.attempts,
         t.review_rounds,
@@ -734,14 +794,14 @@ pub async fn export(
     for (t, e) in events {
         line(serde_json::json!({
             "type": "event", "task": t.id, "repo": t.repo, "issue": t.issue_number,
-            "issue_key": t.issue_key, "seq": e.seq, "kind": e.kind, "source": e.source,
+            "issue_key": t.issue_key, "mode": t.mode.as_str(), "seq": e.seq, "kind": e.kind, "source": e.source,
             "schema_version": e.schema_version, "at": e.at,
             "payload": if with_text { e.payload.clone() } else { redact_event(&e) },
         }));
     }
     for (t, f, d) in findings {
         line(serde_json::json!({
-            "type": "finding", "task": t.id, "key": f.key, "pass": f.pass,
+            "type": "finding", "task": t.id, "mode": t.mode.as_str(), "key": f.key, "pass": f.pass,
             "round": f.round, "reviewer_model": f.reviewer_model,
             "severity": f.severity, "file": f.file, "line": f.line, "rule": f.rule,
             "text": if with_text { serde_json::Value::String(f.text.clone()) } else { redact_text(&f.text) },
