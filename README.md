@@ -74,6 +74,8 @@ Then put the `provefab` label on an issue. Provefab picks it up at its next poll
 | follow the service live | `tail -f ~/.provefab/logs/run.log` |
 | stop the service | `provefab service uninstall` |
 
+When several repositories share a Jira project or Linear team, `provefab add` picks the repository by the ticket's label, ignoring case (`Web` matches `web`).
+
 Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in comments that always start with *Posted by Provefab*, and opens the pull request on GitHub. Labels track progress:
 
 | Label | Meaning |
