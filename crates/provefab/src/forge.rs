@@ -75,6 +75,13 @@ fn status_text(status: &Option<u16>) -> String {
 }
 
 impl ForgeError {
+    /// True when gh answered HTTP 404: the thing it addressed (a comment a
+    /// person deleted) is gone.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, ForgeError::Failed { stderr, .. }
+            if stderr.contains("HTTP 404") || stderr.to_lowercase().contains("not found"))
+    }
+
     /// True when waiting cannot help: a worktree on the wrong branch, or an
     /// issue or repository that does not exist or is not accessible.
     pub fn is_permanent(&self) -> bool {
@@ -604,8 +611,19 @@ impl Git {
     pub async fn fetch_pr_head(&self, repo: &Path, number: u64) -> Result<String, ForgeError> {
         let local = format!("refs/provefab/pull/{number}");
         let refspec = format!("+refs/pull/{number}/head:{local}");
-        self.git(repo, &["fetch", "--quiet", "origin", &refspec])
-            .await?;
+        // The commit may come from a fork: no tags, no submodules.
+        self.git(
+            repo,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "origin",
+                &refspec,
+            ],
+        )
+        .await?;
         self.rev_parse(repo, &local).await
     }
 
@@ -1043,7 +1061,7 @@ impl Gh {
                 "provefab: {slug} has {ISSUE_LIMIT}+ open pull requests into {base}; only the first {ISSUE_LIMIT} are read"
             );
         }
-        Ok(prs
+        let parsed: Vec<PullRequest> = prs
             .iter()
             .filter_map(|p| {
                 Some(PullRequest {
@@ -1068,7 +1086,14 @@ impl Gh {
                     comments: parse_comments(p),
                 })
             })
-            .collect())
+            .collect();
+        if parsed.len() < prs.len() {
+            eprintln!(
+                "provefab: {slug}: skipped {} pull request(s) gh listed without a number, author or branch",
+                prs.len() - parsed.len()
+            );
+        }
+        Ok(parsed)
     }
 
     /// Open issues carrying `label` (spec §3.3).
@@ -2244,6 +2269,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_missing_comment_is_not_found_whatever_gh_words_it() {
+        let failed = |stderr: &str| ForgeError::Failed {
+            program: "gh".into(),
+            args: "api".into(),
+            code: Some(1),
+            stderr: stderr.into(),
+        };
+        assert!(failed("gh: Not Found (HTTP 404)").is_not_found());
+        assert!(failed("HTTP 404: Not Found").is_not_found());
+        assert!(!failed("HTTP 502: Bad Gateway").is_not_found());
+        assert!(!ForgeError::Parse("x".into(), "HTTP 404".into()).is_not_found());
+    }
+
     /// Spec section 5: `refs/pull/<n>/head` holds a fork's commits too.
     #[tokio::test]
     async fn a_pull_requests_head_is_fetched_even_from_a_fork() {
@@ -2252,7 +2291,7 @@ mod tests {
             dir.path(),
             "git clone -q origin.git fork && cd fork && git config user.email t@t && git config user.name t \
              && echo f > f.txt && git add -A && git commit -q -m fork \
-             && git push -q origin HEAD:refs/pull/7/head",
+             && git tag pr-tag && git push -q origin pr-tag HEAD:refs/pull/7/head",
         )
         .await;
         let g = git();
@@ -2260,6 +2299,10 @@ mod tests {
         assert_eq!(
             g.rev_parse(&repo, "refs/provefab/pull/7").await.unwrap(),
             sha
+        );
+        assert!(
+            g.rev_parse(&repo, "refs/tags/pr-tag").await.is_err(),
+            "a fork's tags are never fetched"
         );
         assert!(
             g.fetch_pr_head(&repo, 8).await.is_err(),
