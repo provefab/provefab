@@ -129,7 +129,8 @@ fn comment_of(c: &Value) -> Option<Comment> {
 
 /// The cursor of the page after `page`, unless the listing should stop: no
 /// next page, `pages` already read up to `cap`, or a cursor seen before (a
-/// server that always says there is more cannot keep Provefab looping).
+/// server that always says there is more cannot keep Provefab looping). The
+/// log line names which of the last two stopped it.
 fn next_page(
     page: &Value,
     seen: &mut HashSet<String>,
@@ -138,11 +139,32 @@ fn next_page(
     what: &str,
 ) -> Option<String> {
     let cursor = page_end(page)?;
-    if pages >= cap || !seen.insert(cursor.clone()) {
-        eprintln!("provefab: linear {what}: stopped after {pages} pages");
+    if let Some(reason) = stop_reason(&cursor, seen, pages, cap) {
+        eprintln!("provefab: {}", stop_message(what, pages, reason));
         return None;
     }
     Some(cursor)
+}
+
+/// Why listing stops at `cursor`, if it does. The cap is checked first, so a
+/// cursor is not recorded once the cap is reached.
+fn stop_reason(
+    cursor: &str,
+    seen: &mut HashSet<String>,
+    pages: usize,
+    cap: usize,
+) -> Option<&'static str> {
+    if pages >= cap {
+        Some("page cap")
+    } else if !seen.insert(cursor.to_string()) {
+        Some("repeated cursor")
+    } else {
+        None
+    }
+}
+
+fn stop_message(what: &str, pages: usize, reason: &str) -> String {
+    format!("linear {what}: stopped after {pages} pages ({reason})")
 }
 
 fn page_end(page: &Value) -> Option<String> {
@@ -479,6 +501,26 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const KEY: &str = "lin_api_SECRET_123";
+
+    #[test]
+    fn stop_message_names_the_reason() {
+        assert_eq!(
+            stop_message("issues", 5, "page cap"),
+            "linear issues: stopped after 5 pages (page cap)"
+        );
+        assert_eq!(
+            stop_message("issues", 2, "repeated cursor"),
+            "linear issues: stopped after 2 pages (repeated cursor)"
+        );
+    }
+
+    #[test]
+    fn stop_reason_tells_cap_from_repeated_cursor() {
+        let mut seen = HashSet::new();
+        assert_eq!(stop_reason("c1", &mut seen, 1, 3), None);
+        assert_eq!(stop_reason("c1", &mut seen, 2, 3), Some("repeated cursor"));
+        assert_eq!(stop_reason("c2", &mut seen, 3, 3), Some("page cap"));
+    }
 
     fn linear(server: &MockServer) -> Linear {
         Linear::new(&server.uri(), "ENG", KEY.into())
