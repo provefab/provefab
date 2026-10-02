@@ -1660,12 +1660,15 @@ Please reply with what should happen, what happens instead, and how to reproduce
         detail: &str,
     ) -> Result<TaskState, PipelineError> {
         let pass = u64::from(task.reopen_count) + 1;
+        // A review's pass never changes: its retries are counted per round,
+        // so an earlier round's failures never cut a later one short.
+        let round = (task.mode == TaskMode::PrReview).then_some(u64::from(task.review_rounds));
         let earlier = self
             .store
             .recent_outputs(task.id, "transient", u32::MAX)
             .await?
             .into_iter()
-            .filter(|t| t["pass"].as_u64() == Some(pass))
+            .filter(|t| t["pass"].as_u64() == Some(pass) && t["round"].as_u64() == round)
             .count();
         let Some(delay) = self.config.limits.retry_delays.get(earlier).copied() else {
             return self
@@ -1683,7 +1686,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             .record_output(
                 task.id,
                 "transient",
-                &json!({"pass": pass, "at": at, "reason": public}),
+                &json!({"pass": pass, "round": round, "at": at, "reason": public}),
             )
             .await?;
         self.go(

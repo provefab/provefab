@@ -461,6 +461,36 @@ async fn a_recorded_review_alone_finishes_the_round_without_another() {
     assert!(comments[0].2.contains("std-claude"), "{}", comments[0].2);
 }
 
+/// Final review I2: a review's transient retries are counted per round, so
+/// an earlier round's failures never send a later one straight to the person.
+#[tokio::test]
+async fn transient_retries_are_counted_per_round() {
+    let f = fixture(&["false"]);
+    let mut config = f.config.clone();
+    config.limits.retry_delays = vec![std::time::Duration::ZERO];
+    let f = Fixture { config, ..f };
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    // No head pushed yet: fetching it fails, a transient failure.
+    let id = queue_pr(&p, 12).await;
+    assert_eq!(p.drive(id).await.unwrap(), Waiting);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    // Round 2: the head is gone again, and its first failure retries.
+    git(&f.origin, &["update-ref", "-d", "refs/pull/12/head"]);
+    p.store.bump_review_rounds(id).await.unwrap();
+    p.store
+        .transition(id, Queued, "review again")
+        .await
+        .unwrap();
+    assert_eq!(p.drive(id).await.unwrap(), Waiting);
+}
+
 /// Starts the next round on a new head, as a `/provefab review` after a push.
 async fn next_round(p: &Pipeline<FakeRunner, FakeOracle, FakeHub>, f: &Fixture, id: i64) -> String {
     let head = push_head(f, 12, &[("src/b.rs", "fn b() {}\n")]);
