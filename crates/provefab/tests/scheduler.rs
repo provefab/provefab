@@ -35,6 +35,7 @@ async fn run_once_polls_creates_labels_and_drives_to_a_pr() {
             "provefab:needs-info",
             "provefab:failed",
             "provefab:merged",
+            "provefab:review",
             "provefab:risk-ci",
             "provefab:risk-dependencies",
             "provefab:risk-migrations",

@@ -10,17 +10,18 @@ use serde_json::{Value, json};
 
 use crate::agents::StageRunner;
 use crate::config::RepoConfig;
-use crate::forge::ForgeError;
+use crate::forge::{Comment, ForgeError, is_bot_comment};
+use crate::intake::IntakeError;
 use crate::pipeline::{
     Claim, DIFF_LIMIT, Outcome, Pipeline, PipelineError, exit_name, pass_of, truncate,
 };
-use crate::ports::{Hub, Oracle};
+use crate::ports::{Forge, Hub, Oracle};
 use crate::prompts::{Template, render};
-use crate::record::{Event, FindingRow};
+use crate::record::{Event, FindingRow, requests_review};
 use crate::risk::{self, Detected};
 use crate::router::resolve_tier;
 use crate::stage::{ReviewOutput, ReviewVerdict, output_schema};
-use crate::store::{TaskRow, Write};
+use crate::store::{Also, NewIssue, Store, StoreError, TaskRow, Write};
 use crate::task::{Stage, TaskState, Tier};
 
 /// The hidden line after the bot line of the summary comment (spec section 6).
@@ -101,6 +102,176 @@ fn detail(e: &ForgeError) -> String {
 /// repository that is gone also reads "not found" and is never one.
 fn gone(e: &ForgeError) -> bool {
     !e.is_permanent() && e.is_not_found()
+}
+
+/// `<label>:review` (spec section 4), with its colour and description.
+pub fn review_label(repo: &RepoConfig) -> (String, &'static str, &'static str) {
+    (
+        format!("{}:review", repo.label),
+        "1d76db",
+        "Ask Provefab to review this pull request",
+    )
+}
+
+/// What the scheduler creates at startup: the review label goes on GitHub
+/// pull requests, so only where GitHub is also the tracker (plan decision 5).
+pub fn labels_to_create(repo: &RepoConfig) -> Vec<(String, &'static str, &'static str)> {
+    if repo.tracker_kind() == crate::tracker::TrackerKind::Github {
+        vec![review_label(repo)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Provefab's own pull requests come from `provefab/` branches (spec section 4).
+pub fn is_own_branch(head_ref: &str) -> bool {
+    head_ref.starts_with("provefab/")
+}
+
+/// Who may ask for a review in a comment: a repository owner, an
+/// organization member or a collaborator. The pull request's author alone
+/// is not enough (spec decision 6), and Provefab's own comments never count.
+pub fn may_request(c: &Comment) -> bool {
+    !is_bot_comment(&c.body)
+        && matches!(c.association.as_str(), "OWNER" | "MEMBER" | "COLLABORATOR")
+}
+
+/// The newest `/provefab review` from someone who may ask, posted after
+/// `seen` (RFC 3339, as GitHub writes it, so it sorts as a string).
+pub fn newest_request<'a>(comments: &'a [Comment], seen: Option<&str>) -> Option<&'a Comment> {
+    comments
+        .iter()
+        .filter(|c| may_request(c) && requests_review(&c.body))
+        .filter(|c| seen.is_none_or(|s| c.created_at.as_str() > s))
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+}
+
+/// Between rounds: a new request starts the next one (plan decision 8).
+fn idle(task: &TaskRow) -> bool {
+    matches!(
+        task.state,
+        TaskState::PrOpen | TaskState::NeedsYou | TaskState::Failed
+    )
+}
+
+/// The newest request the task's rounds already answered.
+pub(crate) async fn last_seen(store: &Store, id: i64) -> Result<Option<String>, StoreError> {
+    Ok(store
+        .last_output(id, "pr_trigger")
+        .await?
+        .and_then(|v| v["seen"].as_str().map(str::to_string)))
+}
+
+/// Starts the next round of an idle review task. The state moves first: a
+/// crash before the trigger is kept costs one more round, never a lost
+/// request. A closed pull request that was reopened is open again.
+pub(crate) async fn start_round(
+    store: &Store,
+    task: &TaskRow,
+    by: &str,
+    login: Option<&str>,
+    seen: Option<&str>,
+) -> Result<(), StoreError> {
+    let reason = match login {
+        Some(l) => format!("review requested by {l}"),
+        None => "review requested with the label".to_string(),
+    };
+    store
+        .transition_and(task.id, TaskState::Queued, &reason, Also::NewRound)
+        .await?;
+    if task.pr_state.as_deref() != Some("open") {
+        store.set_pr_state(task.id, "open").await?;
+    }
+    store
+        .record_output(
+            task.id,
+            "pr_trigger",
+            &json!({"round": task.review_rounds + 1, "by": by, "login": login, "seen": seen}),
+        )
+        .await
+}
+
+/// One poll of a repository's open pull requests (spec section 4, plan
+/// decisions 2, 4 and 8): a label or an authorised `/provefab review`
+/// creates a review task; on an idle task, the label put back since the
+/// last poll, or (when the watch does not read its comments) a newer
+/// command, starts the next round. Returns the tasks queued.
+pub async fn poll_prs(
+    forge: &impl Forge,
+    repo: &RepoConfig,
+    store: &Store,
+) -> Result<Vec<i64>, IntakeError> {
+    let label = review_label(repo).0;
+    let mut queued = Vec::new();
+    for pr in forge.open_pull_requests(&repo.slug, &repo.base).await? {
+        if pr.base != repo.base || is_own_branch(&pr.head_ref) {
+            continue;
+        }
+        let labelled = pr.labels.contains(&label);
+        let snapshot = json!({"title": pr.title, "body": pr.body});
+        let newest = newest_request(&pr.comments, None).map(|c| c.created_at.clone());
+        let Some(task) = store.task_of_pr(&repo.slug, pr.number).await? else {
+            let by = if labelled {
+                ("label", None)
+            } else if let Some(c) = newest_request(&pr.comments, None) {
+                ("command", Some(c.author.clone()))
+            } else {
+                continue;
+            };
+            let trigger = json!({"round": 0, "by": by.0, "login": by.1, "seen": newest});
+            let present = json!({"present": labelled});
+            let new = NewIssue {
+                repo: repo.slug.clone(),
+                number: pr.number,
+                issue_key: None,
+                url: pr.url.clone(),
+                title: pr.title.clone(),
+                author: pr.author.clone(),
+            };
+            let outputs = [
+                ("pr", &snapshot),
+                ("pr_trigger", &trigger),
+                ("pr_label", &present),
+            ];
+            if let Some(id) = store.add_pr_review(&new, &outputs).await? {
+                queued.push(id);
+            }
+            continue;
+        };
+        if !idle(&task) {
+            continue;
+        }
+        if store.last_output(task.id, "pr").await?.as_ref() != Some(&snapshot) {
+            store.record_output(task.id, "pr", &snapshot).await?;
+        }
+        let before = store
+            .last_output(task.id, "pr_label")
+            .await?
+            .and_then(|v| v["present"].as_bool())
+            .unwrap_or(false);
+        if before != labelled {
+            store
+                .record_output(task.id, "pr_label", &json!({"present": labelled}))
+                .await?;
+        }
+        // An open, reviewed pull request's commands are read by the watch,
+        // from all its comments (plan decision 2).
+        let watched = task.state == TaskState::PrOpen && task.pr_state.as_deref() == Some("open");
+        let seen = last_seen(store, task.id).await?;
+        let command = (!watched)
+            .then(|| newest_request(&pr.comments, seen.as_deref()))
+            .flatten();
+        let by = if labelled && !before {
+            Some(("label", None))
+        } else {
+            command.map(|c| ("command", Some(c.author.as_str())))
+        };
+        if let Some((by, login)) = by {
+            start_round(store, &task, by, login, newest.as_deref()).await?;
+            queued.push(task.id);
+        }
+    }
+    Ok(queued)
 }
 
 impl<R, O, H> Pipeline<R, O, H>
@@ -577,6 +748,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan decision 5: the label is created where GitHub is the tracker only.
+    #[test]
+    fn the_review_label_is_created_only_where_github_is_the_tracker() {
+        let mut repo: RepoConfig = toml::from_str("slug = \"o/r\"\ngates = [\"true\"]\n").unwrap();
+        assert_eq!(
+            labels_to_create(&repo),
+            vec![(
+                "provefab:review".to_string(),
+                "1d76db",
+                "Ask Provefab to review this pull request"
+            )]
+        );
+        for kind in [
+            crate::tracker::TrackerKind::Jira,
+            crate::tracker::TrackerKind::Linear,
+        ] {
+            repo.tracker = Some(crate::tracker::TrackerConfig {
+                kind,
+                site: None,
+                project: None,
+            });
+            assert!(labels_to_create(&repo).is_empty());
+        }
+    }
+
+    /// Spec section 4: only someone with a role on the repository may ask;
+    /// the author's association alone (a contributor) never is one.
+    #[test]
+    fn only_an_owner_a_member_or_a_collaborator_may_request() {
+        let c = |association: &str, body: &str| Comment {
+            author: "carol".into(),
+            association: association.into(),
+            body: body.into(),
+            created_at: "2026-10-02T00:00:00Z".into(),
+        };
+        for a in ["OWNER", "MEMBER", "COLLABORATOR"] {
+            assert!(may_request(&c(a, "/provefab review")), "{a}");
+        }
+        for a in [
+            "CONTRIBUTOR",
+            "FIRST_TIME_CONTRIBUTOR",
+            "FIRST_TIMER",
+            "NONE",
+            "MANNEQUIN",
+            "",
+        ] {
+            assert!(!may_request(&c(a, "/provefab review")), "{a}");
+        }
+        let bot = format!("{}\n/provefab review", crate::forge::BOT_PREFIX);
+        assert!(!may_request(&c("OWNER", &bot)));
+    }
 
     fn finding(
         key: &str,

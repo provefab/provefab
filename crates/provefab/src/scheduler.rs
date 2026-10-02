@@ -203,6 +203,15 @@ where
                 );
             }
         }
+        // PR review spec section 4 (plan decision 5).
+        for (name, color, text) in crate::pr_review::labels_to_create(repo) {
+            if let Err(e) = p.hub.ensure_label(&repo.slug, &name, color, text).await {
+                eprintln!(
+                    "provefab: could not create label {name} on {}: {e}",
+                    repo.slug
+                );
+            }
+        }
         // Risk labels up front too, so a round's label edit rarely meets one
         // that does not exist yet (the pipeline still ensures each on use).
         let risk: Vec<String> = crate::risk::resolve(repo.risk.as_ref())
@@ -319,6 +328,19 @@ where
                     }
                     Ok(_) => {}
                     Err(e) => eprintln!("provefab: intake for {} failed: {e}", repo.slug),
+                }
+                match crate::pr_review::poll_prs(&p.hub, repo, &p.store).await {
+                    Ok(ids) if !ids.is_empty() => eprintln!(
+                        "provefab: {} pull request review(s) queued from {}",
+                        ids.len(),
+                        repo.slug
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!(
+                        "provefab: pull request intake for {} failed: {}",
+                        repo.slug,
+                        crate::rules::redact_credentials(&e.to_string())
+                    ),
                 }
                 for t in listed(&p, &[TaskState::NeedsInfo]).await {
                     // A task a runner just parked may still be posting its question (review I2).

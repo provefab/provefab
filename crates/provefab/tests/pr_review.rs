@@ -492,3 +492,268 @@ async fn a_deleted_summary_is_posted_again_once() {
     assert_eq!(comments.len(), 2, "{comments:?}");
     assert!(comments[1].2.contains("(round 2)"), "{}", comments[1].2);
 }
+
+fn said(author: &str, association: &str, body: &str, at: i64) -> Comment {
+    Comment {
+        author: author.into(),
+        association: association.into(),
+        body: body.into(),
+        created_at: provefab::store::rfc3339(at),
+    }
+}
+
+fn pr(n: u64, labels: &[&str], comments: Vec<Comment>) -> PullRequest {
+    PullRequest {
+        number: n,
+        url: format!("https://github.com/o/r/pull/{n}"),
+        title: format!("Change {n}"),
+        body: "Adds src/a.rs.".into(),
+        author: "carol".into(),
+        head_ref: "carol/change".into(),
+        base: "main".into(),
+        labels: labels.iter().map(|s| s.to_string()).collect(),
+        comments,
+    }
+}
+
+async fn poll<R: StageRunner + Sync, O: Oracle + Sync>(p: &Pipeline<R, O, FakeHub>) -> Vec<i64> {
+    provefab::pr_review::poll_prs(&p.hub, &p.config.repos[0], &p.store)
+        .await
+        .unwrap()
+}
+
+/// Spec section 4: the label queues one review; keeping it queues no
+/// other; removing it and adding it again, seen across two polls, does.
+#[tokio::test]
+async fn the_label_queues_one_review_and_putting_it_back_queues_another() {
+    let f = fixture(&["false"]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    *p.hub.open_prs.lock().unwrap() = vec![pr(12, &["provefab:review"], vec![])];
+    let ids = poll(&p).await;
+    assert_eq!(ids.len(), 1);
+    let t = p.store.task(ids[0]).await.unwrap().unwrap();
+    assert_eq!(
+        (t.mode, t.state, t.title.as_str(), t.author.as_str()),
+        (TaskMode::PrReview, Queued, "Change 12", "carol")
+    );
+    let trigger = p
+        .store
+        .last_output(t.id, "pr_trigger")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (trigger["round"].clone(), trigger["by"].clone()),
+        (json!(0), json!("label"))
+    );
+    assert!(poll(&p).await.is_empty(), "the task exists");
+    // Between rounds: the label still there is no new request.
+    p.store.transition(t.id, PrOpen, "reviewed").await.unwrap();
+    assert!(poll(&p).await.is_empty());
+    *p.hub.open_prs.lock().unwrap() = vec![pr(12, &[], vec![])];
+    assert!(poll(&p).await.is_empty(), "removed");
+    *p.hub.open_prs.lock().unwrap() = vec![pr(12, &["provefab:review"], vec![])];
+    assert_eq!(poll(&p).await, [t.id], "added again");
+    let t = p.store.task(t.id).await.unwrap().unwrap();
+    assert_eq!((t.state, t.review_rounds), (Queued, 1));
+}
+
+/// Spec section 4 and Review Focus 3: a member's command queues a review;
+/// the author's own command, or a fenced one, does not.
+#[tokio::test]
+async fn a_command_from_a_member_queues_a_review_and_the_authors_does_not() {
+    let f = fixture(&["false"]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let t0 = provefab::store::now();
+    *p.hub.open_prs.lock().unwrap() = vec![
+        pr(
+            13,
+            &[],
+            vec![said("carol", "CONTRIBUTOR", "/provefab review", t0)],
+        ),
+        pr(
+            14,
+            &[],
+            vec![said("bob", "MEMBER", "Looks big.\n/provefab review", t0)],
+        ),
+        pr(
+            15,
+            &[],
+            vec![said("bob", "MEMBER", "```\n/provefab review\n```", t0)],
+        ),
+    ];
+    let ids = poll(&p).await;
+    assert_eq!(ids.len(), 1);
+    let t = p.store.task(ids[0]).await.unwrap().unwrap();
+    assert_eq!(t.issue_number, 14);
+    let trigger = p
+        .store
+        .last_output(t.id, "pr_trigger")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            trigger["by"].clone(),
+            trigger["login"].clone(),
+            trigger["seen"].clone()
+        ),
+        (
+            json!("command"),
+            json!("bob"),
+            json!(provefab::store::rfc3339(t0))
+        )
+    );
+    assert!(p.store.task_of_pr("o/r", 13).await.unwrap().is_none());
+    assert!(p.store.task_of_pr("o/r", 15).await.unwrap().is_none());
+    // A stopped review: only a newer command starts the next round.
+    p.store.transition(t.id, Failed, "stopped").await.unwrap();
+    assert!(poll(&p).await.is_empty(), "already answered");
+    *p.hub.open_prs.lock().unwrap() = vec![pr(
+        14,
+        &[],
+        vec![
+            said("bob", "MEMBER", "/provefab review", t0),
+            said("dana", "OWNER", "/provefab review", t0 + 60),
+        ],
+    )];
+    assert_eq!(poll(&p).await, [t.id]);
+    let trigger = p
+        .store
+        .last_output(t.id, "pr_trigger")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (trigger["round"].clone(), trigger["login"].clone()),
+        (json!(1), json!("dana"))
+    );
+}
+
+/// Spec section 4: on a public repository the pull request's author, or
+/// anyone without a role on the repository, cannot spend the owner's
+/// subscriptions with a command, however often they ask.
+#[tokio::test]
+async fn an_author_only_command_on_a_public_repository_is_refused() {
+    let f = fixture(&["false"]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let t0 = provefab::store::now();
+    *p.hub.open_prs.lock().unwrap() = vec![pr(
+        18,
+        &[],
+        vec![
+            said("carol", "CONTRIBUTOR", "/provefab review", t0),
+            said(
+                "carol",
+                "FIRST_TIME_CONTRIBUTOR",
+                "/provefab review",
+                t0 + 1,
+            ),
+            said("eve", "NONE", "/provefab review", t0 + 2),
+        ],
+    )];
+    assert!(poll(&p).await.is_empty());
+    assert!(p.store.task_of_pr("o/r", 18).await.unwrap().is_none());
+}
+
+/// Spec section 4: a push alone starts no new round.
+#[tokio::test]
+async fn a_push_alone_starts_no_round() {
+    let f = fixture(&["false"]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    *p.hub.open_prs.lock().unwrap() = vec![pr(19, &["provefab:review"], vec![])];
+    let id = poll(&p).await[0];
+    p.store.transition(id, PrOpen, "reviewed").await.unwrap();
+    *p.hub.open_prs.lock().unwrap() = vec![PullRequest {
+        title: "Change 19, pushed again".into(),
+        ..pr(19, &["provefab:review"], vec![])
+    }];
+    assert!(poll(&p).await.is_empty());
+    let t = p.store.task(id).await.unwrap().unwrap();
+    assert_eq!((t.state, t.review_rounds), (PrOpen, 0));
+}
+
+/// Spec section 4: Provefab's own branches and other bases are left alone.
+#[tokio::test]
+async fn own_branches_and_other_bases_are_left_alone() {
+    let f = fixture(&["false"]);
+    let p = pipeline(
+        &f,
+        Box::new(finds),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let own = PullRequest {
+        head_ref: "provefab/7-add-a-feature-file".into(),
+        ..pr(16, &["provefab:review"], vec![])
+    };
+    let other = PullRequest {
+        base: "develop".into(),
+        ..pr(17, &["provefab:review"], vec![])
+    };
+    *p.hub.open_prs.lock().unwrap() = vec![own, other];
+    assert!(poll(&p).await.is_empty());
+    assert_eq!(
+        *p.hub.pr_polls.lock().unwrap(),
+        vec![("o/r".to_string(), "main".to_string())]
+    );
+}
+
+/// `provefab run --once` finds a labelled pull request and reviews it.
+#[tokio::test]
+async fn run_once_reviews_a_labelled_pull_request() {
+    let f = fixture(&["test -f feature.txt"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    *p.hub.open_prs.lock().unwrap() = vec![pr(12, &["provefab:review"], vec![])];
+    let opts = provefab::scheduler::RunOptions {
+        workers: 2,
+        once: true,
+    };
+    provefab::scheduler::run(p.clone(), opts, std::future::pending::<()>())
+        .await
+        .unwrap();
+    let t = p.store.task_of_pr("o/r", 12).await.unwrap().unwrap();
+    assert_eq!(t.state, PrOpen);
+    assert_eq!(p.hub.pr_comments.lock().unwrap().len(), 1);
+    assert!(
+        p.hub
+            .ensured
+            .lock()
+            .unwrap()
+            .contains(&"provefab:review".to_string())
+    );
+}
