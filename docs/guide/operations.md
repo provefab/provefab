@@ -20,7 +20,7 @@ provefab service uninstall             # stop and remove the service
 - installing or moving a tool (`claude`, `codex`, `gh`, `cargo`...);
 - editing `provefab.toml`.
 
-Only one `provefab run` works at a time, thanks to the `~/.provefab/run.lock` lock. To run a pass by hand while the service runs, stop the service first.
+Only one process works on the queue at a time, thanks to the `~/.provefab/run.lock` lock, shared by `provefab run` and the commands that need the queue. To run a pass by hand while the service runs, stop the service first.
 
 `--workers N` sets how many tasks run in parallel. Each model stays limited by its `max_concurrency`, often 1 for a subscription.
 
@@ -82,7 +82,7 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do.
 | `model ... removed: its worker is not ready` in the log | its worker is not installed or not signed in; Provefab dropped it from the catalog at startup | fix the matching `doctor` line, then `provefab service install` |
 | every task in `waiting` | every model of the tier is paused, or the daily budget is reached | `provefab status` gives the reason; wait, or widen the catalog or the budget |
 | the service cannot find `claude` or `cargo` | `PATH` frozen at install time | run `provefab service install` again from a terminal where the tool is found |
-| `another provefab run is already working` | the service already runs | `provefab service uninstall` before a manual pass |
+| `another Provefab process holds the queue lock` | the service or another command that needs the queue is running; wait for it to exit | `provefab service uninstall` before a manual pass |
 | `price <id>: no price` in `doctor` | the model matched no known price (a new model, a typo, or a Pi provider models.dev does not list); it still runs, ranked after priced models, and its cost is not counted | set `price_id = "provider/model"`, or `price_in` and `price_out` |
 | `prices: snapshot` or an old cache in `doctor` | the machine could not reach models.dev or LiteLLM | nothing to do: routing uses the cache or the built-in prices; the service tries again an hour later |
 | `rules <slug> FAIL` in `doctor` | `.provefab/rules.md` is invalid (the line says why) or could not be read; tasks run without rules meanwhile | fix the file in a pull request and merge it (see [Repository rules](rules.md)); `doctor` reads the base branch as last fetched |

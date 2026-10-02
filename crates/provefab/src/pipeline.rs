@@ -248,11 +248,7 @@ fn findings_text(r: &ReviewOutput, keys: &[String]) -> String {
             } else {
                 String::new()
             };
-            let rule = f
-                .rule
-                .as_deref()
-                .map(|r| format!("{r} · "))
-                .unwrap_or_default();
+            let rule = crate::rules::prefix(f.rule.as_deref());
             format!("- {key}{rule}{sev} · `{}{at}` · {}", f.file, f.text)
         })
         .collect::<Vec<_>>()
@@ -374,11 +370,7 @@ fn review_notes(review: &ReviewOutput, final_round: &[FindingRow]) -> Option<Str
         .iter()
         .map(|f| {
             let at = f.line.map(|l| format!(":{l}")).unwrap_or_default();
-            let rule = f
-                .rule
-                .as_deref()
-                .map(|r| format!("{r} · "))
-                .unwrap_or_default();
+            let rule = crate::rules::prefix(f.rule.as_deref());
             format!(
                 "- {} · {rule}{} · `{}{at}` · {} ({})",
                 f.key, f.severity, f.file, f.text, f.reviewer_model

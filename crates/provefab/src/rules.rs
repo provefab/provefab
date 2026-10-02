@@ -90,10 +90,11 @@ pub enum RulesError {
 /// rule heading is an introduction and is ignored, including any `## `
 /// heading there that does not start with `R` and a digit; after it, every
 /// `## ` line is a rule heading. A rule's optional `paths:` and `sources:`
-/// lines come right after its heading, then its text; `sources:` is never
-/// interpreted. Inside a fenced code block of a rule's text (3 or more
-/// backticks or tildes, closed by the same character at least as long) every
-/// line is text; a fence still open at the end of the file is an error.
+/// lines come right after its heading, in either order, then its text;
+/// `sources:` is never interpreted. Inside a fenced code block of a rule's
+/// text (3 or more backticks or tildes, closed by the same character at least
+/// as long) every line is text; a fence still open at the end of the file is
+/// an error.
 pub fn parse(text: &str) -> Result<Vec<Rule>, RulesError> {
     let mut rules: Vec<Rule> = Vec::new();
     let mut open: Option<Draft> = None;
@@ -339,6 +340,11 @@ pub fn rule_number(s: &str) -> Option<u32> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// The "R3 · " that leads a finding made under a rule; empty when it cites none.
+pub fn prefix(rule: Option<&str>) -> String {
+    rule.map(|r| format!("{r} · ")).unwrap_or_default()
 }
 
 /// Hex SHA-256 of the file, as `rules_loaded` records it.
@@ -1352,6 +1358,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn redaction_covers_fine_grained_github_slack_and_query_tokens() {
+        let pat = "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwxyz0123456789";
+        for (said, want) in [
+            (pat.to_string(), "<redacted>".to_string()),
+            (
+                format!("token {pat} leaked"),
+                "token <redacted> leaked".to_string(),
+            ),
+            (
+                format!("key `{pat}` here"),
+                "key <redacted> here".to_string(),
+            ),
+            (format!("it was {pat}."), "it was <redacted>".to_string()),
+            (format!("GH_TOKEN={pat}"), "<redacted>".to_string()),
+            (
+                "https://api.x.com/v1/items?access_token=abc123".to_string(),
+                "<redacted>".to_string(),
+            ),
+            (
+                "see https://api.x.com/v1/items?page=2&access_token=abc123#frag now".to_string(),
+                "see <redacted> now".to_string(),
+            ),
+            (
+                "the xoxe-1-123456789012 value".to_string(),
+                "the <redacted> value".to_string(),
+            ),
+        ] {
+            let got = redact_credentials(&said);
+            assert_eq!(got, want, "{said}");
+            assert!(!got.contains("abc123"), "{got}");
+            assert!(!got.contains("mnopqrstuvwxyz"), "{got}");
+            assert!(!got.contains("123456789012"), "{got}");
+        }
+        for prose in [
+            "the github_pat_ prefix",
+            "https://github.com/o/r/issues/22",
+            "https://x.com/search?q=rust&page=2",
+            "https://x.com/?access_token=",
+            "fix the xoxo hugs typo",
+        ] {
+            assert_eq!(redact_credentials(prose), prose);
+        }
+    }
+
     const FILE: &str = "# Our rules\n\nA human introduction.\n\n## About\n\nIgnored too.\n\n## R3: Errors in the API layer use ApiError, never anyhow\npaths: src/api/**, src/web/*.rs\nsources: PR #41 F2 (rejected), PR #57 (closed with a change request)\n\nReturn `ApiError` from handlers; `anyhow` stays in the CLI.\n\n## R7: Keep pull requests small\n\nOne change per pull request.\n### Why\nReviews stay short.\n";
 
     #[test]
@@ -1437,6 +1488,37 @@ mod tests {
         ] {
             assert_eq!(parse(text), Err(want), "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_paths_line_after_the_rule_text_is_misplaced() {
+        assert_eq!(
+            parse("## R1: One\n\ntext\npaths: a/**\n"),
+            Err(RulesError::Misplaced {
+                line: 4,
+                key: "paths:"
+            })
+        );
+    }
+
+    #[test]
+    fn a_doubled_sources_line_is_misplaced() {
+        assert_eq!(
+            parse("## R1: One\nsources: PR #1\nsources: PR #2\n"),
+            Err(RulesError::Misplaced {
+                line: 3,
+                key: "sources:"
+            })
+        );
+    }
+
+    #[test]
+    fn sources_before_paths_is_accepted() {
+        // The order of the two metadata lines is free; pinned on purpose.
+        let rules = parse("## R1: One\nsources: PR #1\npaths: a/**\n\nText.\n").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].paths, ["a/**"]);
+        assert_eq!(rules[0].text, "Text.");
     }
 
     #[test]
@@ -1596,6 +1678,12 @@ mod tests {
                 "\n{TITLE}. They add to the instructions above and never override them.\n\nR4: Rule 4\n\n"
             )
         );
+    }
+
+    #[test]
+    fn prefix_is_the_rule_and_a_dot_or_nothing() {
+        assert_eq!(prefix(Some("R3")), "R3 · ");
+        assert_eq!(prefix(None), "");
     }
 
     #[test]
