@@ -129,7 +129,8 @@ fn comment_of(c: &Value) -> Option<Comment> {
 
 /// The cursor of the page after `page`, unless the listing should stop: no
 /// next page, `pages` already read up to `cap`, or a cursor seen before (a
-/// server that always says there is more cannot keep Provefab looping).
+/// server that always says there is more cannot keep Provefab looping). The
+/// log line names which of the last two stopped it.
 fn next_page(
     page: &Value,
     seen: &mut HashSet<String>,
@@ -138,11 +139,32 @@ fn next_page(
     what: &str,
 ) -> Option<String> {
     let cursor = page_end(page)?;
-    if pages >= cap || !seen.insert(cursor.clone()) {
-        eprintln!("provefab: linear {what}: stopped after {pages} pages");
+    if let Some(reason) = stop_reason(&cursor, seen, pages, cap) {
+        eprintln!("provefab: {}", stop_message(what, pages, reason));
         return None;
     }
     Some(cursor)
+}
+
+/// Why listing stops at `cursor`, if it does. The cap is checked first, so a
+/// cursor is not recorded once the cap is reached.
+fn stop_reason(
+    cursor: &str,
+    seen: &mut HashSet<String>,
+    pages: usize,
+    cap: usize,
+) -> Option<&'static str> {
+    if pages >= cap {
+        Some("page cap")
+    } else if !seen.insert(cursor.to_string()) {
+        Some("repeated cursor")
+    } else {
+        None
+    }
+}
+
+fn stop_message(what: &str, pages: usize, reason: &str) -> String {
+    format!("linear {what}: stopped after {pages} pages ({reason})")
 }
 
 fn page_end(page: &Value) -> Option<String> {
@@ -479,6 +501,53 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const KEY: &str = "lin_api_SECRET_123";
+
+    #[test]
+    fn stop_message_names_the_reason() {
+        assert_eq!(
+            stop_message("issues", 5, "page cap"),
+            "linear issues: stopped after 5 pages (page cap)"
+        );
+        assert_eq!(
+            stop_message("issues", 2, "repeated cursor"),
+            "linear issues: stopped after 2 pages (repeated cursor)"
+        );
+    }
+
+    #[test]
+    fn stop_reason_tells_cap_from_repeated_cursor() {
+        let mut seen = HashSet::new();
+        assert_eq!(stop_reason("c1", &mut seen, 1, 3), None);
+        assert_eq!(stop_reason("c1", &mut seen, 2, 3), Some("repeated cursor"));
+        assert_eq!(stop_reason("c2", &mut seen, 3, 3), Some("page cap"));
+    }
+
+    #[test]
+    fn docs_name_both_stop_reasons() {
+        let guide = include_str!("../../../docs/guide/trackers.md");
+        let readme = include_str!("../../../README.md");
+        for reason in ["page cap", "repeated cursor"] {
+            assert!(guide.contains(&format!("({reason})")), "guide: {reason}");
+            assert!(readme.contains(reason), "readme: {reason}");
+        }
+    }
+
+    /// The docs quote the message as the code builds it, with `N` for the
+    /// page count: a reason named elsewhere in the text is not enough.
+    #[test]
+    fn docs_quote_the_stop_message() {
+        let guide = include_str!("../../../docs/guide/trackers.md");
+        let readme = include_str!("../../../README.md");
+        for reason in ["page cap", "repeated cursor"] {
+            let line = stop_message("issues", 7, reason).replace("after 7 pages", "after N pages");
+            let quoted = format!("`{line}`");
+            assert!(guide.contains(&quoted), "guide: {quoted}");
+            assert!(readme.contains(&quoted), "readme: {quoted}");
+        }
+        let comments = stop_message("comments", 7, "page cap");
+        let prefix = comments.split("stopped").next().unwrap().trim_end();
+        assert!(guide.contains(&format!("`{prefix}`")), "guide: {prefix}");
+    }
 
     fn linear(server: &MockServer) -> Linear {
         Linear::new(&server.uri(), "ENG", KEY.into())
