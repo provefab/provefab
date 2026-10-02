@@ -323,7 +323,7 @@ mod tests {
                 "{command}"
             );
         }
-        for command in ["git diff HEAD~1", "cat src/a.rs | head -20"] {
+        for command in ["git diff HEAD~1", "cat src/a.rs | head -n 20"] {
             let command = format!("cd {} && {command}", r.path().display());
             assert_eq!(
                 decision(true, GuardFormat::Codex, codex(&command)),
@@ -461,7 +461,7 @@ mod tests {
         let refused = run_guard_review(
             GuardFormat::Codex,
             Some(root),
-            &bare(&format!("cat {abs} | head -5")).to_string(),
+            &bare(&format!("cat {abs} | head -n 5")).to_string(),
         );
         assert!(
             refused

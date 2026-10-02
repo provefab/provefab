@@ -266,48 +266,118 @@ fn check_review_segment(words: &[String], cwd: &Path, root: &Path) -> Decision {
         ));
     }
     let args = &argv[1..];
-    let refused = |a: &String| -> bool {
-        let short = |letter: char| short_flags(a).is_some_and(|f| f.contains(letter));
-        match program.as_str() {
-            "find" => {
-                matches!(
-                    a.as_str(),
-                    "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls" | "-follow"
-                ) || a.starts_with("-fprint")
-                    || a == "-L"
-                    || a == "-H"
-            }
-            // `--pre` and `--hostname-bin` run a program of the caller's choice.
-            "rg" => {
-                a.starts_with("--pre")
-                    || a.starts_with("--hostname-bin")
-                    || a == "--follow"
-                    || short('L')
-            }
-            // GNU `-R` and BSD `-S` follow every symbolic link while recursing.
-            "grep" => a.starts_with("--dereference-recursive") || short('R') || short('S'),
-            "ls" => short('L') || a == "--dereference",
-            _ => false,
-        }
-    };
-    if let Some(a) = args.iter().find(|a| refused(a)) {
-        return Decision::Deny(format!(
-            "`{program} {a}` is refused in a pull request review"
-        ));
-    }
     if program == "git" {
         return check_review_git(args, cwd, root);
     }
-    check_review_paths(program, args, cwd, root)
+    check_review_options(program, args, cwd, root)
 }
 
-/// Every operand, option value and attached path is read relative to `cwd`
-/// and must stay in the worktree. A `grep` or `rg` pattern is not a path,
-/// and its pattern-file argument (`-f`) is.
-fn check_review_paths(program: &str, args: &[String], cwd: &Path, root: &Path) -> Decision {
-    if program == "grep" || program == "rg" {
-        return check_search_paths(program, args, cwd, root);
+/// Short flags without an argument each program may take in a review. A
+/// cluster such as `-rn` is allowed only when every letter is listed. GNU
+/// `grep -R` follows every symbolic link, so it is left out.
+fn review_flags(program: &str) -> &'static str {
+    match program {
+        "grep" => "nilLcwxFEHhrsq",
+        "rg" => "nilcwxFHs",
+        "ls" => "la1Rd",
+        "wc" => "lwc",
+        _ => "",
     }
+}
+
+/// Long options without an argument each program may take in a review.
+fn review_long(program: &str) -> &'static [&'static str] {
+    match program {
+        "grep" => &["--color=never"],
+        "rg" => &["--no-heading", "--color=never", "--hidden"],
+        _ => &[],
+    }
+}
+
+/// The review's option allowlist (controller ruling after the re-review):
+/// any option not listed is refused, so none can run a program, follow a
+/// link or read a file the guard did not see. Every other word is a path
+/// that must resolve inside the worktree, except `-e`'s argument and the
+/// first operand of `grep`/`rg` without `-e` (the pattern), and `find`'s
+/// expression arguments.
+fn check_review_options(program: &str, args: &[String], cwd: &Path, root: &Path) -> Decision {
+    let refuse = |a: &str| {
+        Decision::Deny(format!(
+            "`{program} {a}` is refused in a pull request review: allowed options are listed in the guide"
+        ))
+    };
+    let searches = program == "grep" || program == "rg";
+    let mut pattern_given = false;
+    let mut find_expr = false;
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if program == "find" && (find_expr || a.starts_with('-')) {
+            find_expr = true;
+            let Some(value) = args.get(i) else {
+                return refuse(a);
+            };
+            let ok = match a.as_str() {
+                "-name" | "-iname" | "-path" => true,
+                "-type" => matches!(value.as_str(), "f" | "d"),
+                "-maxdepth" | "-mindepth" => value.chars().all(|c| c.is_ascii_digit()),
+                _ => false,
+            };
+            if !ok || value.is_empty() {
+                return refuse(a);
+            }
+            i += 1;
+            continue;
+        }
+        if (program == "head" || program == "tail") && a.starts_with('-') {
+            let digits = match a.strip_prefix("-n") {
+                Some("") => {
+                    i += 1;
+                    args.get(i - 1).map(String::as_str).unwrap_or("")
+                }
+                Some(d) => d,
+                None => return refuse(a),
+            };
+            if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+                return refuse(a);
+            }
+            continue;
+        }
+        if searches && a == "-e" {
+            if args.get(i).is_none() {
+                return refuse(a);
+            }
+            i += 1;
+            pattern_given = true;
+            continue;
+        }
+        if a.starts_with("--") {
+            if !review_long(program).contains(&a.as_str()) {
+                return refuse(a);
+            }
+            continue;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            let flags = review_flags(program);
+            if !a[1..].chars().all(|c| flags.contains(c)) {
+                return refuse(a);
+            }
+            continue;
+        }
+        if searches && !pattern_given {
+            pattern_given = true;
+            continue;
+        }
+        if let Decision::Deny(why) = check_read(Path::new(a), cwd, root) {
+            return Decision::Deny(format!("`{program}` reads {why}"));
+        }
+    }
+    Decision::Allow
+}
+
+/// Every operand, option value and attached path of a git subcommand is read
+/// relative to `cwd` and must stay in the worktree.
+fn check_review_paths(program: &str, args: &[String], cwd: &Path, root: &Path) -> Decision {
     let mut operands_only = false;
     for a in args {
         let path = if operands_only || !a.starts_with('-') || a == "-" {
@@ -321,7 +391,7 @@ fn check_review_paths(program: &str, args: &[String], cwd: &Path, root: &Path) -
         } else if let Some((_, value)) = a.split_once('=') {
             value
         } else if let Some(at) = a.find('/') {
-            // A short option with a path attached, such as `-f/etc/x`.
+            // A short option with a path attached, such as `-O/etc/x`.
             &a[at..]
         } else {
             continue;
@@ -333,90 +403,7 @@ fn check_review_paths(program: &str, args: &[String], cwd: &Path, root: &Path) -
     Decision::Allow
 }
 
-/// `grep` and `rg`: the first bare word is the pattern unless `-e`/`-f` (or a
-/// cluster ending in them) already gave one; every file operand and every
-/// `-f` pattern-file is a path that must stay inside the worktree. A short
-/// cluster that contains `f` or `e` takes an argument (its own tail, or the
-/// next word): after `f` it is a path, after `e` a pattern.
-fn check_search_paths(program: &str, args: &[String], cwd: &Path, root: &Path) -> Decision {
-    let mut pattern_given = false;
-    let mut want: Option<char> = None; // the next word is this option's argument
-    let mut operands_only = false;
-    let deny = |path: &str| -> Option<Decision> {
-        match check_read(Path::new(path), cwd, root) {
-            Decision::Deny(why) => Some(Decision::Deny(format!("`{program}` reads {why}"))),
-            Decision::Allow => None,
-        }
-    };
-    for a in args {
-        if let Some(opt) = want.take() {
-            // `f` takes a path, `e` a pattern (never a path).
-            if opt == 'f'
-                && let Some(d) = deny(a)
-            {
-                return d;
-            }
-            pattern_given = true;
-            continue;
-        }
-        if operands_only || a == "-" || !a.starts_with('-') {
-            if a == "-" {
-                continue;
-            }
-            if !pattern_given {
-                pattern_given = true; // this bare word is the pattern
-                continue;
-            }
-            if let Some(d) = deny(a) {
-                return d;
-            }
-            continue;
-        }
-        if a == "--" {
-            operands_only = true;
-            continue;
-        }
-        if let Some(long) = a.strip_prefix("--") {
-            let (name, value) = match long.split_once('=') {
-                Some((n, v)) => (n, Some(v)),
-                None => (long, None),
-            };
-            let is_file = "file".starts_with(name) && !name.is_empty();
-            let is_regexp =
-                ("regexp".starts_with(name) || "regex".starts_with(name)) && !name.is_empty();
-            if is_file || is_regexp {
-                pattern_given = true;
-                match value {
-                    Some(v) if is_file => {
-                        if let Some(d) = deny(v) {
-                            return d;
-                        }
-                    }
-                    Some(_) => {}
-                    None => want = Some(if is_file { 'f' } else { 'e' }),
-                }
-            }
-            continue;
-        }
-        // A short cluster such as `-in`, `-if`, `-ef`, `-f/path` or `-fPAT`.
-        let cluster = &a[1..];
-        if let Some(pos) = cluster.find(['f', 'e']) {
-            let opt = cluster.as_bytes()[pos] as char;
-            pattern_given = true;
-            let tail = &cluster[pos + 1..];
-            if tail.is_empty() {
-                want = Some(opt); // the next word is the argument
-            } else if opt == 'f'
-                && let Some(d) = deny(tail)
-            {
-                return d;
-            }
-        }
-    }
-    Decision::Allow
-}
-
-/// Only `--no-pager` may precede the subcommand./// Only `--no-pager` may precede the subcommand. `-C` is refused: it would
+/// Only `--no-pager` may precede the subcommand. `-C` is refused: it would
 /// point git at a subdirectory, which could hold a bare repository git reads.
 /// Every other global option (`-c`, `--exec-path`, `--git-dir`, ...) is refused.
 fn check_review_git(args: &[String], cwd: &Path, root: &Path) -> Decision {
@@ -1238,6 +1225,22 @@ mod tests {
             "grep -ief /etc/hosts src",
             "rg -if /etc/hosts",
             "grep -f/etc/hosts src",
+            "rg -e . -ge /etc/hosts",
+            "rg -e '^' -re /etc/hosts",
+            "rg --ignore-file=/etc/hosts foo src",
+            "rg --ignore-file /etc/hosts foo src",
+            "grep --exclude-from=/etc/hosts -r foo src",
+            "grep -A1 foo src",
+            "grep -R foo src",
+            "grep -- -x /etc/hosts",
+            "find . -L",
+            "find . -newer /etc/hosts",
+            "find src -type l",
+            "head -c 10 src/a.rs",
+            "tail -f src/a.rs",
+            "ls -L src",
+            "wc -m src/a.rs",
+            "cat -v src/a.rs",
         ]
         .into_iter()
         .filter(|c| check_review_command(c) == Decision::Allow)
@@ -1258,10 +1261,22 @@ mod tests {
             "grep -rn foo src",
             "grep -in foo src",
             "rg -in foo src",
+            "rg -n -e foo src",
+            "grep -e foo -r src",
+            "rg --no-heading --color=never --hidden foo src",
+            "find src -name '*.rs' -type f",
+            "find . -maxdepth 2 -iname '*.md'",
+            "head -n 20 src/a.rs",
+            "head -n20 src/a.rs",
+            "tail -n 5 src/a.rs",
+            "ls -la src",
+            "ls -1Rd src",
+            "wc -lwc src/a.rs",
+            "cat src/a.rs",
             "rg foo src",
-            "cat src/a.rs | head -20",
+            "cat src/a.rs | head -n 20",
             "head -n 50 src/a.rs",
-            "tail -5 src/a.rs",
+            "tail -n 5 src/a.rs",
             "ls -la src",
             "wc -l src/a.rs",
             "find . -name '*.rs'",
