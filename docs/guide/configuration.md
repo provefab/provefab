@@ -168,7 +168,7 @@ Absent, the repository's issues are its GitHub issues. Setup, labels and limits:
 | Field | Default | Role |
 |---|---|---|
 | `kind` | `github` | `github`, `jira` or `linear`. |
-| `site` | none | Jira only, required: the site's host name, such as `acme.atlassian.net` (no `https://`, no path). |
+| `site` | none | Jira only, required: the site's DNS host name, such as `acme.atlassian.net` (no `https://`, no path, no port). Labels are 1 to 63 letters, digits or hyphens, there are at least two, and an IP address is refused. |
 | `project` | none | Jira and Linear, required: the project or team key, `[A-Z][A-Z0-9_]*`, as in `ENG-123`. |
 
 Refused at load: an unknown `kind` or key (credentials never go in this file), `site` outside Jira, `project` with `github`, and, for Jira, a `label` containing whitespace.
