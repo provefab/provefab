@@ -86,6 +86,10 @@ pub fn check_review(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
         } => Decision::Deny(
             "a search pattern starting with `-` is refused in a pull request review".into(),
         ),
+        // Fail closed: a read tool call the guard sees no path for is refused.
+        ToolCall::Read { paths, .. } if paths.is_empty() => {
+            Decision::Deny("this read names no path, so the guard cannot check it".into())
+        }
         ToolCall::Read { paths, .. } => paths
             .iter()
             .map(|p| paths::check_read(p, cwd, root))

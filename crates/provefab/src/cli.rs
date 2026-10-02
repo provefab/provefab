@@ -400,6 +400,11 @@ mod tests {
             "git diff --no-index /etc/hosts src/a.rs".into(),
             "git blame --contents=/etc/hosts src/a.rs".into(),
             "grep -f/etc/hosts src/a.rs".into(),
+            "grep -if /etc/hosts src".into(),
+            "grep -ief /etc/hosts src".into(),
+            "rg -if /etc/hosts".into(),
+            "git -C src log -1".into(),
+            "git -C evil status".into(),
             "cat x=~/.ssh/id_rsa".into(),
             "cat src/a.rs; cd / && cat etc/hosts".into(),
         ]
@@ -420,6 +425,8 @@ mod tests {
             format!("cd {wt} && cat src/a.rs & cat etc/hosts"),
             format!("cd {wt}/missing && cat src/a.rs"),
             format!("cd {wt}/escape && cat secret"),
+            format!("cd {wt}/src && cat a.rs"),
+            format!("cd {wt}/evil && git status"),
         ] {
             assert_eq!(
                 decide(true, GuardFormat::Codex, root, &bare(&c)),
@@ -434,7 +441,9 @@ mod tests {
             "grep -rn 'foo$' src".into(),
             "grep -rn foo".into(),
             "git diff HEAD~1".into(),
-            "git -C src log -1".into(),
+            "git status".into(),
+            "grep -in foo src".into(),
+            "rg -in foo src".into(),
             "head -n 20 src/a.rs | wc -l".into(),
             "find src -name '*.rs'".into(),
             "ls".into(),
@@ -516,6 +525,8 @@ mod tests {
                 GuardFormat::Pi,
                 pi("find", json!({"pattern": "--exec=./x"})),
             ),
+            (GuardFormat::ClaudeCode, cc("Read", json!({}))),
+            (GuardFormat::Pi, pi("read", json!({}))),
         ] {
             assert_eq!(decide(true, format, root, &input), "deny", "{input}");
         }
