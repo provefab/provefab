@@ -386,7 +386,10 @@ pub fn detect(root: &RepoRoot, slug: &str) -> Result<Vec<String>, SetupError> {
 /// manager of the lock file (spec section 4, plan decision 10). Controller
 /// ruling over the brief: the gates start with that lock file's install
 /// command (`npm ci` when `package-lock.json` is at the root, else
-/// `npm install`), so a fresh worktree has its dependencies.
+/// `npm install --no-package-lock`), so a fresh worktree has its
+/// dependencies. Final review: a plain `npm install` writes
+/// `package-lock.json`, which `git add -A` would commit into every PR (and
+/// risk would flag as a dependency change).
 fn node_gates(root: &RepoRoot, slug: &str) -> Result<Vec<String>, SetupError> {
     let has = |n: &str| root.entries.contains(n);
     let (pm, install) = if has("pnpm-lock.yaml") {
@@ -396,7 +399,7 @@ fn node_gates(root: &RepoRoot, slug: &str) -> Result<Vec<String>, SetupError> {
     } else if has("package-lock.json") {
         ("npm", "npm ci")
     } else {
-        ("npm", "npm install")
+        ("npm", "npm install --no-package-lock")
     };
     let text = root.files.get("package.json").map_or("{}", String::as_str);
     let manifest: Value = serde_json::from_str(text).map_err(|_| {
@@ -915,7 +918,7 @@ mod tests {
                     "package.json",
                     r#"{"scripts":{"lint":"eslint .","test":"node --test"}}"#,
                 )],
-                Ok(vec!["npm install", "npm run lint", "npm test"]),
+                Ok(vec!["npm install --no-package-lock", "npm run lint", "npm test"]),
             ),
             (
                 "npm with package-lock",
@@ -1328,7 +1331,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!said.contains(DEPENDENCIES_NOTE), "{said}");
-        assert!(said.contains("gates: npm install; npm test"), "{said}");
+        assert!(said.contains("gates: npm install --no-package-lock; npm test"), "{said}");
         let (_h3, paths3) = home_with(MINE);
         let said = repos_add(&paths3, &go_hub("main"), &git(), "o/r", None, false)
             .await

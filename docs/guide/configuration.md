@@ -13,7 +13,7 @@ Provefab reads `provefab.toml` from its home directory, `~/.provefab` by default
 | At the root | `gates` |
 |---|---|
 | `Cargo.toml` | `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
-| `package.json` | the install from the lock file (`pnpm install --frozen-lockfile` with `pnpm-lock.yaml`, `yarn install --frozen-lockfile` with `yarn.lock`, `npm ci` with `package-lock.json`, `npm install` otherwise), then `<pm> run lint`, `<pm> run typecheck`, `<pm> test`, for the scripts that exist; `<pm>` is the same package manager |
+| `package.json` | the install from the lock file (`pnpm install --frozen-lockfile` with `pnpm-lock.yaml`, `yarn install --frozen-lockfile` with `yarn.lock`, `npm ci` with `package-lock.json`, `npm install --no-package-lock` otherwise, so no lock file is written into the task's changes), then `<pm> run lint`, `<pm> run typecheck`, `<pm> test`, for the scripts that exist; `<pm>` is the same package manager |
 | `pyproject.toml`, or `setup.py` or `setup.cfg` with a `tests` directory | `ruff check .` when ruff is configured (`[tool.ruff]` or `ruff.toml`), then `pytest` |
 | `go.mod` | `go vet ./...`, `go test ./...` |
 

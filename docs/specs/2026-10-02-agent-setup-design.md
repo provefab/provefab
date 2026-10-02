@@ -33,7 +33,7 @@ Today the quick start asks a person to copy the example configuration and edit i
 - Stack detection at the repository root, exactly one stack:
   - Rust (`Cargo.toml`): `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
   - Node (`package.json`): the package manager from the lock file (`pnpm-lock.yaml` pnpm, `yarn.lock` yarn, otherwise npm); gates are `<pm> run lint`, `<pm> run typecheck`, `<pm> test` for the scripts that exist, in that order; no script among them: not recognised.
-    - The gates start with the lock file's install: `pnpm install --frozen-lockfile` (`pnpm-lock.yaml`), `yarn install --frozen-lockfile` (`yarn.lock`), `npm ci` (`package-lock.json`), else `npm install` (amended 2026-10-02 during implementation).
+    - The gates start with the lock file's install: `pnpm install --frozen-lockfile` (`pnpm-lock.yaml`), `yarn install --frozen-lockfile` (`yarn.lock`), `npm ci` (`package-lock.json`), else `npm install --no-package-lock` (amended 2026-10-02 during implementation; `--no-package-lock` amended 2026-10-02 after final review, so no generated lock file is committed with the task).
   - Python (`pyproject.toml`, or `setup.py`/`setup.cfg` with a `tests` directory): `ruff check .` when ruff is configured (`[tool.ruff]` or `ruff.toml`), then `pytest`.
   - Go (`go.mod`): `go vet ./...`, `go test ./...`.
 - No stack or several stacks: exit code 4, an error naming what was found and pointing to the configuration guide; nothing written.
