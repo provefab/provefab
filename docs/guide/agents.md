@@ -13,7 +13,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
 
 `provefab --version`, `provefab init` and `provefab doctor --json` run from any directory. Only step 3 needs the person's clone: run it from inside that clone.
 
-Several commands end with a line starting with `next:`, which names the next command. It is information only: the steps below already cover it.
+`provefab init` and `provefab repos add` end with a line starting with `next:`, which names the next command. It is information only: the steps below already cover it.
 
 1. **Check that Provefab is installed:** run `provefab --version`.
    - It prints `provefab <version>`: go to step 2.
