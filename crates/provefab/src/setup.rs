@@ -145,6 +145,13 @@ pub fn init(paths: &Paths, path_var: &OsStr, dry_run: bool) -> Result<String, Se
     if dry_run {
         return Ok(text);
     }
+    // Parsed before anything is written, so a failure leaves no file.
+    let ids: Vec<String> = Config::from_toml_str(&text)
+        .map_err(|e| SetupError::Other(one_line(&e.to_string())))?
+        .models
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
     std::fs::create_dir_all(&paths.home)
         .map_err(|e| SetupError::Other(format!("cannot create {}: {e}", paths.home.display())))?;
     let mut f = std::fs::OpenOptions::new()
@@ -155,11 +162,15 @@ pub fn init(paths: &Paths, path_var: &OsStr, dry_run: bool) -> Result<String, Se
             std::io::ErrorKind::AlreadyExists => exists(),
             _ => SetupError::Other(format!("cannot write {}: {e}", file.display())),
         })?;
-    f.write_all(text.as_bytes())
-        .map_err(|e| SetupError::Other(format!("cannot write {}: {e}", file.display())))?;
-    let ids: Vec<String> = Config::from_toml_str(&text)
-        .map(|c| c.models.into_iter().map(|m| m.id).collect())
-        .unwrap_or_default();
+    if let Err(e) = f.write_all(text.as_bytes()) {
+        // A partial file would make the next `init` exit 3 (best effort).
+        drop(f);
+        let _ = std::fs::remove_file(&file);
+        return Err(SetupError::Other(format!(
+            "cannot write {}: {e}",
+            file.display()
+        )));
+    }
     Ok(format!(
         "wrote {}\nmodels: {}\nnext: provefab repos add <owner/name>\n",
         file.display(),
