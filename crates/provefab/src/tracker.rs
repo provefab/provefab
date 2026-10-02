@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::config::{Config, RepoConfig};
-use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus, PullRequest};
+use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus, PullRequest, RepoRoot};
 use crate::jira::Jira;
 use crate::linear::Linear;
 use crate::ports::{Forge, Tracker};
@@ -780,6 +780,9 @@ impl Forge for Routed {
     }
     async fn repo_is_public(&self, slug: &str) -> Result<bool, ForgeError> {
         Forge::repo_is_public(&self.gh, slug).await
+    }
+    async fn repo_root(&self, slug: &str, read: &[&str]) -> Result<RepoRoot, ForgeError> {
+        Forge::repo_root(&self.gh, slug, read).await
     }
 }
 

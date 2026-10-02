@@ -7,7 +7,7 @@ use std::path::Path;
 use agent_workers::WorkerEvent;
 use jev::JevClient;
 
-use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus, PullRequest};
+use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus, PullRequest, RepoRoot};
 use crate::jevq::{self, IssueContext, Triage};
 use crate::task::Verdict;
 
@@ -217,6 +217,13 @@ pub trait Forge {
     ) -> impl Future<Output = Result<(), ForgeError>> + Send;
     /// Whether anyone can write the repository's issues (a public repository).
     fn repo_is_public(&self, slug: &str) -> impl Future<Output = Result<bool, ForgeError>> + Send;
+    /// The default branch and, on it, the repository's root: names and the
+    /// text of the files of `read` that exist (agent setup spec section 4).
+    fn repo_root(
+        &self,
+        slug: &str,
+        read: &[&str],
+    ) -> impl Future<Output = Result<RepoRoot, ForgeError>> + Send;
 }
 
 /// Everything the pipeline needs: one tracker and the forge. A blanket
@@ -308,6 +315,9 @@ impl Forge for Gh {
     }
     async fn repo_is_public(&self, slug: &str) -> Result<bool, ForgeError> {
         Gh::repo_is_public(self, slug).await
+    }
+    async fn repo_root(&self, slug: &str, read: &[&str]) -> Result<RepoRoot, ForgeError> {
+        Gh::repo_root(self, slug, read).await
     }
 }
 

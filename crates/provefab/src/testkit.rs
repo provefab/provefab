@@ -11,7 +11,7 @@ pub use std::sync::Mutex;
 pub use crate::agents::StageRunner;
 pub use crate::config::{Config, ModelEntry};
 pub use crate::cooldown::Cooldowns;
-pub use crate::forge::{Comment, ForgeError, Git, Issue, PullRequest};
+pub use crate::forge::{Comment, ForgeError, Git, Issue, PullRequest, RepoRoot};
 pub use crate::jevq::{IssueContext, Triage};
 pub use crate::paths::Paths;
 pub use crate::pipeline::Pipeline;
@@ -284,6 +284,11 @@ pub struct FakeHub {
     pub edited: Mutex<Vec<(String, String, String)>>,
     /// While set, `pr_status` fails (GitHub unreachable).
     pub pr_status_down: std::sync::atomic::AtomicBool,
+    /// What `repo_root` answers (its files kept to those asked for); `None`
+    /// answers as gh does for a repository it cannot read.
+    pub repo_root: Mutex<Option<RepoRoot>>,
+    /// Every (slug, read) `repo_root` was asked for.
+    pub repo_root_calls: Mutex<Vec<(String, Vec<String>)>>,
 }
 
 impl FakeHub {
@@ -339,6 +344,8 @@ impl FakeHub {
             deleted_comments: Mutex::new(Vec::new()),
             edited: Mutex::new(Vec::new()),
             pr_status_down: Default::default(),
+            repo_root: Mutex::new(None),
+            repo_root_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -582,6 +589,22 @@ impl Forge for FakeHub {
     }
     async fn repo_is_public(&self, _: &str) -> Result<bool, ForgeError> {
         Ok(self.public.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    async fn repo_root(&self, slug: &str, read: &[&str]) -> Result<RepoRoot, ForgeError> {
+        self.repo_root_calls.lock().unwrap().push((
+            slug.to_string(),
+            read.iter().map(|s| s.to_string()).collect(),
+        ));
+        let Some(mut root) = self.repo_root.lock().unwrap().clone() else {
+            return Err(ForgeError::Failed {
+                program: "gh".into(),
+                args: format!("api repos/{slug}"),
+                code: Some(1),
+                stderr: "gh: Not Found (HTTP 404) token=ghp_SECRET0123456789abcdef".into(),
+            });
+        };
+        root.files.retain(|name, _| read.contains(&name.as_str()));
+        Ok(root)
     }
     async fn repo_clone(&self, _: &str, dest: &Path) -> Result<(), ForgeError> {
         if let Some(stderr) = self.clone_error.lock().unwrap().clone() {

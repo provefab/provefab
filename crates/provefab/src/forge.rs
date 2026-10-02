@@ -2,6 +2,7 @@
 //! worktrees and branches, Provefab's commit and push, and `gh` for issues,
 //! comments, labels and pull requests (spec §3.1, §3.2).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -684,6 +685,56 @@ impl Git {
             .map(Some)
     }
 
+    /// The URL of the `origin` remote, or `None` without one.
+    pub async fn origin_url(&self, repo: &Path) -> Option<String> {
+        self.git(repo, &["remote", "get-url", "origin"])
+            .await
+            .ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+    }
+
+    /// The branch `origin/HEAD` names (the remote's default branch as of the
+    /// clone or the last `git remote set-head`), without `origin/`.
+    pub async fn origin_head(&self, repo: &Path) -> Option<String> {
+        let out = self
+            .git(
+                repo,
+                &[
+                    "symbolic-ref",
+                    "--quiet",
+                    "--short",
+                    "refs/remotes/origin/HEAD",
+                ],
+            )
+            .await
+            .ok()?;
+        out.trim()
+            .strip_prefix("origin/")
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The names at the root of `rev`; a directory's ends with `/`.
+    pub async fn root_entries(
+        &self,
+        repo: &Path,
+        rev: &str,
+    ) -> Result<BTreeSet<String>, ForgeError> {
+        let out = self.git(repo, &["ls-tree", "-z", rev]).await?;
+        Ok(out
+            .split('\0')
+            .filter_map(|line| {
+                let (meta, name) = line.split_once('\t')?;
+                Some(if meta.split(' ').nth(1) == Some("tree") {
+                    format!("{name}/")
+                } else {
+                    name.to_string()
+                })
+            })
+            .collect())
+    }
+
     /// `origin/<base>` when the repo has it (fetched), else the local `<base>`.
     pub async fn base_ref(&self, repo: &Path, base: &str) -> String {
         let remote = format!("refs/remotes/origin/{base}");
@@ -970,6 +1021,18 @@ pub struct PullRequest {
     pub labels: Vec<String>,
     /// The comments `gh pr list` returns (GitHub lists at most 100 per pull request).
     pub comments: Vec<Comment>,
+}
+
+/// What setup reads of a repository (agent setup spec section 4): its
+/// default branch and, on it, the names at the root and the text of the
+/// files asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoRoot {
+    pub default_branch: String,
+    /// Names at the root; a directory's ends with `/`.
+    pub entries: BTreeSet<String>,
+    /// The text of each file asked for that is at the root.
+    pub files: BTreeMap<String, String>,
 }
 
 /// The `comments` array of `gh issue view` / `gh pr view --json comments`.
@@ -1354,6 +1417,67 @@ impl Gh {
         Ok(is_public_visibility(&out))
     }
 
+    /// The default branch of `slug` and its root on that branch: the names
+    /// there and the text of each file of `read` that exists. Read through
+    /// the API, nothing cloned (agent setup spec section 4). The contents
+    /// API reads the default branch when given no `ref`.
+    pub async fn repo_root(&self, slug: &str, read: &[&str]) -> Result<RepoRoot, ForgeError> {
+        let repo = format!("repos/{slug}");
+        let default_branch = self
+            .gh(&["api", &repo, "--jq", ".default_branch"], None)
+            .await?
+            .trim()
+            .to_string();
+        if default_branch.is_empty() || default_branch == "null" {
+            return Err(ForgeError::Parse(
+                "gh api repos".into(),
+                "no default branch".into(),
+            ));
+        }
+        let contents = format!("{repo}/contents");
+        let listing = match self.gh(&["api", &contents], None).await {
+            Ok(out) => out,
+            // An empty repository has no contents: nothing to detect.
+            Err(e) if e.is_not_found() => "[]".to_string(),
+            Err(e) => return Err(e),
+        };
+        let v = self.json("gh api contents", &listing)?;
+        let mut entries = BTreeSet::new();
+        for e in v.as_array().into_iter().flatten() {
+            let Some(name) = e.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if e.get("type").and_then(Value::as_str) == Some("dir") {
+                entries.insert(format!("{name}/"));
+            } else {
+                entries.insert(name.to_string());
+            }
+        }
+        let mut files = BTreeMap::new();
+        for name in read {
+            if !entries.contains(*name) {
+                continue;
+            }
+            let text = self
+                .gh(
+                    &[
+                        "api",
+                        "-H",
+                        "Accept: application/vnd.github.raw+json",
+                        &format!("{contents}/{name}"),
+                    ],
+                    None,
+                )
+                .await?;
+            files.insert(name.to_string(), text);
+        }
+        Ok(RepoRoot {
+            default_branch,
+            entries,
+            files,
+        })
+    }
+
     /// Whether the issue is open (a merged fix whose issue was reopened, D52).
     pub async fn issue_open(&self, slug: &str, number: u64) -> Result<bool, ForgeError> {
         let n = number.to_string();
@@ -1676,6 +1800,133 @@ mod tests {
         Git {
             program: "git".into(),
         }
+    }
+
+    /// A fake `gh` that logs each call and answers by its whole argv.
+    fn fake_gh_api(dir: &Path, cases: &[(&str, &str)]) -> Gh {
+        let mut script = format!(
+            "#!/bin/sh\necho \"$*\" >> {}\ncase \"$*\" in\n",
+            dir.join("log.txt").display()
+        );
+        for (i, (argv, out)) in cases.iter().enumerate() {
+            let file = dir.join(format!("out{i}.txt"));
+            std::fs::write(&file, out).unwrap();
+            script.push_str(&format!("  '{argv}') cat {} ;;\n", file.display()));
+        }
+        script.push_str("  *) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;\nesac\n");
+        let bin = dir.join("gh");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Gh { program: bin }
+    }
+
+    /// Agent setup spec section 4: the default branch, the root names and
+    /// the files asked for that exist, through `gh api`; nothing cloned.
+    #[tokio::test]
+    async fn gh_reads_a_repository_root_without_cloning() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh_api(
+            dir.path(),
+            &[
+                ("api repos/o/r --jq .default_branch", "trunk\n"),
+                (
+                    "api repos/o/r/contents",
+                    r#"[{"name":"package.json","type":"file"},{"name":"tests","type":"dir"},{"name":"pnpm-lock.yaml","type":"file"}]"#,
+                ),
+                (
+                    "api -H Accept: application/vnd.github.raw+json repos/o/r/contents/package.json",
+                    r#"{"scripts":{"test":"vitest"}}"#,
+                ),
+            ],
+        );
+        let root = gh
+            .repo_root("o/r", &["package.json", "pyproject.toml"])
+            .await
+            .unwrap();
+        assert_eq!(root.default_branch, "trunk");
+        assert_eq!(
+            root.entries.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["package.json", "pnpm-lock.yaml", "tests/"]
+        );
+        assert_eq!(
+            root.files.get("package.json").map(String::as_str),
+            Some(r#"{"scripts":{"test":"vitest"}}"#)
+        );
+        assert_eq!(root.files.len(), 1, "pyproject.toml is not there: not read");
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+        assert_eq!(log.lines().count(), 3, "{log}");
+        assert!(!log.contains("clone"), "{log}");
+    }
+
+    /// An empty repository has no contents (GitHub answers 404): no names.
+    #[tokio::test]
+    async fn an_empty_repository_has_an_empty_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh_api(
+            dir.path(),
+            &[("api repos/o/r --jq .default_branch", "main")],
+        );
+        let root = gh.repo_root("o/r", &["package.json"]).await.unwrap();
+        assert_eq!(
+            (
+                root.default_branch.as_str(),
+                root.entries.len(),
+                root.files.len()
+            ),
+            ("main", 0, 0)
+        );
+        // A repository gh cannot read: the error says not found.
+        let other = dir.path().join("x");
+        std::fs::create_dir_all(&other).unwrap();
+        let missing = fake_gh_api(&other, &[]);
+        assert!(
+            missing
+                .repo_root("o/r", &[])
+                .await
+                .unwrap_err()
+                .is_not_found()
+        );
+    }
+
+    /// Agent setup plan decision 2: a clone's origin, its default branch as
+    /// of the clone, and the root names of a commit.
+    #[tokio::test]
+    async fn a_clone_tells_its_origin_default_branch_and_root() {
+        use crate::testkit::git as sh;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("tests")).unwrap();
+        sh(&src, &["init", "-q", "-b", "trunk"]);
+        std::fs::write(src.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(src.join("tests/a_test.go"), "").unwrap();
+        std::fs::write(src.join("we ird.txt"), "").unwrap();
+        sh(&src, &["add", "-A"]);
+        sh(&src, &["commit", "-q", "-m", "init"]);
+        let clone = dir.path().join("clone");
+        sh(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                src.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let g = git();
+        assert_eq!(g.origin_head(&clone).await.as_deref(), Some("trunk"));
+        assert_eq!(
+            g.origin_url(&clone).await.as_deref(),
+            Some(src.to_str().unwrap())
+        );
+        let names = g.root_entries(&clone, "origin/trunk").await.unwrap();
+        assert_eq!(
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["go.mod", "tests/", "we ird.txt"]
+        );
+        sh(&clone, &["remote", "set-head", "origin", "-d"]);
+        assert_eq!(g.origin_head(&clone).await, None);
+        assert_eq!(g.origin_url(&src).await, None, "no origin remote");
+        assert!(g.root_entries(&clone, "origin/nope").await.is_err());
     }
 
     #[tokio::test]
