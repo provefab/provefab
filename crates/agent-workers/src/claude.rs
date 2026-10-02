@@ -48,7 +48,8 @@ impl ClaudeCodeWorker {
         push("--strict-mcp-config");
         push("--tools");
         push(match req.tools {
-            ToolProfile::ReadOnly => "Read,Grep,Glob",
+            // No shell: nothing the worktree holds can run (final review I1).
+            ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly => "Read,Grep,Glob",
             ToolProfile::Full => "Bash,Read,Edit,Write,Glob,Grep",
             // `""` disables every built-in tool; `--json-schema` still answers.
             ToolProfile::NoTools => "",
@@ -366,6 +367,29 @@ mod tests {
         };
         assert_eq!(no_tools(&none), Some(Some("1".into())));
         assert_eq!(no_tools(&req()), Some(None), "removed for other stages");
+    }
+
+    /// Final review I1 (pull request reviews): Claude Code reviews a person's
+    /// pull request with Read, Grep and Glob only, no shell, and tells the guard.
+    #[test]
+    fn an_untrusted_review_has_no_shell_and_tells_the_guard() {
+        let mut review = req();
+        review.tools = ToolProfile::UntrustedReadOnly;
+        let args: Vec<String> = worker()
+            .args(&review)
+            .into_iter()
+            .map(|s| s.into_string().unwrap())
+            .collect();
+        let at = args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(args[at + 1], "Read,Grep,Glob", "{args:?}");
+        assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
+        let marker = worker()
+            .command(&review)
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == crate::UNTRUSTED_REVIEW_ENV)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()));
+        assert_eq!(marker.as_deref(), Some("1"));
     }
 
     /// Final review M6: other switches that move Claude Code off the subscription are removed too.

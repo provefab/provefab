@@ -100,6 +100,133 @@ pub(super) fn check_command_from(command: &str, start: Option<PathBuf>, root: &P
     Decision::Allow
 }
 
+/// Programs a review of a person's pull request may run (final review I1):
+/// they read files and history, and none runs code the pull request wrote.
+/// Spelled exactly: a path such as `./cat` could be the pull request's own file.
+const REVIEW_PROGRAMS: [&str; 9] = [
+    "cat", "head", "tail", "ls", "wc", "grep", "rg", "find", "git",
+];
+/// Git subcommands a review may run: reading history and the worktree only.
+const REVIEW_GIT: [&str; 9] = [
+    "show",
+    "diff",
+    "log",
+    "status",
+    "blame",
+    "ls-files",
+    "grep",
+    "rev-parse",
+    "cat-file",
+];
+
+/// Long options of the subcommands above that write a file or run a program.
+const REVIEW_GIT_REFUSED: [&str; 3] = ["output", "ext-diff", "open-files-in-pager"];
+
+/// The shell policy for a review of a person's pull request
+/// (`PROVEFAB_UNTRUSTED_REVIEW`): every segment, piped or not, is one of
+/// `REVIEW_PROGRAMS` with no option that runs a program or writes a file,
+/// and no output goes anywhere but `/dev/null`. Command substitution is
+/// refused by `split_segments`, as for every stage.
+pub(super) fn check_review_command(command: &str) -> Decision {
+    let segments = match split_segments(command) {
+        Ok(s) => s,
+        Err(why) => return Decision::Deny(why),
+    };
+    for seg in segments {
+        if let Decision::Deny(why) = check_review_segment(&seg.text) {
+            return Decision::Deny(why);
+        }
+    }
+    Decision::Allow
+}
+
+fn check_review_segment(text: &str) -> Decision {
+    let Ok(words) = shell_words::split(text) else {
+        return Decision::Deny(format!("could not parse `{text}`"));
+    };
+    let (argv, targets) = split_redirects(&words);
+    if let Some(t) = targets.iter().find(|t| *t != "/dev/null") {
+        return Decision::Deny(format!(
+            "a pull request review writes no file, so the redirect to {t} is refused"
+        ));
+    }
+    let Some(program) = argv.first() else {
+        return Decision::Allow;
+    };
+    if !REVIEW_PROGRAMS.contains(&program.as_str()) {
+        return Decision::Deny(format!(
+            "`{program}` is refused in a pull request review: only {} run",
+            REVIEW_PROGRAMS.join(", ")
+        ));
+    }
+    let args = &argv[1..];
+    let refused = |a: &String| -> bool {
+        match program.as_str() {
+            "find" => {
+                matches!(
+                    a.as_str(),
+                    "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls"
+                ) || a.starts_with("-fprint")
+            }
+            // `--pre` and `--hostname-bin` run a program of the caller's choice.
+            "rg" => a.starts_with("--pre") || a.starts_with("--hostname-bin"),
+            _ => false,
+        }
+    };
+    if let Some(a) = args.iter().find(|a| refused(a)) {
+        return Decision::Deny(format!(
+            "`{program} {a}` is refused in a pull request review"
+        ));
+    }
+    if program == "git" {
+        return check_review_git(args);
+    }
+    Decision::Allow
+}
+
+/// `git -C <dir>` and `--no-pager` may precede the subcommand; any other
+/// global option (`-c`, `--exec-path`, `--git-dir`, ...) is refused.
+fn check_review_git(args: &[String]) -> Decision {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "-C" => i += 2,
+            "--no-pager" | "-P" => i += 1,
+            s if s.starts_with('-') => {
+                return Decision::Deny(format!("`git {s}` is refused in a pull request review"));
+            }
+            sub if REVIEW_GIT.contains(&sub) => {
+                // `--output` writes a file; `--ext-diff` and `grep -O` run a
+                // program. Git takes any unambiguous prefix of a long option.
+                let refused = args[i + 1..].iter().find(|a| {
+                    let long = a
+                        .strip_prefix("--")
+                        .map(|l| l.split('=').next().unwrap_or_default())
+                        .filter(|l| !l.is_empty());
+                    long.is_some_and(|l| {
+                        REVIEW_GIT_REFUSED
+                            .iter()
+                            .any(|r| r.starts_with(l) || l.starts_with(r))
+                    }) || (sub == "grep" && short_flags(a).is_some_and(|f| f.contains('O')))
+                });
+                return match refused {
+                    Some(a) => Decision::Deny(format!(
+                        "`git {sub} {a}` is refused in a pull request review"
+                    )),
+                    None => Decision::Allow,
+                };
+            }
+            sub => {
+                return Decision::Deny(format!(
+                    "`git {sub}` is refused in a pull request review: only git {} run",
+                    REVIEW_GIT.join(", ")
+                ));
+            }
+        }
+    }
+    Decision::Allow
+}
+
 #[derive(Debug, PartialEq)]
 struct Segment {
     text: String,
@@ -792,6 +919,99 @@ mod tests {
                 "python3 scripts/gen.py",
             ],
             wt.path(),
+        );
+    }
+
+    /// Final review I1: under the review marker nothing from the pull request
+    /// runs; only read-only programs, piped into each other.
+    #[test]
+    fn a_pull_request_review_runs_only_read_only_commands() {
+        let leaked: Vec<&str> = [
+            "python3 tools/check.py",
+            "bash -c 'cat x'",
+            "bash scripts/test.sh",
+            "cargo test",
+            "make",
+            "npm test",
+            "go test ./...",
+            "node index.js",
+            "git log | sh",
+            "cat a > b",
+            "cat a >> b",
+            "grep foo src 2> err.txt",
+            "find . -exec rm {} ;",
+            "find . -execdir rm {} +",
+            "find . -delete",
+            "find . -ok rm {} ;",
+            "find . -fprint out.txt",
+            "find . -fprintf out.txt %p",
+            "find . -fls out.txt",
+            "env cat a",
+            "xargs cat",
+            "sh -c 'ls'",
+            "FOO=1 cat a",
+            "./cat a",
+            "/bin/cat a",
+            "CAT a",
+            "cat $(echo a)",
+            "cat `echo a`",
+            "git push",
+            "git commit -m x",
+            "git add a",
+            "git checkout main",
+            "git -c core.pager=sh log",
+            "git --exec-path=. log",
+            "git log --output=out.txt",
+            "git diff --ext-diff",
+            "git grep -O foo",
+            "git grep --open-files-in-pager=sh foo",
+            "git grep --open=sh foo",
+            "git grep -nOsh foo",
+            "git log --outp=out.txt",
+            "git diff --ext",
+            "rg --pre ./run foo",
+            "rg --pre=./run foo",
+            "rg --hostname-bin ./run foo",
+            "ls; python3 x.py",
+            "cat a && cargo build",
+            "sed -n 1p a",
+            "cd src",
+        ]
+        .into_iter()
+        .filter(|c| check_review_command(c) == Decision::Allow)
+        .collect();
+        assert!(leaked.is_empty(), "allowed but must be denied: {leaked:#?}");
+        let blocked: Vec<(&str, Decision)> = [
+            "git diff HEAD~1",
+            "git diff --stat origin/main",
+            "git show HEAD:src/a.rs",
+            "git log --oneline -5",
+            "git diff --no-ext-diff --name-only HEAD~1",
+            "git status",
+            "git blame src/a.rs",
+            "git ls-files",
+            "git grep -n foo",
+            "git rev-parse HEAD",
+            "git cat-file -p HEAD",
+            "git -C src log -1",
+            "grep -rn foo src",
+            "rg foo src",
+            "cat src/a.rs | head -20",
+            "head -n 50 src/a.rs",
+            "tail -5 src/a.rs",
+            "ls -la src",
+            "wc -l src/a.rs",
+            "find . -name '*.rs'",
+            "grep -rn foo src 2>/dev/null | wc -l",
+            "cat src/a.rs && ls",
+        ]
+        .into_iter()
+        .map(|c| (c, check_review_command(c)))
+        .filter(|(_, d)| *d != Decision::Allow)
+        .collect();
+        assert!(
+            blocked.is_empty(),
+            "denied but must be allowed: {blocked:#?}"
         );
     }
 }

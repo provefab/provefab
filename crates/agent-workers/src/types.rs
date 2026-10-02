@@ -29,6 +29,10 @@ pub struct StageRequest {
 pub enum ToolProfile {
     /// Read and search only (plan, review).
     ReadOnly,
+    /// `ReadOnly` for a review of a person's pull request: the guard is told
+    /// (`PROVEFAB_UNTRUSTED_REVIEW`) to let the shell run read-only commands
+    /// only, so nothing the pull request wrote runs during its review.
+    UntrustedReadOnly,
     /// Read, search, edit, write and shell (implement).
     Full,
     /// No tool: the model answers from its prompt alone (periodic work). The

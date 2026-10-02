@@ -60,6 +60,22 @@ pub fn check(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
     }
 }
 
+/// `check` for a review of a person's pull request (`PROVEFAB_UNTRUSTED_REVIEW`,
+/// final review I1): no file is written and the shell runs only read-only
+/// programs, so nothing the pull request wrote runs during its review.
+pub fn check_review(call: &ToolCall) -> Decision {
+    match call {
+        ToolCall::Shell { command } | ToolCall::ShellUnknownCwd { command } => {
+            shell::check_review_command(command)
+        }
+        ToolCall::Write { .. } | ToolCall::Patch { .. } => {
+            Decision::Deny("a pull request review writes no file".into())
+        }
+        ToolCall::Blocked { reason } => Decision::Deny(reason.clone()),
+        ToolCall::Other { .. } => Decision::Allow,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

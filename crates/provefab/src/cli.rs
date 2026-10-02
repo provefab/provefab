@@ -25,6 +25,16 @@ pub struct GuardOutput {
 }
 
 pub fn run_guard(format: GuardFormat, root: Option<&Path>, stdin: &str) -> GuardOutput {
+    guard_call(format, root, stdin, false)
+}
+
+/// `run_guard` for a review of a person's pull request
+/// (`PROVEFAB_UNTRUSTED_REVIEW`): the shell runs read-only commands only.
+pub fn run_guard_review(format: GuardFormat, root: Option<&Path>, stdin: &str) -> GuardOutput {
+    guard_call(format, root, stdin, true)
+}
+
+fn guard_call(format: GuardFormat, root: Option<&Path>, stdin: &str, review: bool) -> GuardOutput {
     let Ok(input) = serde_json::from_str::<Value>(stdin) else {
         return unreadable(format);
     };
@@ -57,7 +67,11 @@ pub fn run_guard(format: GuardFormat, root: Option<&Path>, stdin: &str) -> Guard
                 GuardFormat::ClaudeCode => adapters::from_claude_code(tool, args),
                 GuardFormat::Codex => adapters::from_codex(tool, args),
             };
-            guard::check(&call, &cwd, root)
+            if review {
+                guard::check_review(&call)
+            } else {
+                guard::check(&call, &cwd, root)
+            }
         }
     };
     render(format, &decision)
@@ -259,6 +273,77 @@ mod tests {
         assert_eq!((answer.stdout.as_str(), answer.exit_code), ("", 0));
         let cc_bad = run_guard_no_tools(GuardFormat::ClaudeCode, "not json");
         assert_eq!(cc_bad.exit_code, 2);
+    }
+
+    /// Final review I1: the review marker turns the shell read-only; the
+    /// same calls without it keep the stage policy.
+    #[test]
+    fn a_pull_request_review_runs_no_code_from_it() {
+        let r = root();
+        let decision = |review: bool, format, input: Value| {
+            let out = if review {
+                run_guard_review(format, Some(r.path()), &input.to_string())
+            } else {
+                run_guard(format, Some(r.path()), &input.to_string())
+            };
+            match format {
+                GuardFormat::Pi => serde_json::from_str::<Value>(&out.stdout).unwrap()["decision"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                _ if out.stdout.is_empty() => "allow".to_string(),
+                _ => serde_json::from_str::<Value>(&out.stdout).unwrap()["hookSpecificOutput"]
+                    ["permissionDecision"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            }
+        };
+        let codex =
+            |command: &str| json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        let pi = |command: &str| json!({"tool": "bash", "args": {"command": command}});
+        for command in [
+            "python3 tools/check.py",
+            "bash scripts/test.sh",
+            "cargo test",
+        ] {
+            assert_eq!(
+                decision(true, GuardFormat::Codex, codex(command)),
+                "deny",
+                "{command}"
+            );
+            assert_eq!(
+                decision(true, GuardFormat::Pi, pi(command)),
+                "deny",
+                "{command}"
+            );
+            assert_eq!(
+                decision(false, GuardFormat::Codex, codex(command)),
+                "allow",
+                "{command}"
+            );
+        }
+        for command in ["git diff HEAD~1", "cat src/a.rs | head -20"] {
+            assert_eq!(
+                decision(true, GuardFormat::Codex, codex(command)),
+                "allow",
+                "{command}"
+            );
+        }
+        let read = json!({"tool_name": "Read", "tool_input": {"file_path": "src/a.rs"}});
+        assert_eq!(decision(true, GuardFormat::ClaudeCode, read), "allow");
+        let write = json!({"tool_name": "Write", "tool_input": {"file_path": "src/a.rs"}});
+        assert_eq!(
+            decision(true, GuardFormat::ClaudeCode, write.clone()),
+            "deny"
+        );
+        assert_eq!(decision(false, GuardFormat::ClaudeCode, write), "allow");
+        let missing = run_guard_review(GuardFormat::Pi, None, &pi("ls").to_string());
+        assert!(
+            missing.stdout.contains("PROVEFAB_WORKTREE"),
+            "{}",
+            missing.stdout
+        );
     }
 
     #[test]

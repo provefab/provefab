@@ -68,7 +68,8 @@ impl PiWorker {
 
 fn tools_arg(profile: ToolProfile, submit: bool) -> String {
     let base = match profile {
-        ToolProfile::ReadOnly => "read,grep,find,ls",
+        // No `bash`: Pi's read tools never run a program.
+        ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly => "read,grep,find,ls",
         ToolProfile::Full => "read,bash,edit,write,grep,find,ls",
         ToolProfile::NoTools => "",
     };
@@ -349,6 +350,16 @@ mod tests {
         r.output_schema = None;
         assert!(joined(&r).contains(" --no-tools "), "{}", joined(&r));
         assert!(!joined(&r).contains("--tools"), "{}", joined(&r));
+    }
+
+    /// Final review I1 (pull request reviews): Pi reviews a person's pull
+    /// request without `bash`.
+    #[test]
+    fn an_untrusted_review_has_no_shell() {
+        assert_eq!(
+            tools_arg(ToolProfile::UntrustedReadOnly, true),
+            format!("read,grep,find,ls,{SUBMIT_TOOL}")
+        );
     }
 
     #[test]

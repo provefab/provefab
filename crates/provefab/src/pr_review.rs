@@ -598,7 +598,8 @@ where
         let req = self.request(
             &wt,
             prompt,
-            ToolProfile::ReadOnly,
+            // Final review I1: nothing the pull request wrote may run.
+            ToolProfile::UntrustedReadOnly,
             Some(output_schema::<ReviewOutput>()),
             self.config.limits.max_turns.review,
             self.paths.session(

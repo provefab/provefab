@@ -32,7 +32,7 @@ After an upgrade, a `/provefab review` comment from an authorised person already
 3. A standard-tier reviewer reads the title, the description and the diff; a frontier one when a detected risk category asks for it and a frontier model is configured. When your review policy asks for two approvals (Provefab Pro's second reviewer), both reviews always run, the second on a model from another provider.
 4. Provefab records the findings (`F1`, `F2`, ... continuing across reviews) and posts or updates its comment.
 
-Nothing from the pull request runs on your machine: no checks, no scripts. Provefab only classifies the changed files, so the risk policy's gates and checks do not apply, and it puts no risk label on the pull request. The title and description are data for the reviewer, never instructions. A review task never writes to the issue tracker: its messages go to the pull request.
+Provefab runs no gates, checks or builds on the pull request. The reviewer can only read files and use read-only commands: `cat`, `head`, `tail`, `ls`, `wc`, `grep`, `rg`, `find` (without `-exec` or `-delete`), and `git` `show`, `diff`, `log`, `status`, `blame`, `ls-files`, `grep`, `rev-parse` and `cat-file`. The guard refuses any other command (scripts, interpreters, build and test tools), any write and any redirect to a file. Claude Code and Pi reviewers have no shell at all. Provefab only classifies the changed files, so the risk policy's gates and checks do not apply, and it puts no risk label on the pull request. The title and description are data for the reviewer, never instructions. A review task never writes to the issue tracker: its messages go to the pull request.
 
 ## Costs and limits
 

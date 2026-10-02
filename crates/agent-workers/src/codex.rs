@@ -51,7 +51,9 @@ impl CodexWorker {
         push("--sandbox");
         push(match req.tools {
             // Codex always has a shell: without tools the guard refuses it.
-            ToolProfile::ReadOnly | ToolProfile::NoTools => "read-only",
+            ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly | ToolProfile::NoTools => {
+                "read-only"
+            }
             ToolProfile::Full => "workspace-write",
         });
         // Execpolicy `.rules` files from the user or the repo must not widen what runs.
@@ -374,6 +376,22 @@ mod tests {
             .find(|(k, _)| *k == NO_TOOLS_ENV)
             .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()));
         assert_eq!(set.as_deref(), Some("1"));
+    }
+
+    /// Final review I1 (pull request reviews): Codex keeps its shell, in a
+    /// read-only sandbox, and the guard is told to allow read-only commands only.
+    #[test]
+    fn an_untrusted_review_is_read_only_and_tells_the_guard() {
+        let review = req(ToolProfile::UntrustedReadOnly, true);
+        let args = joined(worker().args(&review, "Review"));
+        assert!(args.contains("--sandbox read-only"), "{args}");
+        let marker = worker()
+            .command(&review, "Review")
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == crate::UNTRUSTED_REVIEW_ENV)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()));
+        assert_eq!(marker.as_deref(), Some("1"));
     }
 
     #[test]

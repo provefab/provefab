@@ -57,6 +57,10 @@ pub(crate) struct Finished {
 /// every call but the structured answer's own.
 pub const NO_TOOLS_ENV: &str = "PROVEFAB_NO_TOOLS";
 
+/// Set (to `1`) for a review of a person's pull request: `provefab guard`
+/// then lets the shell run read-only commands only and refuses every write.
+pub const UNTRUSTED_REVIEW_ENV: &str = "PROVEFAB_UNTRUSTED_REVIEW";
+
 /// Environment every worker gets, whatever the agent runtime.
 pub fn apply_worker_env(cmd: &mut Command, worktree: &Path, hooks_dir: &Path, tools: ToolProfile) {
     for key in SCRUBBED_ENV {
@@ -64,7 +68,15 @@ pub fn apply_worker_env(cmd: &mut Command, worktree: &Path, hooks_dir: &Path, to
     }
     match tools {
         ToolProfile::NoTools => cmd.env(NO_TOOLS_ENV, "1"),
-        ToolProfile::ReadOnly | ToolProfile::Full => cmd.env_remove(NO_TOOLS_ENV),
+        ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly | ToolProfile::Full => {
+            cmd.env_remove(NO_TOOLS_ENV)
+        }
+    };
+    match tools {
+        ToolProfile::UntrustedReadOnly => cmd.env(UNTRUSTED_REVIEW_ENV, "1"),
+        ToolProfile::ReadOnly | ToolProfile::Full | ToolProfile::NoTools => {
+            cmd.env_remove(UNTRUSTED_REVIEW_ENV)
+        }
     };
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     let mut n = current_env(cmd, "GIT_CONFIG_COUNT")
@@ -589,6 +601,33 @@ if git push -q origin HEAD:main 2>/dev/null; then echo '{"pushed":true}'; else e
         .await
         .unwrap();
         assert_eq!(seen.unwrap()["pushed"], false);
+    }
+
+    /// Final review I1 (pull request reviews): the guard's review marker is
+    /// set for a review of a person's pull request only, and an inherited one
+    /// is removed for every other stage.
+    #[test]
+    fn the_review_marker_is_set_for_untrusted_reviews_only() {
+        let marker = |tools| {
+            let mut cmd = sh("true");
+            cmd.env(UNTRUSTED_REVIEW_ENV, "1");
+            apply_worker_env(&mut cmd, Path::new("/w"), Path::new("/h"), tools);
+            cmd.as_std()
+                .get_envs()
+                .find(|(k, _)| *k == UNTRUSTED_REVIEW_ENV)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
+        };
+        assert_eq!(
+            marker(ToolProfile::UntrustedReadOnly),
+            Some(Some("1".into()))
+        );
+        for tools in [
+            ToolProfile::ReadOnly,
+            ToolProfile::Full,
+            ToolProfile::NoTools,
+        ] {
+            assert_eq!(marker(tools), Some(None), "{tools:?}");
+        }
     }
 
     /// Final review M5: the user's own GIT_CONFIG_* entries are kept, ours are appended.

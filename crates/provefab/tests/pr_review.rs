@@ -188,6 +188,57 @@ async fn a_fork_head_is_reviewed_and_summarised_once() {
     );
 }
 
+/// Final review I1: a person's pull request is reviewed with the guard's
+/// read-only shell marker; an issue task's stages keep their tools.
+#[tokio::test]
+async fn only_a_pull_request_review_runs_under_the_read_only_marker() {
+    use agent_workers::ToolProfile;
+    let seen: Arc<Mutex<Vec<(String, ToolProfile)>>> = Arc::default();
+    let script = {
+        let seen = seen.clone();
+        move |m: &ModelEntry, req: &StageRequest, tx: &UnboundedSender<WorkerEvent>| {
+            seen.lock()
+                .unwrap()
+                .push((stage_of(&req.prompt).to_string(), req.tools));
+            match stage_of(&req.prompt) {
+                "review" if req.prompt.contains("BEGIN UNTRUSTED pull request") => {
+                    finds(m, req, tx)
+                }
+                _ => happy(m, req, tx),
+            }
+        }
+    };
+    let f = fixture(&["true"]);
+    push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
+    let p = pipeline(
+        &f,
+        Box::new(script),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let review = queue_pr(&p, 12).await;
+    assert_eq!(p.drive(review).await.unwrap(), PrOpen);
+    assert_eq!(
+        std::mem::take(&mut *seen.lock().unwrap()),
+        [("review".to_string(), ToolProfile::UntrustedReadOnly)]
+    );
+    let issue = queue(&p).await;
+    assert_eq!(p.drive(issue).await.unwrap(), PrOpen);
+    let tools = seen.lock().unwrap().clone();
+    assert!(!tools.is_empty());
+    assert!(
+        tools
+            .iter()
+            .all(|(_, t)| *t != ToolProfile::UntrustedReadOnly),
+        "{tools:?}"
+    );
+    assert!(
+        tools.contains(&("review".to_string(), ToolProfile::ReadOnly)),
+        "{tools:?}"
+    );
+}
+
 /// Spec section 5: risk picks a frontier reviewer; rules come from the
 /// base commit and are selected for the changed files; the pull request's
 /// own copy of the rules file is never read.

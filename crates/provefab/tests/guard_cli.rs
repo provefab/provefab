@@ -4,9 +4,20 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn guard(format: &str, root: Option<&std::path::Path>, stdin: &str) -> std::process::Output {
+    guard_with(format, root, stdin, &[])
+}
+
+fn guard_with(
+    format: &str,
+    root: Option<&std::path::Path>,
+    stdin: &str,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_provefab"));
     cmd.args(["guard", "--format", format])
         .env_remove("PROVEFAB_WORKTREE")
+        .env_remove("PROVEFAB_UNTRUSTED_REVIEW")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -51,4 +62,39 @@ fn pi_without_root_denies() {
     let out = guard("pi", None, r#"{"tool":"bash","args":{"command":"ls"}}"#);
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains(r#""decision":"deny""#), "{stdout}");
+}
+
+/// Final review I1: the worker's review marker reaches the guard through
+/// the environment and limits the shell to read-only commands.
+#[test]
+fn the_review_marker_refuses_running_the_pull_requests_code() {
+    let root = tempfile::tempdir().unwrap();
+    let call = |command: &str| {
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}).to_string()
+    };
+    let marker = [("PROVEFAB_UNTRUSTED_REVIEW", "1")];
+    let out = guard_with(
+        "codex",
+        Some(root.path()),
+        &call("python3 tools/check.py"),
+        &marker,
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(r#""permissionDecision":"deny""#),
+        "{stdout}"
+    );
+    let out = guard_with(
+        "codex",
+        Some(root.path()),
+        &call("git diff HEAD~1"),
+        &marker,
+    );
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+    let out = guard("codex", Some(root.path()), &call("python3 tools/check.py"));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "",
+        "no marker, stage policy"
+    );
 }

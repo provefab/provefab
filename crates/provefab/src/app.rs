@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use crate::agents::AgentRunner;
-use crate::cli::{GuardFormat, run_guard, run_guard_no_tools};
+use crate::cli::{GuardFormat, run_guard, run_guard_no_tools, run_guard_review};
 use crate::commands::{self, Tools};
 use crate::config::{Auth, Config, WorkerKind};
 use crate::cooldown::Cooldowns;
@@ -103,6 +103,11 @@ enum Cmd {
         /// false one (0, false, no, off) turns it on.
         #[arg(long, env = agent_workers::NO_TOOLS_ENV, value_parser = clap::builder::FalseyValueParser::new())]
         no_tools: bool,
+        /// Refuse every shell command but read-only ones (`cat`, `grep`,
+        /// `git diff`, ...) and every write. Workers set
+        /// PROVEFAB_UNTRUSTED_REVIEW for a review of a person's pull request.
+        #[arg(long, env = agent_workers::UNTRUSTED_REVIEW_ENV, value_parser = clap::builder::FalseyValueParser::new())]
+        untrusted_review: bool,
     },
 }
 
@@ -188,6 +193,7 @@ where
         format,
         root,
         no_tools,
+        untrusted_review,
     } = cli.cmd
     {
         // Synchronous and dependency-free: runs before every agent tool call.
@@ -196,6 +202,8 @@ where
         let _ = std::io::stdin().read_to_string(&mut stdin);
         let out = if no_tools {
             run_guard_no_tools(format, &stdin)
+        } else if untrusted_review {
+            run_guard_review(format, root.as_deref(), &stdin)
         } else {
             run_guard(format, root.as_deref(), &stdin)
         };
