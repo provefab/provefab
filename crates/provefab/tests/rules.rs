@@ -402,6 +402,24 @@ async fn doctor_prints_the_rules_of_each_repository() {
     );
 }
 
+#[tokio::test]
+async fn doctor_says_when_the_rules_cannot_be_read() {
+    use provefab::commands::{Tools, rules_checks};
+    let f = fixture(&["true"]);
+    let paths = Paths::new(&f.home);
+    let tools = Tools::default();
+    let hub = FakeHub::new("x");
+    let mut config = f.config.clone();
+    config.repos[0].base = "no-such-branch".into();
+    let check = rules_checks(&tools, &config, &paths, &hub)
+        .await
+        .into_iter()
+        .find(|c| c.name == "rules o/r")
+        .unwrap();
+    assert!(!check.ok);
+    assert_eq!(check.detail, "could not read .provefab/rules.md");
+}
+
 fn run_of(kind: &str, pr_url: Option<&str>, detail: Option<Value>) -> MaintenanceRun {
     MaintenanceRun {
         id: 0,
