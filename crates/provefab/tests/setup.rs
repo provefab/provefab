@@ -313,7 +313,11 @@ fn a_token_in_a_broken_configuration_never_reaches_stderr() {
     let home = t.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    std::fs::write(home.join("provefab.toml"), format!("[jev]\nkey = {token}\n")).unwrap();
+    std::fs::write(
+        home.join("provefab.toml"),
+        format!("[jev]\nkey = {token}\n"),
+    )
+    .unwrap();
     let bin = bin_dir(t.path());
     for args in [vec!["repos", "add", "o/r"], vec!["doctor"]] {
         let err = refused(&provefab(&home, &bin, &args), 1);

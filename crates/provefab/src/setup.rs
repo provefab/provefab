@@ -931,7 +931,11 @@ mod tests {
                     "package.json",
                     r#"{"scripts":{"lint":"eslint .","test":"node --test"}}"#,
                 )],
-                Ok(vec!["npm install --no-package-lock", "npm run lint", "npm test"]),
+                Ok(vec![
+                    "npm install --no-package-lock",
+                    "npm run lint",
+                    "npm test",
+                ]),
             ),
             (
                 "npm with package-lock",
@@ -1339,7 +1343,10 @@ mod tests {
             .await
             .unwrap();
         assert!(shown.starts_with("[[repos]]\n"), "{shown}");
-        assert!(shown.ends_with(&format!("{DEPENDENCIES_NOTE}\n")), "{shown}");
+        assert!(
+            shown.ends_with(&format!("{DEPENDENCIES_NOTE}\n")),
+            "{shown}"
+        );
         let (_h2, paths2) = home_with(MINE);
         let hub2 = FakeHub::new("x");
         *hub2.repo_root.lock().unwrap() = Some(root_of(
@@ -1350,7 +1357,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!said.contains(DEPENDENCIES_NOTE), "{said}");
-        assert!(said.contains("gates: npm install --no-package-lock; npm test"), "{said}");
+        assert!(
+            said.contains("gates: npm install --no-package-lock; npm test"),
+            "{said}"
+        );
         let (_h3, paths3) = home_with(MINE);
         let said = repos_add(&paths3, &go_hub("main"), &git(), "o/r", None, false)
             .await
