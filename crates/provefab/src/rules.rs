@@ -88,7 +88,7 @@ pub enum RulesError {
 /// rule heading is an introduction and is ignored, including any `## `
 /// heading there that does not start with `R` and a digit; after it, every
 /// `## ` line is a rule heading. A rule's optional `paths:` and `sources:`
-/// lines come right after its heading, then its text; `sources:` is never
+/// lines come right after its heading, in either order, then its text; `sources:` is never
 /// interpreted.
 pub fn parse(text: &str) -> Result<Vec<Rule>, RulesError> {
     let mut rules: Vec<Rule> = Vec::new();
@@ -1439,6 +1439,37 @@ mod tests {
         ] {
             assert_eq!(parse(text), Err(want), "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_paths_line_after_the_rule_text_is_misplaced() {
+        assert_eq!(
+            parse("## R1: One\n\ntext\npaths: a/**\n"),
+            Err(RulesError::Misplaced {
+                line: 4,
+                key: "paths:"
+            })
+        );
+    }
+
+    #[test]
+    fn a_doubled_sources_line_is_misplaced() {
+        assert_eq!(
+            parse("## R1: One\nsources: PR #1\nsources: PR #2\n"),
+            Err(RulesError::Misplaced {
+                line: 3,
+                key: "sources:"
+            })
+        );
+    }
+
+    #[test]
+    fn sources_before_paths_is_accepted() {
+        // The order of the two metadata lines is free; pinned on purpose.
+        let rules = parse("## R1: One\nsources: PR #1\npaths: a/**\n\nText.\n").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].paths, ["a/**"]);
+        assert_eq!(rules[0].text, "Text.");
     }
 
     #[test]
