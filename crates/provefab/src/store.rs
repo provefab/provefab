@@ -13,7 +13,7 @@ use sqlx::{Row, SqliteConnection};
 
 use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
 use crate::record::{Disposition, Event, FindingRow, RULE_VERSION, Rule, StoredEvent};
-use crate::task::{TaskKind, TaskState};
+use crate::task::{TaskKind, TaskMode, TaskState};
 
 /// A finding `f` belongs to the last review round of its pass: the highest
 /// round of the pass's `review` events, so a final review without findings
@@ -71,17 +71,31 @@ pub struct TaskRow {
     pub reopen_count: u32,
     /// The retry ladder moved the implement stage up one tier (spec §3.2).
     pub escalated: bool,
+    /// An issue Provefab works on, or a pull request it reviews (PR review spec section 3).
+    pub mode: TaskMode,
+    /// The commit a pull request review last reviewed.
+    pub pr_head: Option<String>,
 }
 
 impl TaskRow {
-    /// `#123` or `ENG-123` (issue trackers spec §4).
+    /// `#123`, `ENG-123` (issue trackers spec §4), or `PR #12` for a review.
     pub fn reference(&self) -> String {
-        crate::tracker::issue_ref(self.issue_number, self.issue_key.as_deref())
+        match self.mode {
+            TaskMode::PrReview => format!("PR #{}", self.issue_number),
+            TaskMode::Issue => {
+                crate::tracker::issue_ref(self.issue_number, self.issue_key.as_deref())
+            }
+        }
     }
 
-    /// `o/r#123` or `o/r ENG-123`.
+    /// `o/r#123`, `o/r ENG-123` or `o/r PR #12`.
     pub fn repo_reference(&self) -> String {
-        crate::tracker::repo_ref(&self.repo, self.issue_number, self.issue_key.as_deref())
+        match self.mode {
+            TaskMode::PrReview => format!("{} PR #{}", self.repo, self.issue_number),
+            TaskMode::Issue => {
+                crate::tracker::repo_ref(&self.repo, self.issue_number, self.issue_key.as_deref())
+            }
+        }
     }
 }
 
@@ -255,16 +269,41 @@ impl Store {
 
     /// Queues an issue. `None` when the issue URL is already known (intake is idempotent).
     pub async fn add_issue(&self, issue: &NewIssue) -> Result<Option<i64>, StoreError> {
+        self.insert_task(issue, TaskMode::Issue, &[]).await
+    }
+
+    /// Queues a review of pull request `pr.number` (PR review spec section 4),
+    /// with `outputs` (stage outputs) written in the same transaction. `None`
+    /// when that pull request already has a review task.
+    pub async fn add_pr_review(
+        &self,
+        pr: &NewIssue,
+        outputs: &[(&str, &Value)],
+    ) -> Result<Option<i64>, StoreError> {
+        self.insert_task(pr, TaskMode::PrReview, outputs).await
+    }
+
+    async fn insert_task(
+        &self,
+        issue: &NewIssue,
+        mode: TaskMode,
+        outputs: &[(&str, &Value)],
+    ) -> Result<Option<i64>, StoreError> {
         // IMMEDIATE takes the write lock up front: a deferred transaction that reads
         // first gets SQLITE_BUSY when another writer commits in between (review C1).
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let t = now();
+        // A review's pull request is the task's own from the start.
+        let (pr_url, pr_state) = match mode {
+            TaskMode::Issue => (None, None),
+            TaskMode::PrReview => (Some(issue.url.as_str()), Some("open")),
+        };
         let inserted = sqlx::query(
-            "INSERT INTO tasks (repo, issue_number, issue_key, issue_url, title, author, state, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (repo, issue_number) DO NOTHING",
+            "INSERT INTO tasks (repo, issue_number, issue_key, issue_url, title, author, state, created_at, updated_at, mode, pr_url, pr_state)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (repo, mode, issue_number) DO NOTHING",
         )
-        // GitHub slugs are case-insensitive; (repo, number) is the issue's identity.
+        // GitHub slugs are case-insensitive; (repo, mode, number) is the task's identity.
         .bind(issue.repo.to_lowercase())
         .bind(issue.number as i64)
         .bind(&issue.issue_key)
@@ -274,6 +313,9 @@ impl Store {
         .bind(TaskState::Queued.as_str())
         .bind(t)
         .bind(t)
+        .bind(mode.as_str())
+        .bind(pr_url)
+        .bind(pr_state)
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -286,6 +328,9 @@ impl Store {
             .bind(t)
             .execute(&mut *tx)
             .await?;
+        for &(kind, value) in outputs {
+            exec_write(&mut tx, id, &Write::Output { kind, value }).await?;
+        }
         tx.commit().await?;
         Ok(Some(id))
     }
@@ -312,12 +357,36 @@ impl Store {
         repo: &str,
         number: u64,
     ) -> Result<Option<TaskRow>, StoreError> {
-        let row = sqlx::query("SELECT * FROM tasks WHERE lower(repo) = ? AND issue_number = ?")
-            .bind(repo.to_lowercase())
-            .bind(number as i64)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT * FROM tasks WHERE lower(repo) = ? AND issue_number = ? AND mode = 'issue'",
+        )
+        .bind(repo.to_lowercase())
+        .bind(number as i64)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|r| task_row(&r)).transpose()
+    }
+
+    /// The review task of pull request `number` of `repo` (any case).
+    pub async fn task_of_pr(&self, repo: &str, number: u64) -> Result<Option<TaskRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT * FROM tasks WHERE lower(repo) = ? AND issue_number = ? AND mode = 'pr_review'",
+        )
+        .bind(repo.to_lowercase())
+        .bind(number as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| task_row(&r)).transpose()
+    }
+
+    /// The commit a review task last reviewed.
+    pub async fn set_pr_head(&self, id: i64, sha: &str) -> Result<(), StoreError> {
+        self.update(
+            id,
+            "UPDATE tasks SET pr_head = ?, updated_at = ? WHERE id = ?",
+            |q| q.bind(sha.to_string()),
+        )
+        .await
     }
 
     /// Tasks in any of `states`, oldest first.
@@ -1107,12 +1176,14 @@ impl Store {
         Ok((events, findings))
     }
 
-    /// Finished tasks last updated before `before`: failed, or a PR that is
-    /// done or archived, with no post-merge check still open.
+    /// Finished tasks last updated before `before`: failed, a PR that is done
+    /// or archived, or a pull request review that merged or closed, with no
+    /// post-merge check still open.
     pub async fn prunable_tasks(&self, before: i64) -> Result<Vec<TaskRow>, StoreError> {
         let rows = sqlx::query(
             "SELECT * FROM tasks WHERE updated_at < ? \
-             AND (state = ? OR (state = ? AND pr_state IN ('done', 'archived'))) \
+             AND (state = ? OR (state = ? AND (pr_state IN ('done', 'archived') \
+                  OR (mode = 'pr_review' AND pr_state IN ('merged', 'closed'))))) \
              AND NOT EXISTS (SELECT 1 FROM post_merge_checks c WHERE c.task_id = tasks.id \
                  AND c.state NOT IN ('passed','superseded','revert_open','blocked')) \
              ORDER BY id",
@@ -1432,6 +1503,11 @@ fn task_row(r: &SqliteRow) -> Result<TaskRow, StoreError> {
         pr_state: r.get("pr_state"),
         reopen_count: r.get::<i64, _>("reopen_count") as u32,
         escalated: r.get::<i64, _>("escalated") != 0,
+        mode: {
+            let m: String = r.get("mode");
+            TaskMode::parse(&m).ok_or(StoreError::Corrupt(m))?
+        },
+        pr_head: r.get("pr_head"),
     })
 }
 
@@ -1712,6 +1788,7 @@ mod tests {
                 "5f568cb3d17aaf248e9f208ef39268d14393dd87157e348b5946549ebf4a359aedf16a05374529315b4dba8d461e9832",
                 "9c8911c912d3be8612dc10a06a802d318765a37df1c1c8a2449ba1063b3bdeb54242a9e943d29922b51f9c99350a0b3b",
                 "de68e76b6d0a8bee1058b97821d70b7d78434d938cef56bcf13d9a1d42aaf30b9bac8bf2e103104949b747230190b5e9",
+                "49afe250fcbcf615540e912d91db02599c46618f4dcf84ad45ae94aca10641fb9932c15f7c6da37ca4398a3750315911",
             ]
         );
     }
@@ -1860,6 +1937,217 @@ mod tests {
             (t.issue_key.clone(), t.reference(), t.repo_reference()),
             (None, "#8".into(), "o/r#8".into())
         );
+    }
+
+    /// Spec section 10: migration 0008 on a database holding tasks and a row
+    /// in each of the eight tables that reference `tasks (id)`: ids and links
+    /// kept, foreign keys enforced again, and pull request #12 next to
+    /// ticket ENG-12 (plan decision 1).
+    #[tokio::test]
+    async fn migration_0008_rebuilds_tasks_and_keeps_every_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provefab.db");
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .foreign_keys(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::migrate!("./migrations")
+                .run_to(7, &pool)
+                .await
+                .unwrap();
+            for sql in [
+                "INSERT INTO tasks (id, repo, issue_number, issue_url, title, author, state, created_at, updated_at, reopen_count, escalated, issue_key) \
+                 VALUES (5, 'o/r', 12, 'https://acme.atlassian.net/browse/ENG-12', 'Ticket', 'alice', 'pr_open', 1, 2, 1, 1, 'ENG-12')",
+                "INSERT INTO tasks (id, repo, issue_number, issue_url, title, author, state, created_at, updated_at) \
+                 VALUES (9, 'o/r', 3, 'https://github.com/o/r/issues/3', 'Issue', 'bob', 'queued', 1, 2)",
+                "INSERT INTO transitions (task_id, from_state, to_state, reason, at) VALUES (5, NULL, 'queued', 'intake', 1)",
+                "INSERT INTO routing_decisions (task_id, tiers_json, reasons, at) VALUES (5, '{}', '', 1)",
+                "INSERT INTO stage_runs (task_id, stage, model_id, exit, turns, input_tokens, output_tokens, session_dir, started_at, finished_at) \
+                 VALUES (5, 'review', 'm', 'completed', 1, 1, 1, '/s', 1, 2)",
+                "INSERT INTO replies_seen (task_id, last_comment_at) VALUES (5, '2026-10-02T00:00:00Z')",
+                "INSERT INTO stage_outputs (task_id, kind, json, at) VALUES (5, 'review', '{}', 1)",
+                "INSERT INTO post_merge_checks (task_id, merge_sha, base, state) VALUES (5, 'abc', 'main', 'queued')",
+                "INSERT INTO change_events (id, task_id, seq, kind, source, schema_version, payload, at) \
+                 VALUES (40, 5, 1, 'review', 'claim', 1, '{}', 1)",
+                "INSERT INTO findings (task_id, key, pass, round, reviewer_model, severity, file, text, event_id) \
+                 VALUES (5, 'F1', 1, 0, 'm', 'blocking', 'a.rs', 't', 40)",
+            ] {
+                sqlx::query(sql).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+        let s = Store::open(&path).await.unwrap();
+        let ticket = s.task(5).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                ticket.issue_number,
+                ticket.issue_key.as_deref(),
+                ticket.mode,
+                ticket.pr_head.as_deref(),
+                ticket.reopen_count,
+                ticket.escalated
+            ),
+            (12, Some("ENG-12"), TaskMode::Issue, None, 1, true)
+        );
+        let other = s.task(9).await.unwrap().unwrap();
+        assert_eq!(
+            (other.title.as_str(), other.state),
+            ("Issue", TaskState::Queued)
+        );
+        for table in [
+            "transitions",
+            "routing_decisions",
+            "stage_runs",
+            "replies_seen",
+            "stage_outputs",
+            "post_merge_checks",
+            "change_events",
+            "findings",
+        ] {
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE task_id = 5"
+            )))
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "{table}");
+        }
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let refused = sqlx::query(
+            "INSERT INTO transitions (task_id, from_state, to_state, reason, at) VALUES (999, NULL, 'queued', 'x', 1)",
+        )
+        .execute(&s.pool)
+        .await;
+        assert!(refused.is_err(), "foreign keys are enforced again");
+        let pr = NewIssue {
+            url: "https://github.com/o/r/pull/12".into(),
+            author: "carol".into(),
+            ..issue(12)
+        };
+        let id = s.add_pr_review(&pr, &[]).await.unwrap().unwrap();
+        assert_eq!(id, 10, "ids continue after the copied ones");
+        assert_eq!(s.task_of_issue("o/r", 12).await.unwrap().unwrap().id, 5);
+        assert_eq!(s.task_of_pr("O/R", 12).await.unwrap().unwrap().id, id);
+        drop(s);
+        let s = Store::open(&path).await.unwrap();
+        assert!(s.task(id).await.unwrap().is_some(), "0008 runs once");
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_review_is_a_task_of_its_own_mode() {
+        let (_d, s) = store().await;
+        let ticket = s
+            .add_issue(&NewIssue {
+                issue_key: Some("ENG-12".into()),
+                url: "https://acme.atlassian.net/browse/ENG-12".into(),
+                ..issue(12)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let pr = NewIssue {
+            url: "https://github.com/o/r/pull/12".into(),
+            title: "Fix the parser".into(),
+            author: "carol".into(),
+            ..issue(12)
+        };
+        let snapshot = json!({"title": "Fix the parser", "body": "b"});
+        let id = s
+            .add_pr_review(&pr, &[("pr", &snapshot)])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(id, ticket);
+        assert_eq!(
+            s.add_pr_review(&pr, &[("pr", &snapshot)]).await.unwrap(),
+            None,
+            "one task per pull request"
+        );
+        assert_eq!(
+            s.add_issue(&issue(12)).await.unwrap(),
+            None,
+            "one issue task per number, as before"
+        );
+        let t = s.task(id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                t.mode,
+                t.state,
+                t.pr_url.as_deref(),
+                t.pr_state.as_deref(),
+                t.issue_key.clone()
+            ),
+            (
+                TaskMode::PrReview,
+                TaskState::Queued,
+                Some("https://github.com/o/r/pull/12"),
+                Some("open"),
+                None
+            )
+        );
+        assert_eq!(
+            (t.reference(), t.repo_reference()),
+            ("PR #12".to_string(), "o/r PR #12".to_string())
+        );
+        assert_eq!(s.last_output(id, "pr").await.unwrap(), Some(snapshot));
+        assert_eq!(
+            s.count_outputs(id, "pr").await.unwrap(),
+            1,
+            "the refused insert wrote nothing"
+        );
+        assert_eq!(s.transitions(id).await.unwrap()[0].reason, "intake");
+        assert_eq!(
+            s.task_of_issue("o/r", 12).await.unwrap().unwrap().id,
+            ticket
+        );
+        assert_eq!(s.task_of_pr("o/r", 12).await.unwrap().unwrap().id, id);
+        assert!(s.task_of_pr("o/r", 13).await.unwrap().is_none());
+        s.set_pr_head(id, "abc123").await.unwrap();
+        assert_eq!(
+            s.task(id).await.unwrap().unwrap().pr_head.as_deref(),
+            Some("abc123")
+        );
+    }
+
+    /// Plan decision 12: a merged or closed review is finished.
+    #[tokio::test]
+    async fn an_ended_pull_request_review_can_be_pruned() {
+        let (_d, s) = store().await;
+        let pr = |n: u64| NewIssue {
+            url: format!("https://github.com/o/r/pull/{n}"),
+            ..issue(n)
+        };
+        let open = s.add_pr_review(&pr(3), &[]).await.unwrap().unwrap();
+        let merged = s.add_pr_review(&pr(4), &[]).await.unwrap().unwrap();
+        let closed = s.add_pr_review(&pr(5), &[]).await.unwrap().unwrap();
+        for id in [open, merged, closed] {
+            s.transition(id, TaskState::PrOpen, "reviewed")
+                .await
+                .unwrap();
+        }
+        s.set_pr_state(merged, "merged").await.unwrap();
+        s.set_pr_state(closed, "closed").await.unwrap();
+        let ids: Vec<i64> = s
+            .prunable_tasks(now() + 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, [merged, closed]);
     }
 
     use crate::record::{Event, MergedBy};

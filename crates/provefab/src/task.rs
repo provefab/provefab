@@ -66,6 +66,29 @@ impl TaskKind {
     }
 }
 
+/// What a task works on (PR review spec section 3): an issue Provefab turns
+/// into a pull request, or a pull request a person wrote that it reviews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskMode {
+    Issue,
+    PrReview,
+}
+
+impl TaskMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskMode::Issue => "issue",
+            TaskMode::PrReview => "pr_review",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [TaskMode::Issue, TaskMode::PrReview]
+            .into_iter()
+            .find(|m| m.as_str() == s)
+    }
+}
+
 /// Where a task is in the pipeline (spec §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskState {
