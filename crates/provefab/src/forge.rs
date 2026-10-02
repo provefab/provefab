@@ -597,6 +597,18 @@ impl Git {
         Ok(())
     }
 
+    /// Fetches pull request `number`'s head from `origin` into
+    /// `refs/provefab/pull/<number>` and returns its commit. GitHub keeps
+    /// `refs/pull/<n>/head` for pull requests from forks too (PR review spec
+    /// section 5).
+    pub async fn fetch_pr_head(&self, repo: &Path, number: u64) -> Result<String, ForgeError> {
+        let local = format!("refs/provefab/pull/{number}");
+        let refspec = format!("+refs/pull/{number}/head:{local}");
+        self.git(repo, &["fetch", "--quiet", "origin", &refspec])
+            .await?;
+        self.rev_parse(repo, &local).await
+    }
+
     /// Updates `origin/*` so a new pass starts from the latest base (D48).
     pub async fn fetch(&self, repo: &Path) -> Result<(), ForgeError> {
         self.git(repo, &["fetch", "--quiet", "origin"]).await?;
@@ -925,6 +937,23 @@ pub struct PrStatus {
     pub commit_count: Option<usize>,
 }
 
+/// An open pull request as the PR review triggers read it (spec section 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    /// The branch the change comes from; on a fork, the fork's branch name.
+    pub head_ref: String,
+    /// The branch it targets.
+    pub base: String,
+    pub labels: Vec<String>,
+    /// The comments `gh pr list` returns (GitHub lists at most 100 per pull request).
+    pub comments: Vec<Comment>,
+}
+
 /// The `comments` array of `gh issue view` / `gh pr view --json comments`.
 fn parse_comments(v: &Value) -> Vec<Comment> {
     v.get("comments")
@@ -964,6 +993,13 @@ pub(crate) fn issue_limit_warning(slug: &str, label: &str, count: usize) -> Opti
     })
 }
 
+/// The id at the end of a comment URL, `.../pull/12#issuecomment-4321`.
+fn comment_id(out: &str) -> Option<u64> {
+    out.lines()
+        .rev()
+        .find_map(|l| l.trim().rsplit_once("#issuecomment-")?.1.parse().ok())
+}
+
 impl Gh {
     async fn gh(&self, args: &[&str], stdin: Option<&str>) -> Result<String, ForgeError> {
         run(&self.program, None, args, stdin).await
@@ -971,6 +1007,68 @@ impl Gh {
 
     fn json(&self, what: &str, text: &str) -> Result<Value, ForgeError> {
         serde_json::from_str(text).map_err(|e| ForgeError::Parse(what.to_string(), e.to_string()))
+    }
+
+    /// Open pull requests into `base`, with their labels and comments: what
+    /// the PR review label and command read (spec section 4, plan decision 2).
+    pub async fn open_pull_requests(
+        &self,
+        slug: &str,
+        base: &str,
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        let limit = ISSUE_LIMIT.to_string();
+        let out = self
+            .gh(
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    slug,
+                    "--base",
+                    base,
+                    "--state",
+                    "open",
+                    "--limit",
+                    &limit,
+                    "--json",
+                    "number,url,title,body,author,headRefName,baseRefName,labels,comments",
+                ],
+                None,
+            )
+            .await?;
+        let v = self.json("gh pr list", &out)?;
+        let prs = v.as_array().cloned().unwrap_or_default();
+        if prs.len() >= ISSUE_LIMIT {
+            eprintln!(
+                "provefab: {slug} has {ISSUE_LIMIT}+ open pull requests into {base}; only the first {ISSUE_LIMIT} are read"
+            );
+        }
+        Ok(prs
+            .iter()
+            .filter_map(|p| {
+                Some(PullRequest {
+                    number: p.get("number")?.as_u64()?,
+                    url: p.get("url")?.as_str()?.to_string(),
+                    title: p.get("title")?.as_str()?.to_string(),
+                    body: p
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    author: p.pointer("/author/login")?.as_str()?.to_string(),
+                    head_ref: p.get("headRefName")?.as_str()?.to_string(),
+                    base: p.get("baseRefName")?.as_str()?.to_string(),
+                    labels: p
+                        .get("labels")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+                        .collect(),
+                    comments: parse_comments(p),
+                })
+            })
+            .collect())
     }
 
     /// Open issues carrying `label` (spec §3.3).
@@ -1262,14 +1360,32 @@ impl Gh {
         Ok(())
     }
 
-    /// Posts a bot comment on a pull request.
-    pub async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
-        self.gh(
-            &["pr", "comment", url, "--repo", slug, "--body-file", "-"],
-            Some(&with_prefix(body)),
-        )
-        .await?;
-        Ok(())
+    /// Posts a bot comment on a pull request and returns its id, read from
+    /// the comment URL gh prints (`None` when it printed none). With `edit`,
+    /// replaces that comment's body instead (the PR review summary, plan
+    /// decision 3).
+    pub async fn pr_comment(
+        &self,
+        slug: &str,
+        url: &str,
+        body: &str,
+        edit: Option<u64>,
+    ) -> Result<Option<u64>, ForgeError> {
+        let body = with_prefix(body);
+        if let Some(id) = edit {
+            let path = format!("repos/{slug}/issues/comments/{id}");
+            let input = serde_json::json!({ "body": body }).to_string();
+            self.gh(&["api", "-X", "PATCH", &path, "--input", "-"], Some(&input))
+                .await?;
+            return Ok(Some(id));
+        }
+        let out = self
+            .gh(
+                &["pr", "comment", url, "--repo", slug, "--body-file", "-"],
+                Some(&body),
+            )
+            .await?;
+        Ok(comment_id(&out))
     }
 
     pub async fn edit_labels(
@@ -2039,6 +2155,115 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap(),
             "New body"
+        );
+    }
+
+    /// PR review spec section 6 (plan decision 3): posting returns the id gh
+    /// printed in the comment URL; editing patches that comment.
+    #[tokio::test]
+    async fn gh_posts_then_edits_one_pull_request_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://github.com/o/r/pull/9";
+        let gh = fake_gh(dir.path(), &format!("{url}#issuecomment-4321\n"));
+        assert_eq!(
+            gh.pr_comment("o/r", url, "Hello", None).await.unwrap(),
+            Some(4321)
+        );
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+        assert_eq!(
+            log,
+            format!(
+                "ARG pr\nARG comment\nARG {url}\nARG --repo\nARG o/r\nARG --body-file\nARG -\n"
+            )
+        );
+        let sent = std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap();
+        assert!(
+            sent.starts_with(BOT_PREFIX) && sent.ends_with("Hello"),
+            "{sent}"
+        );
+        assert_eq!(
+            gh.pr_comment("o/r", url, "Again", Some(4321))
+                .await
+                .unwrap(),
+            Some(4321)
+        );
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+        assert_eq!(
+            log,
+            "ARG api\nARG -X\nARG PATCH\nARG repos/o/r/issues/comments/4321\nARG --input\nARG -\n"
+        );
+        let sent: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap())
+                .unwrap();
+        let body = sent["body"].as_str().unwrap();
+        assert!(
+            body.starts_with(BOT_PREFIX) && body.ends_with("Again"),
+            "{body}"
+        );
+        // An older gh that prints no URL: posted, no id.
+        let gh = fake_gh(dir.path(), "");
+        assert_eq!(gh.pr_comment("o/r", url, "x", None).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn gh_lists_open_pull_requests_with_labels_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("list.txt"),
+            r#"[{"number":12,"url":"https://github.com/o/r/pull/12","title":"Fix","body":"Why","author":{"login":"carol"},"headRefName":"carol/fix","baseRefName":"main","labels":[{"name":"provefab:review"}],"comments":[{"author":{"login":"bob"},"authorAssociation":"MEMBER","body":"/provefab review","createdAt":"2026-10-02T10:00:00Z"}]}]"#,
+        )
+        .unwrap();
+        let gh = fake_gh(dir.path(), "");
+        let prs = gh.open_pull_requests("o/r", "main").await.unwrap();
+        assert_eq!(
+            prs,
+            vec![PullRequest {
+                number: 12,
+                url: "https://github.com/o/r/pull/12".into(),
+                title: "Fix".into(),
+                body: "Why".into(),
+                author: "carol".into(),
+                head_ref: "carol/fix".into(),
+                base: "main".into(),
+                labels: vec!["provefab:review".into()],
+                comments: vec![Comment {
+                    author: "bob".into(),
+                    association: "MEMBER".into(),
+                    body: "/provefab review".into(),
+                    created_at: "2026-10-02T10:00:00Z".into(),
+                }],
+            }]
+        );
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).unwrap();
+        assert!(
+            log.contains("ARG --base\nARG main\nARG --state\nARG open\n")
+                && log.contains(
+                    "ARG number,url,title,body,author,headRefName,baseRefName,labels,comments\n"
+                ),
+            "{log}"
+        );
+    }
+
+    /// Spec section 5: `refs/pull/<n>/head` holds a fork's commits too.
+    #[tokio::test]
+    async fn a_pull_requests_head_is_fetched_even_from_a_fork() {
+        let (dir, repo) = repo().await;
+        sh(
+            dir.path(),
+            "git clone -q origin.git fork && cd fork && git config user.email t@t && git config user.name t \
+             && echo f > f.txt && git add -A && git commit -q -m fork \
+             && git push -q origin HEAD:refs/pull/7/head",
+        )
+        .await;
+        let g = git();
+        let sha = g.fetch_pr_head(&repo, 7).await.unwrap();
+        assert_eq!(
+            g.rev_parse(&repo, "refs/provefab/pull/7").await.unwrap(),
+            sha
+        );
+        assert!(
+            g.fetch_pr_head(&repo, 8).await.is_err(),
+            "no such pull request"
         );
     }
 

@@ -7,7 +7,7 @@ use std::path::Path;
 use agent_workers::WorkerEvent;
 use jev::JevClient;
 
-use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus};
+use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus, PullRequest};
 use crate::jevq::{self, IssueContext, Triage};
 use crate::task::Verdict;
 
@@ -164,12 +164,23 @@ pub trait Tracker {
 
 /// Where the code lives: GitHub, always (pull requests, clone, visibility).
 pub trait Forge {
+    /// Posts a bot comment on a pull request and returns its id when gh
+    /// printed one; with `edit`, replaces that comment instead (the PR review
+    /// summary, edited on each round).
     fn pr_comment(
         &self,
         slug: &str,
         url: &str,
         body: &str,
-    ) -> impl Future<Output = Result<(), ForgeError>> + Send;
+        edit: Option<u64>,
+    ) -> impl Future<Output = Result<Option<u64>, ForgeError>> + Send;
+    /// Open pull requests into `base` with their labels and comments: what
+    /// the PR review triggers read (PR review spec section 4).
+    fn open_pull_requests(
+        &self,
+        slug: &str,
+        base: &str,
+    ) -> impl Future<Output = Result<Vec<PullRequest>, ForgeError>> + Send;
     fn pr_create(
         &self,
         slug: &str,
@@ -251,8 +262,21 @@ impl Tracker for Gh {
 }
 
 impl Forge for Gh {
-    async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
-        Gh::pr_comment(self, slug, url, body).await
+    async fn pr_comment(
+        &self,
+        slug: &str,
+        url: &str,
+        body: &str,
+        edit: Option<u64>,
+    ) -> Result<Option<u64>, ForgeError> {
+        Gh::pr_comment(self, slug, url, body, edit).await
+    }
+    async fn open_pull_requests(
+        &self,
+        slug: &str,
+        base: &str,
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        Gh::open_pull_requests(self, slug, base).await
     }
     async fn pr_create(
         &self,

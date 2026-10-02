@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::config::{Config, RepoConfig};
-use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus};
+use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus, PullRequest};
 use crate::jira::Jira;
 use crate::linear::Linear;
 use crate::ports::{Forge, Tracker};
@@ -717,8 +717,21 @@ impl Tracker for Routed {
 }
 
 impl Forge for Routed {
-    async fn pr_comment(&self, slug: &str, url: &str, body: &str) -> Result<(), ForgeError> {
-        Forge::pr_comment(&self.gh, slug, url, body).await
+    async fn pr_comment(
+        &self,
+        slug: &str,
+        url: &str,
+        body: &str,
+        edit: Option<u64>,
+    ) -> Result<Option<u64>, ForgeError> {
+        Forge::pr_comment(&self.gh, slug, url, body, edit).await
+    }
+    async fn open_pull_requests(
+        &self,
+        slug: &str,
+        base: &str,
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        Forge::open_pull_requests(&self.gh, slug, base).await
     }
     async fn pr_create(
         &self,

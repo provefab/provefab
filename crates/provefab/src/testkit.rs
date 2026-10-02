@@ -11,7 +11,7 @@ pub use std::sync::Mutex;
 pub use crate::agents::StageRunner;
 pub use crate::config::{Config, ModelEntry};
 pub use crate::cooldown::Cooldowns;
-pub use crate::forge::{Comment, ForgeError, Git, Issue};
+pub use crate::forge::{Comment, ForgeError, Git, Issue, PullRequest};
 pub use crate::jevq::{IssueContext, Triage};
 pub use crate::paths::Paths;
 pub use crate::pipeline::Pipeline;
@@ -271,6 +271,15 @@ pub struct FakeHub {
     pub pr_head_override: Mutex<Option<String>>,
     /// The next this-many `pr_comment` calls fail (GitHub unreachable).
     pub pr_comment_failures: std::sync::atomic::AtomicU32,
+    /// What `open_pull_requests` answers, whatever base it is asked for, so
+    /// a test sees the caller's own base check.
+    pub open_prs: Mutex<Vec<PullRequest>>,
+    /// Every (slug, base) `open_pull_requests` was asked for.
+    pub pr_polls: Mutex<Vec<(String, String)>>,
+    /// Every comment posted on a pull request: (id, url, body), edited in place.
+    pub pr_comments: Mutex<Vec<(u64, String, String)>>,
+    /// Comment ids a person deleted: editing one fails as GitHub does.
+    pub deleted_comments: Mutex<Vec<u64>>,
     /// Every `pr_edit`: (url, title, body).
     pub edited: Mutex<Vec<(String, String, String)>>,
     /// While set, `pr_status` fails (GitHub unreachable).
@@ -324,6 +333,10 @@ impl FakeHub {
             pr_statuses: Mutex::new(std::collections::HashMap::new()),
             pr_head_override: Mutex::new(None),
             pr_comment_failures: Default::default(),
+            open_prs: Mutex::new(Vec::new()),
+            pr_polls: Mutex::new(Vec::new()),
+            pr_comments: Mutex::new(Vec::new()),
+            deleted_comments: Mutex::new(Vec::new()),
             edited: Mutex::new(Vec::new()),
             pr_status_down: Default::default(),
         }
@@ -433,14 +446,43 @@ impl Tracker for FakeHub {
 }
 
 impl Forge for FakeHub {
-    async fn pr_comment(&self, _: &str, url: &str, body: &str) -> Result<(), ForgeError> {
+    async fn pr_comment(
+        &self,
+        _: &str,
+        url: &str,
+        body: &str,
+        edit: Option<u64>,
+    ) -> Result<Option<u64>, ForgeError> {
         use std::sync::atomic::Ordering;
         let left = self.pr_comment_failures.load(Ordering::SeqCst);
         if left > 0 {
             self.pr_comment_failures.store(left - 1, Ordering::SeqCst);
             return Err(ForgeError::Parse("gh pr comment".into(), "HTTP 502".into()));
         }
+        if let Some(id) = edit {
+            let not_found = || ForgeError::Failed {
+                program: "gh".into(),
+                args: format!("api -X PATCH repos/o/r/issues/comments/{id}"),
+                code: Some(1),
+                stderr: "gh: Not Found (HTTP 404)".into(),
+            };
+            if self.deleted_comments.lock().unwrap().contains(&id) {
+                return Err(not_found());
+            }
+            let mut all = self.pr_comments.lock().unwrap();
+            let Some(c) = all.iter_mut().find(|c| c.0 == id) else {
+                return Err(not_found());
+            };
+            c.2 = body.to_string();
+            return Ok(Some(id));
+        }
         self.posted.lock().unwrap().push(body.to_string());
+        let id = {
+            let mut all = self.pr_comments.lock().unwrap();
+            let id = 1000 + all.len() as u64;
+            all.push((id, url.to_string(), body.to_string()));
+            id
+        };
         let comment = Comment {
             author: "me".into(),
             association: "MEMBER".into(),
@@ -451,7 +493,18 @@ impl Forge for FakeHub {
             Some(s) => s.comments.push(comment),
             None => self.pr_status.lock().unwrap().comments.push(comment),
         }
-        Ok(())
+        Ok(Some(id))
+    }
+    async fn open_pull_requests(
+        &self,
+        slug: &str,
+        base: &str,
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        self.pr_polls
+            .lock()
+            .unwrap()
+            .push((slug.into(), base.into()));
+        Ok(self.open_prs.lock().unwrap().clone())
     }
     async fn pr_create(
         &self,

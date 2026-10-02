@@ -861,7 +861,7 @@ where
                     .iter()
                     .any(|c| c.body.contains(&mark));
                 if !seen {
-                    self.hub.pr_comment(&repo.slug, url, &body).await?;
+                    self.hub.pr_comment(&repo.slug, url, &body, None).await?;
                 }
                 Ok::<(), PipelineError>(())
             }
