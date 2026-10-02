@@ -1309,6 +1309,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn redaction_covers_fine_grained_github_slack_and_query_tokens() {
+        let pat = "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwxyz0123456789";
+        for (said, want) in [
+            (pat.to_string(), "<redacted>".to_string()),
+            (
+                format!("token {pat} leaked"),
+                "token <redacted> leaked".to_string(),
+            ),
+            (
+                format!("key `{pat}` here"),
+                "key <redacted> here".to_string(),
+            ),
+            (format!("it was {pat}."), "it was <redacted>".to_string()),
+            (format!("GH_TOKEN={pat}"), "<redacted>".to_string()),
+            (
+                "https://api.x.com/v1/items?access_token=abc123".to_string(),
+                "<redacted>".to_string(),
+            ),
+            (
+                "see https://api.x.com/v1/items?page=2&access_token=abc123#frag now".to_string(),
+                "see <redacted> now".to_string(),
+            ),
+            (
+                "the xoxe-1-123456789012 value".to_string(),
+                "the <redacted> value".to_string(),
+            ),
+        ] {
+            let got = redact_credentials(&said);
+            assert_eq!(got, want, "{said}");
+            assert!(!got.contains("abc123"), "{got}");
+            assert!(!got.contains("mnopqrstuvwxyz"), "{got}");
+            assert!(!got.contains("123456789012"), "{got}");
+        }
+        for prose in [
+            "the github_pat_ prefix",
+            "https://github.com/o/r/issues/22",
+            "https://x.com/search?q=rust&page=2",
+            "https://x.com/?access_token=",
+            "fix the xoxo hugs typo",
+        ] {
+            assert_eq!(redact_credentials(prose), prose);
+        }
+    }
+
     const FILE: &str = "# Our rules\n\nA human introduction.\n\n## About\n\nIgnored too.\n\n## R3: Errors in the API layer use ApiError, never anyhow\npaths: src/api/**, src/web/*.rs\nsources: PR #41 F2 (rejected), PR #57 (closed with a change request)\n\nReturn `ApiError` from handlers; `anyhow` stays in the CLI.\n\n## R7: Keep pull requests small\n\nOne change per pull request.\n### Why\nReviews stay short.\n";
 
     #[test]
