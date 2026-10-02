@@ -778,6 +778,17 @@ pub fn lock_run(paths: &Paths) -> std::io::Result<Option<File>> {
     lock(&paths.home.join("run.lock"))
 }
 
+/// What `provefab run` says when another process holds the run lock.
+pub const QUEUE_LOCK_HELD: &str = "another Provefab process holds the queue lock (`provefab run` or a command that needs the queue); it exits when that process ends";
+
+/// `lock_run`, with the error to show when another process holds the lock.
+pub fn lock_run_or_explain(paths: &Paths) -> anyhow::Result<File> {
+    match lock_run(paths)? {
+        Some(file) => Ok(file),
+        None => anyhow::bail!(QUEUE_LOCK_HELD),
+    }
+}
+
 /// One process drives the queue at a time: a second `provefab run` would race
 /// the first on the same tasks. The lock lasts as long as the returned file.
 pub fn lock(path: &Path) -> std::io::Result<Option<File>> {
@@ -1437,6 +1448,17 @@ mod tests {
         assert!(held.is_some());
         assert!(lock(&dir.path().join("run.lock")).unwrap().is_none());
         assert!(lock_run(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn queue_lock_message_names_any_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let _held = lock_run(&paths).unwrap().unwrap();
+        let err = lock_run_or_explain(&paths).unwrap_err().to_string();
+        assert_eq!(err, QUEUE_LOCK_HELD);
+        assert!(err.contains("another Provefab process holds the queue lock"));
+        assert!(!err.contains("already working"));
     }
 
     fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
