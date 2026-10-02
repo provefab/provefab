@@ -160,23 +160,37 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// `security` with `args`: its stdout (and stderr, for attribute listings) on
-/// success. Never prompts.
-async fn security_out(security: &Path, args: &[&str], with_stderr: bool) -> Option<String> {
-    let out = Command::new(security)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .ok()?;
+/// success. Keychain may show an access dialog, so the call is bounded by
+/// `limit` (the child is killed when it runs out) and stdin is closed.
+async fn security_out(
+    security: &Path,
+    args: &[&str],
+    with_stderr: bool,
+    limit: Duration,
+) -> Result<Option<String>, TimedOut> {
+    let mut cmd = Command::new(security);
+    cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
+    let Ok(run) = tokio::time::timeout(limit, cmd.output()).await else {
+        return Err(TimedOut);
+    };
+    let Ok(out) = run else {
+        return Ok(None);
+    };
     if !out.status.success() {
-        return None;
+        return Ok(None);
     }
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     if with_stderr {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
     }
-    Some(text)
+    Ok(Some(text))
 }
+
+/// How long a Keychain read may take before it is given up.
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A `security` call that did not finish within its limit.
+struct TimedOut;
 
 /// The item comment in a `security find-generic-password` listing:
 /// `    "icmt"<blob>="bot@acme.test"`.
@@ -192,9 +206,24 @@ fn keychain_comment(listing: &str) -> Option<String> {
 /// each overriding its part of the Keychain item `provefab-jira` / `<site>`
 /// (spec §5). The error names the fix, never a secret.
 pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<JiraAuth, String> {
+    jira_auth_within(security, site, env, KEYCHAIN_TIMEOUT).await
+}
+
+async fn jira_auth_within(
+    security: &Path,
+    site: &str,
+    env: Env<'_>,
+    limit: Duration,
+) -> Result<JiraAuth, String> {
     let fix = format!(
         "run `provefab login jira --site {site}` or set PROVEFAB_JIRA_EMAIL and PROVEFAB_JIRA_TOKEN"
     );
+    let timed_out = |_: TimedOut| {
+        format!(
+            "reading the Keychain item {JIRA_KEYCHAIN_SERVICE} for {site} timed out after {} seconds: run `provefab login jira --site {site}` (or set PROVEFAB_JIRA_TOKEN and PROVEFAB_JIRA_EMAIL)",
+            KEYCHAIN_TIMEOUT.as_secs()
+        )
+    };
     let token = match env("PROVEFAB_JIRA_TOKEN") {
         Some(t) => t,
         None => security_out(
@@ -208,8 +237,10 @@ pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<Jira
                 "-w",
             ],
             false,
+            limit,
         )
         .await
+        .map_err(timed_out)?
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| format!("no Jira API token for {site}: {fix}"))?,
@@ -226,8 +257,10 @@ pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<Jira
                 site,
             ],
             true,
+            limit,
         )
         .await
+        .map_err(timed_out)?
         .as_deref()
         .and_then(keychain_comment)
         .ok_or_else(|| format!("no Jira account e-mail for {site}: {fix}"))?,
@@ -238,6 +271,14 @@ pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<Jira
 /// The Linear personal API key: `PROVEFAB_LINEAR_KEY`, else the Keychain item
 /// `provefab-linear` / `provefab` (spec §5).
 pub async fn linear_key(security: &Path, env: Env<'_>) -> Result<String, String> {
+    linear_key_within(security, env, KEYCHAIN_TIMEOUT).await
+}
+
+async fn linear_key_within(
+    security: &Path,
+    env: Env<'_>,
+    limit: Duration,
+) -> Result<String, String> {
     if let Some(k) = env("PROVEFAB_LINEAR_KEY") {
         return Ok(k);
     }
@@ -252,8 +293,15 @@ pub async fn linear_key(security: &Path, env: Env<'_>) -> Result<String, String>
             "-w",
         ],
         false,
+        limit,
     )
     .await
+    .map_err(|_| {
+        format!(
+            "reading the Keychain item {LINEAR_KEYCHAIN_SERVICE} timed out after {} seconds: run `provefab login linear` (or set PROVEFAB_LINEAR_KEY)",
+            KEYCHAIN_TIMEOUT.as_secs()
+        )
+    })?
     .map(|k| k.trim().to_string())
     .filter(|k| !k.is_empty())
     .ok_or_else(|| {
@@ -864,6 +912,57 @@ esac"#;
         let missing = fake_security(dir.path(), "missing", "exit 44");
         let err = linear_key(&missing, &env_of(&[])).await.unwrap_err();
         assert!(err.contains("provefab login linear"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn keychain_read_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = fake_security(
+            dir.path(),
+            "slow",
+            "echo lin_api_secret_value; exec sleep 5",
+        );
+        let limit = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let err = jira_auth_within(&slow, "acme.atlassian.net", &env_of(&[]), limit)
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("provefab-jira"), "{err}");
+        assert!(
+            err.contains("provefab login jira --site acme.atlassian.net"),
+            "{err}"
+        );
+        assert!(!err.contains("lin_api_secret_value"), "{err}");
+        let err = linear_key_within(&slow, &env_of(&[]), limit)
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("provefab-linear"), "{err}");
+        assert!(err.contains("provefab login linear"), "{err}");
+        assert!(!err.contains("lin_api_secret_value"), "{err}");
+        assert!(!err.contains('\u{2014}'), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn keychain_read_times_out_on_the_email_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"case "$*" in
+  *-w) echo "kc-token" ;;
+  *) exec sleep 5 ;;
+esac"#;
+        let slow = fake_security(dir.path(), "slow_email", script);
+        let err = jira_auth_within(
+            &slow,
+            "acme.atlassian.net",
+            &env_of(&[]),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(!err.contains("kc-token"), "{err}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ One Jira project or one Linear team per repository. Several repositories may sha
 ### Jira Cloud
 
 1. Create an API token for the Atlassian account Provefab will use: <https://id.atlassian.com/manage-profile/security/api-tokens>. The account needs to browse the project, comment and edit labels.
-2. Store it: `provefab login jira --site acme.atlassian.net`. Provefab asks for the account e-mail; the token is typed at the Keychain's own prompt (service `provefab-jira`, account `acme.atlassian.net`). `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` override it.
+2. Store it: `provefab login jira --site acme.atlassian.net`. Provefab asks for the account e-mail; the token is typed at the Keychain's own prompt (service `provefab-jira`, account `acme.atlassian.net`). `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` override it. Keychain reads (Jira and Linear) time out after 10 seconds with an error that names the item and points to `provefab login`.
 3. In `provefab.toml`:
 
    ```toml
