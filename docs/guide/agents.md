@@ -26,7 +26,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
    - Exit code 1: report the error, and stop.
 
 3. **Add the repository the person is in.**
-   1. In the clone, run `gh repo view --json nameWithOwner -q .nameWithOwner`. It prints `<owner/name>` and no URL (do not print the remote's URL yourself: it can hold a token). When it fails because the clone is not on GitHub, tell the person that Provefab works with GitHub repositories, and go to step 4. When it fails because `gh` is not signed in, ask the person to run `gh auth login` in their own terminal, then run this step again. On any other failure, report its error and go to step 4.
+   1. In the clone, run `gh repo view --json nameWithOwner -q .nameWithOwner`. It prints `<owner/name>` and no URL (do not print the remote's URL yourself: it can hold a token). When it fails because the clone is not on GitHub (the error says that none of the git remotes point to a known GitHub host), tell the person that Provefab works with GitHub repositories, and go to step 4. When it fails because `gh` is not signed in, ask the person to run `gh auth login` in their own terminal, then run this step again. On any other failure, report its error and go to step 4.
    2. Run, with that `<owner/name>`:
 
       ```bash
