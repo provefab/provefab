@@ -951,10 +951,11 @@ async fn probe(program: &Path, args: &[&str], envs: &[(&str, &Path)]) -> Result<
         .map(|t| detail_line(&t))
 }
 
-/// The first line of a tool's output that is not a leading `WARNING:` line
-/// (final review: codex prints environment warnings before its answer).
+/// The first line of a tool's output that is neither blank nor a leading
+/// `WARNING:` line (final review: codex prints environment warnings before
+/// its answer); the first non-blank line when there is no other.
 fn detail_line(text: &str) -> String {
-    let mut lines = text.lines().map(str::trim);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.clone().next().unwrap_or_default();
     lines
         .find(|l| !l.starts_with("WARNING:"))
@@ -1192,9 +1193,11 @@ pub async fn doctor(
         if !codex_home.is_dir() {
             // Final review: before `provefab login codex` creates it, codex
             // only complains that CODEX_HOME is missing.
-            for name in ["codex login", "codex guard hook"] {
-                checks.push(check(name, Err("not signed in".into())));
-            }
+            checks.push(check("codex login", Err("not signed in".into())));
+            checks.push(check(
+                "codex guard hook",
+                Err("not set up (run the fix)".into()),
+            ));
         } else {
             checks.push(check(
                 "codex login",
@@ -1210,7 +1213,12 @@ pub async fn doctor(
                 crate::codex_setup::check(&tools.codex, &codex_home, &codex_home)
                     .await
                     .map(|_| "trusted, and no project is".to_string())
-                    .map_err(|e| format!("{e} (run `provefab login codex`)")),
+                    .map_err(|e| {
+                        format!(
+                            "{} (run `provefab login codex`)",
+                            detail_line(&e.to_string())
+                        )
+                    }),
             ));
         }
     }
@@ -1227,7 +1235,7 @@ pub async fn doctor(
             .await
             .and_then(|t| {
                 if t.to_lowercase().contains("api key") {
-                    Ok(t.lines().next().unwrap_or_default().to_string())
+                    Ok(detail_line(&t))
                 } else {
                     Err(format!("not signed in with an API key: {fix}"))
                 }
@@ -1646,17 +1654,66 @@ mod tests {
         let paths = Paths::new(d);
         let checks = doctor(&tools, &config, &paths, None).await;
         let get = |n: &str| checks.iter().find(|c| c.name == n).cloned().unwrap();
-        for name in ["codex login", "codex guard hook"] {
-            assert_eq!(
-                (get(name).ok, get(name).detail.as_str()),
-                (false, "not signed in"),
-                "{name}"
-            );
-        }
+        assert_eq!(
+            (get("codex login").ok, get("codex login").detail.as_str()),
+            (false, "not signed in")
+        );
+        // Round 2: a hook is not signed in; it is not set up yet.
+        assert_eq!(
+            (
+                get("codex guard hook").ok,
+                get("codex guard hook").detail.as_str()
+            ),
+            (false, "not set up (run the fix)")
+        );
         std::fs::create_dir_all(paths.codex_home()).unwrap();
         let checks = doctor(&tools, &config, &paths, None).await;
-        let login = checks.iter().find(|c| c.name == "codex login").unwrap();
-        assert_eq!((login.ok, login.detail.as_str()), (false, "Not logged in"));
+        let get = |n: &str| checks.iter().find(|c| c.name == n).cloned().unwrap();
+        assert_eq!(
+            (get("codex login").ok, get("codex login").detail.as_str()),
+            (false, "Not logged in")
+        );
+        let hook = get("codex guard hook");
+        assert!(
+            !hook.ok && !hook.detail.is_empty() && !hook.detail.starts_with("WARNING:"),
+            "{hook:?}"
+        );
+    }
+
+    /// Round 2: blank lines are skipped like leading warnings; the API-key
+    /// login's detail skips them too.
+    #[tokio::test]
+    async fn details_skip_blank_and_warning_lines() {
+        assert_eq!(
+            detail_line("\nWARNING: x\n\n  Not logged in\n"),
+            "Not logged in"
+        );
+        assert_eq!(detail_line("WARNING: only\n"), "WARNING: only");
+        assert_eq!(detail_line(""), "");
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tools = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: d.join("missing-claude"),
+            codex: fake(
+                d,
+                "codex-cli",
+                "if [ \"$1\" = login ]; then echo 'WARNING: proceeding'; echo; echo 'Logged in using an API key - sk-***'; exit 0; fi; echo 'codex-cli 0.130.0'",
+            ),
+            pi: d.join("missing-pi"),
+            security: d.join("missing-security"),
+        };
+        let config = Config::from_toml_str(
+            "[jev]\nmodel = \"jev-1.13\"\n[[models]]\nid = \"x\"\nworker = \"codex\"\nmodel = \"gpt-5.5\"\ntier = \"standard\"\nauth = \"api_key\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&tools, &config, &Paths::new(d), None).await;
+        let login = checks.iter().find(|c| c.name == "codex api login").unwrap();
+        assert_eq!(
+            (login.ok, login.detail.as_str()),
+            (true, "Logged in using an API key - sk-***")
+        );
     }
 
     #[tokio::test]

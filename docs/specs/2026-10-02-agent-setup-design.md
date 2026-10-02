@@ -51,7 +51,7 @@ Today the quick start asks a person to copy the example configuration and edit i
 - A configuration that does not parse prints one line (text) or one `configuration` JSON line, exit code 1; a signed-out Claude shows `not signed in` (amended 2026-10-02 during implementation).
 - A configuration error is redacted on every path (text, JSON, `repos add`, any command that loads the file), so a secret pasted into the file is not repeated (amended 2026-10-02 after final review).
 - With `--json`, a Jev client that cannot be set up although a key exists is a failed `jev` line instead of an exit without any line (amended 2026-10-02 after final review).
-- Before `provefab login codex` has created Provefab's codex directory, `codex login` and `codex guard hook` read `not signed in`; a tool's leading `WARNING:` lines are not the detail, and a silent failure reads `exit 1` (amended 2026-10-02 after final review).
+- Before `provefab login codex` has created Provefab's codex directory, `codex login` and `codex guard hook` read `not signed in` and `not set up (run the fix)`; a tool's leading `WARNING:` and blank lines are not the detail, and a silent failure reads `exit 1` (amended 2026-10-02 after final review).
 
 ## 6. Exit codes and messages
 
