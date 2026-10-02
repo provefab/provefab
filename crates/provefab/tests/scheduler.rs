@@ -133,7 +133,48 @@ async fn run_polls_only_the_configured_slug_and_label() {
         );
         assert!(p.hub.prs.lock().unwrap().is_empty());
         assert!(p.hub.posted.lock().unwrap().is_empty());
+        // The poll itself used the repository's slug and label, not the fake's.
+        let polls = p.hub.polls.lock().unwrap();
+        assert!(!polls.is_empty());
+        assert!(
+            polls
+                .iter()
+                .all(|(s, l)| s == "o/r" && l == "provefab" && (s != slug || l != label)),
+            "{polls:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn run_picks_up_the_issue_when_slug_and_label_match() {
+    let f = fixture(&["true"]);
+    let p = std::sync::Arc::new(
+        pipeline(
+            &f,
+            Box::new(happy),
+            FakeOracle::default(),
+            FakeHub::new("x"),
+        )
+        .await,
+    );
+    let opts = provefab::scheduler::RunOptions {
+        workers: 1,
+        once: true,
+    };
+    provefab::scheduler::run(p.clone(), opts, std::future::pending::<()>())
+        .await
+        .unwrap();
+    assert!(
+        p.store
+            .task_by_url("https://github.com/o/r/issues/7")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        *p.hub.polls.lock().unwrap().first().unwrap(),
+        ("o/r".to_string(), "provefab".to_string())
+    );
 }
 
 // ---------- final review fixes ----------

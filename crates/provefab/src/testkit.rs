@@ -223,6 +223,8 @@ pub struct FakeHub {
     pub slug: String,
     /// The label `open_issues` must be asked for to return the issue.
     pub label: String,
+    /// Every (slug, label) pair that `open_issues` was asked for.
+    pub polls: Mutex<Vec<(String, String)>>,
     pub comments: Mutex<Vec<Comment>>,
     /// While set, reading comments fails (GitHub unreachable).
     pub comments_down: std::sync::atomic::AtomicBool,
@@ -289,6 +291,7 @@ impl FakeHub {
                 labels: vec!["provefab".into()],
                 key: None,
             },
+            polls: Mutex::new(Vec::new()),
             comments: Mutex::new(Vec::new()),
             posted: Mutex::new(Vec::new()),
             labels: Mutex::new(Vec::new()),
@@ -351,6 +354,7 @@ impl FakeHub {
 impl Tracker for FakeHub {
     /// The fake's one issue, only when asked for its `slug` and `label`.
     async fn open_issues(&self, slug: &str, label: &str) -> Result<Vec<Issue>, ForgeError> {
+        self.polls.lock().unwrap().push((slug.into(), label.into()));
         if slug == self.slug && label == self.label {
             Ok(vec![self.issue.clone()])
         } else {
