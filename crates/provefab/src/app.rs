@@ -286,7 +286,9 @@ fn load_config(paths: &Paths) -> anyhow::Result<Config> {
     let path = paths.config();
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(Config::from_toml_str(&text)?)
+    // R3: the loader quotes the offending line, which may hold a secret.
+    Config::from_toml_str(&text)
+        .map_err(|e| anyhow::anyhow!(crate::rules::redact_credentials(&format!("{e:#}"))))
 }
 
 async fn oracle(config: &Config) -> anyhow::Result<Option<JevOracle>> {

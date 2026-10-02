@@ -297,3 +297,20 @@ fn doctor_with_an_unparsable_configuration_stays_one_line() {
     assert_eq!(line["name"], "configuration");
     assert_eq!(line["ok"], false);
 }
+
+/// Final review, R3: a configuration that does not parse never repeats a
+/// secret-looking value on stderr, for `repos add` and text `doctor`.
+#[test]
+fn a_token_in_a_broken_configuration_never_reaches_stderr() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::fs::write(home.join("provefab.toml"), format!("[jev]\nkey = {token}\n")).unwrap();
+    let bin = bin_dir(t.path());
+    for args in [vec!["repos", "add", "o/r"], vec!["doctor"]] {
+        let err = refused(&provefab(&home, &bin, &args), 1);
+        assert!(!err.contains(token), "{args:?}: {err}");
+        assert!(err.contains("<redacted>"), "{args:?}: {err}");
+    }
+}

@@ -500,7 +500,7 @@ pub async fn repos_add(
         SetupError::Other(format!(
             "{} does not load, fix it first: {}",
             file.display(),
-            one_line(&e.to_string())
+            crate::rules::redact_credentials(&one_line(&e.to_string()))
         ))
     })?;
     if config
@@ -528,7 +528,7 @@ pub async fn repos_add(
         SetupError::Other(format!(
             "{} would not load with {slug}, nothing written: {}",
             file.display(),
-            one_line(&e.to_string())
+            crate::rules::redact_credentials(&one_line(&e.to_string()))
         ))
     })?;
     if dry_run {

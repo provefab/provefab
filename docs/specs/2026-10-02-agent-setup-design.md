@@ -49,6 +49,7 @@ Today the quick start asks a person to copy the example configuration and edit i
 - No secret appears in any field.
 - The Jev key stays optional for the exit code, as in `provefab doctor` before; policy warnings, a refused merge setting and a missing configuration are lines too; details are redacted (amended 2026-10-02 in the plan).
 - A configuration that does not parse prints one line (text) or one `configuration` JSON line, exit code 1; a signed-out Claude shows `not signed in` (amended 2026-10-02 during implementation).
+- A configuration error is redacted on every path (text, JSON, `repos add`, any command that loads the file), so a secret pasted into the file is not repeated (amended 2026-10-02 after final review).
 
 ## 6. Exit codes and messages
 
