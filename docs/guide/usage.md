@@ -76,6 +76,10 @@ Each finding in the PR's **Review notes** has a key (`F1`, `F2`...). To record w
 
 `provefab prune --before YYYY-MM-DD [--yes]` deletes the record of finished tasks last updated before that date. Without `--yes` it lists the tasks and deletes nothing.
 
+## Reviewing a pull request a person wrote
+
+Put the `provefab:review` label on a pull request, or comment `/provefab review` on it (an owner, member or collaborator), and Provefab reviews it with the same reviewer, rules and record as its own pull requests. It posts one comment with the findings and never approves, requests changes on or merges the pull request. See [Pull request reviews](pr-review.md).
+
 ## Task states
 
 | State | Meaning | Next |

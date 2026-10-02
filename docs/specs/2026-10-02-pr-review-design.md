@@ -1,7 +1,7 @@
 # Reviewing human pull requests
 
 - Date: 2026-10-02
-- Status: approved design (owner, 2026-10-02); implementation pending
+- Status: approved design (owner, 2026-10-02); implemented in 0.5.0, amended 2026-10-02 in the plan and during implementation (see the notes marked "amended")
 - Feature: on request, Provefab reviews a pull request written by a person with a reviewer from its catalog, the repository rules and the risk policy, posts one summary comment, and records the findings in the evidence record like its own pull requests.
 
 ## 1. Intent
@@ -18,7 +18,8 @@ Teams already write most pull requests by hand. Reviewing them with the same rev
 ## 3. Model
 
 - Migration `0008`: `tasks.mode TEXT NOT NULL DEFAULT 'issue'` (`issue` or `pr_review`) and `tasks.pr_head TEXT` (the commit last reviewed); the table is rebuilt so that uniqueness is `UNIQUE (repo, mode, issue_number)` instead of `UNIQUE (repo, issue_number)`, keeping every `id` and every row that references a task. Why: in a Jira or Linear repository, pull request #12 and ticket ENG-12 share the number 12. The rebuild follows SQLite's documented procedure for changing a table's constraints with foreign keys enforced; the plan verifies how to run it under sqlx migrations and a test migrates a database holding tasks, findings, events, stage runs and outputs.
-- For a `pr_review` task, `issue_number` is the pull request number, `issue_url` its URL, `title` its title, `author` its author, `issue_key` NULL.
+- For a `pr_review` task, `issue_number`
+- (amended 2026-10-02 in the plan) The migration runs with `-- no-transaction` and its own `BEGIN IMMEDIATE`/`COMMIT` around SQLite's procedure (plan decision 1). (amended 2026-10-02 during implementation) It switches `PRAGMA foreign_keys` off and back on itself, is safe to run twice, and carries no in-file `foreign_key_check`: ids are copied verbatim. is the pull request number, `issue_url` its URL, `title` its title, `author` its author, `issue_key` NULL.
 
 ## 4. Trigger and intake
 
@@ -26,7 +27,9 @@ Teams already write most pull requests by hand. Reviewing them with the same rev
 - Command: a comment whose line is exactly `/provefab review` (case-insensitive, outside code fences) on an open pull request, from an `OWNER`, `MEMBER` or `COLLABORATOR`. The pull request's author alone is not enough: on a public repository a contributor from a fork could otherwise spend the owner's model subscriptions.
 - Excluded: pull requests whose head branch starts with `provefab/` (Provefab's own), closed or merged pull requests, and pull requests to another base.
 - Intake: the existing poll also lists open pull requests with the label (one new `Forge` method) and reads new `/provefab review` commands on open pull requests already known or labelled; a new trigger on a pull request with a `pr_review` task starts a new review round on the current head; the first trigger creates the task.
-- A push to a reviewed pull request does not start a review by itself; the label being removed and added again, or a new command, does.
+- A push to a reviewed pull request does not start
+- (amended 2026-10-02 in the plan) The one new `Forge` method lists every open pull request into the base with its labels and comments, so a command works on any open pull request (decision 2). A label removed and added again is seen between two polls (decision 4). The label is created on GitHub-tracker repositories only; on Jira and Linear repositories it is created by hand, and the comment works there too (decision 5). Triggers act between rounds (decision 8).
+- (amended 2026-10-02 during implementation) The comment's authorisation is as above; Provefab's own comments never trigger. A flip of the label during a running round is not seen. Old member commands present at upgrade can queue one review. a review by itself; the label being removed and added again, or a new command, does.
 
 ## 5. Review run
 
@@ -35,22 +38,28 @@ Teams already write most pull requests by hand. Reviewing them with the same rev
 - Reviewer tier: standard; frontier when a detected risk category asks for it and a frontier model is configured. There is no implementer, so no provider is avoided. Routing as for stages (subscription first, then API keys by price); the cost is recorded on the task and counts in the daily stage budget.
 - Prompt: a variant of the review prompt in which the pull request's title and description replace the issue (both untrusted data), the out-of-scope rule becomes "the change does not do what the description says, or does more", and the review rubric and repository rules apply unchanged.
 - Approvals: when the review policy asks for two approvals (Provefab Pro's second reviewer), the second review runs on a model of another provider than the first, as for Provefab's own pull requests.
-- Findings get keys `F<n>` continuing across rounds and are recorded like other reviews (`review` event, `findings` rows with the reviewer model and the cited rule).
+- Findings get keys `F<n>`
+- (amended 2026-10-02 in the plan) Only classification: nothing from the pull request runs, since it may come from a fork (decision 6). Two reviews whatever the first verdict when two approvals are asked (decision 9). The tier rule is as written (decision 10). Findings are redacted before they are kept (decision 11). Rules are read from the base, pinned each round (decision 16).
+- (amended 2026-10-02 during implementation) The head is fetched with `--no-tags --no-recurse-submodules`; no gates, no risk checks and no risk labels apply; finding text and git or `gh` error text are redacted. continuing across rounds and are recorded like other reviews (`review` event, `findings` rows with the reviewer model and the cited rule).
 
 ## 6. The summary comment
 
 - One comment per pull request, starting with the bot line, created on the first review and edited on later ones (found by a hidden marker `<!-- provefab-pr-review -->`).
 - Content: the verdict (`no blocking finding` or `N blocking findings`), the findings in the review-notes format (`F1 · R3 · blocking · src/a.rs:12 · text`), `Rules: R1, R3`, the risk categories detected, the reviewer model(s) and the commit reviewed, and how to record a decision (`/provefab F1 rejected: reason`).
-- Provefab never sets a GitHub review state, never approves, never requests changes, never merges a person's pull request.
+- Provefab never sets a GitHub review state
+- (amended 2026-10-02 in the plan) The comment is edited by the id recorded when it was posted, through `pr_comment`'s new `edit` argument, not found by the marker; it is posted anew when deleted (decision 3). (amended 2026-10-02 during implementation) A not-found error that is not permanent counts as deleted; when GitHub returns no id, the next round posts a new comment., never approves, never requests changes, never merges a person's pull request.
 
 ## 7. After the review
 
 - The task stays watched while the pull request is open: `/provefab F<n>` commands are read as today; on merge, the `unaddressed_at_merge` inference applies to the last round's findings; on close, the task ends.
-- Post-merge checks and reverts stay limited to Provefab's own pull requests.
+- Post-merge checks and reverts stay limited
+- (amended 2026-10-02 in the plan) A review task never writes to the tracker (decision 7). End states: merged and closed (decision 12). Authorisation of the two commands is as in section 4 (decision 13).
+- (amended 2026-10-02 during implementation) Reviews parked in `needs_you` or `failed` are watched for their end only; `F<n>` decisions on a parked review are read at merge or close, or at the next round. An ended review keeps its state and is prunable whatever its state. to Provefab's own pull requests.
 
 ## 8. Visibility
 
-- `provefab status`: `o/r PR #57 · reviewed (2 blocking)`; `log` and `export` carry `mode`; `stats` counts pull-request reviews apart from issue tasks.
+- `provefab status`: `o/r PR #57
+- (amended 2026-10-02 in the plan) Formats (decision 18): `status` shows `reviewed (N blocking)`, `merged` or `closed`; `log` shows `mode pr_review`; every `export` line carries `mode`; `stats` has one line `pull request reviews: N pull requests · N rounds · N findings (N blocking)`. · reviewed (2 blocking)`; `log` and `export` carry `mode`; `stats` counts pull-request reviews apart from issue tasks.
 
 ## 9. Documentation and landing
 

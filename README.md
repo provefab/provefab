@@ -32,7 +32,7 @@ Requirements: macOS, `git` and `gh` (signed in with `gh auth login`), and at lea
 #       provefab-<version>-macos-universal.zip from the Releases page, unzip, then
 sudo install -m 755 provefab /usr/local/bin/provefab
 #    b. from source, with Rust 1.96 or newer:
-cargo install --git https://github.com/provefab/provefab --tag v0.4.0 --locked provefab
+cargo install --git https://github.com/provefab/provefab --tag v0.5.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
 provefab login claude        # Claude plan login, in ~/.provefab/claude
@@ -66,6 +66,7 @@ Then put the `provefab` label on an issue. Provefab picks it up at its next poll
 | see every task and why it is in its state | `provefab status` |
 | see everything about one task (routing, stages, checks, plan, reviews) | `provefab log <id>` |
 | queue an issue by hand, or restart a stopped task | `provefab add <issue-url>` |
+| have a pull request a person wrote reviewed | label it `provefab:review`, or comment `/provefab review` |
 | check tools, logins, Jev and repositories | `provefab doctor` |
 | measure: PRs opened, merged (automatically or by hand), reviewers | `provefab stats` |
 | export the record as JSON Lines | `provefab export` |
@@ -82,6 +83,7 @@ Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in commen
 | `provefab:needs-info` | Provefab asked a question; answer in a comment |
 | `provefab:in-pr` | a pull request is open |
 | `provefab:merged` | the pull request was merged |
+| `provefab:review` | on a pull request a person wrote: review it (you set it) |
 | `provefab:failed` | Provefab stopped; its comment says why |
 | `provefab:risk-<category>` | the change touches that risk category |
 
@@ -90,6 +92,7 @@ Provefab talks to you on the issue's tracker (GitHub, Jira or Linear), in commen
 - [Configuration](docs/guide/configuration.md): every field of `provefab.toml`, with its default.
 - [Usage](docs/guide/usage.md): writing issues that land, answering Provefab, restarting, reading states.
 - [Repository rules](docs/guide/rules.md): conventions in `.provefab/rules.md`, given to every stage and checked by the reviewer.
+- [Pull request reviews](docs/guide/pr-review.md): reviewing pull requests people wrote, on request.
 - [Jira and Linear](docs/guide/trackers.md) (beta): issues from a Jira Cloud project or a Linear team, pull requests on GitHub. When Linear paging stops early, the log line says why: `linear issues: stopped after N pages (page cap)` or `linear issues: stopped after N pages (repeated cursor)`.
 - [Operations](docs/guide/operations.md): the service, logs, budgets, troubleshooting.
 - [Security](docs/guide/security.md): what agents can and cannot do, and who can trigger Provefab.
