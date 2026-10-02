@@ -531,18 +531,19 @@ pub async fn repos_add(
             crate::rules::redact_credentials(&one_line(&e.to_string()))
         ))
     })?;
+    let note = match stacks(&root).as_slice() {
+        [Stack::Python] => format!("{DEPENDENCIES_NOTE}\n"),
+        _ => String::new(),
+    };
     if dry_run {
-        return Ok(block);
+        // Final review: an agent that previews first sees the note too.
+        return Ok(format!("{block}{note}"));
     }
     std::fs::OpenOptions::new()
         .append(true)
         .open(&file)
         .and_then(|mut f| f.write_all(added.as_bytes()))
         .map_err(|e| SetupError::Other(format!("cannot write {}: {e}", file.display())))?;
-    let note = match stacks(&root).as_slice() {
-        [Stack::Python] => format!("{DEPENDENCIES_NOTE}\n"),
-        _ => String::new(),
-    };
     Ok(format!(
         "added {slug} to {}: base {}, gates: {}\nProvefab keeps its own clone in {} (set local_path by hand to use yours)\n{note}next: provefab doctor --json\n",
         file.display(),
@@ -1333,6 +1334,12 @@ mod tests {
             .await
             .unwrap();
         assert!(said.contains(DEPENDENCIES_NOTE), "{said}");
+        // Final review: a dry run shows it too, after the block.
+        let shown = repos_add(&paths, &hub, &git(), "o/py2", None, true)
+            .await
+            .unwrap();
+        assert!(shown.starts_with("[[repos]]\n"), "{shown}");
+        assert!(shown.ends_with(&format!("{DEPENDENCIES_NOTE}\n")), "{shown}");
         let (_h2, paths2) = home_with(MINE);
         let hub2 = FakeHub::new("x");
         *hub2.repo_root.lock().unwrap() = Some(root_of(
