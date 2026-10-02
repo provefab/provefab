@@ -20,10 +20,10 @@ paths: crates/provefab/migrations/**, crates/provefab/src/store.rs
 
 A migration that has been released is append-only history: add a new numbered file instead of changing an existing one, and pin the new file's SHA-384 in `migrations_are_frozen`.
 
-## R5: A behaviour change comes with a test that failed first, and with its docs
+## R5: A behaviour change comes with a test that failed first, and with its user docs
 paths: crates/**
 
-Every change in behaviour adds or updates a test that fails without the change. When the change is visible to a user (a command, an output, a configuration key, a message), update `docs/guide/` and the README in the same change so the documentation matches the code.
+Every change in behaviour adds or updates a test that fails without the change. When the change is visible to a user (a command, an output, a configuration key, a message), update the matching page in `docs/guide/` in the same change. Touch the README only when its quick start or its tables (commands, labels, day-to-day actions) change; never add detail sentences there. Never write a test that checks the wording of documentation.
 
 ## R6: No guarantees in user-facing text
 sources: product wording rule
