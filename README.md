@@ -2,6 +2,8 @@
 
 Provefab turns labelled GitHub, Jira or Linear issues into pull requests that arrive green, reviewed by a second model, with their evidence.
 
+[![Provefab in 12 seconds: a labelled issue, your checks, a review by a second model family, a pull request waiting for you](docs/assets/provefab-loop.gif)](https://provefab.com/#demo)
+
 It runs on your Mac as a service. AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI, signed in with your own plan or your own API key, chosen per model), and Jev, TypeSafe's classifier, rates each issue so that every stage runs on the cheapest model that can do it: your plans first, then your API keys by price, with prices updated daily. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
 
 ```
