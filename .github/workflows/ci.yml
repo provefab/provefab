@@ -1,5 +1,6 @@
 # Checks every push and pull request on Linux; on a v* tag, builds static
-# Linux binaries and attaches them to the GitHub release (Linux spec §6).
+# Linux binaries and adds them to the GitHub release the owner created
+# (Linux spec §6).
 # Run by hand (workflow_dispatch), it builds, tests and packs both archives
 # without a release, to prove the static builds before tagging.
 # The notarized macOS zip is built by hand with scripts/release-macos.sh.
@@ -15,6 +16,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or pull request cancels the older run; a
+# tag run is never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -23,11 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.96"
-          components: rustfmt, clippy
+      # rustup is on every GitHub runner: no third-party action to pin.
+      - run: rustup toolchain install 1.96 --profile minimal --component rustfmt,clippy && rustup default 1.96
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -54,17 +60,16 @@ jobs:
       CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.96"
-          targets: ${{ matrix.target }}
+      - run: rustup toolchain install 1.96 --profile minimal --target ${{ matrix.target }} && rustup default 1.96
+      # A release binary is built from a clean target directory, never a cache.
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           key: ${{ matrix.target }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools file
       - name: The tag is the crate's version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -94,12 +99,18 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Attach to the release (created if the macOS zip is not there yet)
+      # The owner creates the release with the notarized macOS zip; this job
+      # never creates one. It waits for it (every 30 s, up to 30 minutes),
+      # then adds the Linux archives.
+      - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           ls -l dist
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --verify-tag --title "Provefab ${GITHUB_REF_NAME#v}" --notes ""
+          for i in $(seq 1 60); do
+            gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && break
+            [ "$i" = 60 ] && { echo "no release $GITHUB_REF_NAME after 30 minutes: create it with the macOS zip, then re-run this job" >&2; exit 1; }
+            sleep 30
+          done
           gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
