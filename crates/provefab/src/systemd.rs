@@ -153,6 +153,7 @@ impl Systemd {
         if path_env.trim().is_empty() {
             return Err(ServiceError::EmptyPath);
         }
+        crate::service::require_utf8(&[exe, &self.provefab_home])?;
         let texts = [
             exe.display().to_string(),
             self.provefab_home.display().to_string(),
@@ -459,6 +460,25 @@ mod tests {
                 && err.contains("Failed to connect to bus"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("built");
+        std::fs::write(&exe, "binary").unwrap();
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"h\xffome"));
+        let s = Systemd {
+            provefab_home: odd,
+            ..systemd(dir.path(), "echo Linger=yes")
+        };
+        assert!(matches!(
+            s.install(&exe, 1, "/usr/bin").await,
+            Err(ServiceError::NotUtf8 { .. })
+        ));
+        assert!(!s.unit_path().exists());
+        assert_eq!(calls(dir.path()), "");
     }
 
     #[tokio::test]

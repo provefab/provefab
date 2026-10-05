@@ -23,6 +23,8 @@ pub enum ServiceError {
     Systemctl { args: String, message: String },
     #[error("a path or PATH holds a line break; the service file cannot hold it")]
     LineBreak,
+    #[error("{path} is not valid UTF-8; the service file cannot name it")]
+    NotUtf8 { path: String },
 }
 
 fn xml(s: &str) -> String {
@@ -113,6 +115,16 @@ pub(crate) fn prepare(provefab_home: &Path, exe: &Path) -> Result<PathBuf, Servi
         .map_err(|e| io(&tmp, e))?;
     std::fs::rename(&tmp, &bin).map_err(|e| io(&bin, e))?;
     Ok(bin)
+}
+
+/// Refuses a path a service file could only name changed (no lossy rendering).
+pub(crate) fn require_utf8(paths: &[&Path]) -> Result<(), ServiceError> {
+    match paths.iter().find(|p| p.to_str().is_none()) {
+        Some(p) => Err(ServiceError::NotUtf8 {
+            path: p.display().to_string(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The service backend of this system (Linux spec §4, plan decision 12).
@@ -278,6 +290,7 @@ impl Launchd {
         if path_env.trim().is_empty() {
             return Err(ServiceError::EmptyPath);
         }
+        require_utf8(&[exe, &self.provefab_home])?;
         std::fs::create_dir_all(&self.agents_dir)
             .map_err(|e| ServiceError::Io(self.agents_dir.display().to_string(), e.to_string()))?;
         let bin = prepare(&self.provefab_home, exe)?;
@@ -507,6 +520,23 @@ mod tests {
             "small"
         );
         assert!(!logs.join("run.log.1").exists());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Launchd {
+            provefab_home: dir.path().join(std::ffi::OsStr::from_bytes(b"h\xffome")),
+            ..service(dir.path())
+        };
+        let exe = dir.path().join("built");
+        std::fs::write(&exe, "binary").unwrap();
+        assert!(matches!(
+            s.install(&exe, 1, "/usr/bin").await,
+            Err(ServiceError::NotUtf8 { .. })
+        ));
+        assert!(!s.plist_path().exists());
     }
 
     #[tokio::test]

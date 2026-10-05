@@ -882,12 +882,21 @@ pub const HELPER_COMMAND: &str = "secrets get anthropic";
 /// The `apiKeyHelper` command: this binary prints the stored key, with the
 /// home fixed so the stage's environment never changes where it looks
 /// (plan decision 9). Claude Code runs it with /bin/sh.
-pub fn api_key_helper(exe: &Path, home: &Path) -> String {
-    format!(
+pub fn api_key_helper(exe: &Path, home: &Path) -> Result<String, String> {
+    // Never a lossy rendering: the helper would name another file.
+    let text = |p: &Path| {
+        p.to_str().map(str::to_string).ok_or_else(|| {
+            format!(
+                "{} is not valid UTF-8, so the key helper cannot name it: move it to a path that is",
+                p.display()
+            )
+        })
+    };
+    Ok(format!(
         "PROVEFAB_HOME={} {} {HELPER_COMMAND}",
-        shell_words::quote(&home.display().to_string()),
-        shell_words::quote(&exe.display().to_string())
-    )
+        shell_words::quote(&text(home)?),
+        shell_words::quote(&text(exe)?)
+    ))
 }
 
 /// Writes `apiKeyHelper` into the API-key config dir's `settings.json`, keeping
@@ -1501,7 +1510,8 @@ mod tests {
         let helper = api_key_helper(
             Path::new("/opt/provefab/bin/provefab"),
             Path::new("/h/.provefab"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             helper,
             "PROVEFAB_HOME=/h/.provefab /opt/provefab/bin/provefab secrets get anthropic"
@@ -1532,13 +1542,26 @@ mod tests {
         );
         let home = odd.join("home $HOME");
         let out = std::process::Command::new("sh")
-            .args(["-c", &api_key_helper(&exe, &home)])
+            .args(["-c", &api_key_helper(&exe, &home).unwrap()])
             .output()
             .unwrap();
         assert_eq!(
             String::from_utf8(out.stdout).unwrap(),
             format!("{}|secrets get anthropic\n", home.display())
         );
+    }
+
+    /// Linux final review: a path that is not valid UTF-8 would be written
+    /// changed into the helper; it is refused instead.
+    #[test]
+    fn the_helper_refuses_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/opt/\xff/provefab"));
+        let fine = Path::new("/h/.provefab");
+        for (exe, home) in [(odd, fine), (Path::new("/bin/provefab"), odd)] {
+            let err = api_key_helper(exe, home).unwrap_err();
+            assert!(err.contains("not valid UTF-8"), "{err}");
+        }
     }
 
     #[test]

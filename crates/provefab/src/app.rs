@@ -758,6 +758,10 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
         } => {
             match worker {
                 LoginWorker::Claude => {
+                    // The helper is checked before the key is asked for.
+                    let exe = std::env::current_exe().context("locating Provefab binary")?;
+                    let helper =
+                        commands::api_key_helper(&exe, &paths.home).map_err(anyhow::Error::msg)?;
                     let secrets = Secrets::system(&paths.home);
                     let stdin = std::io::stdin();
                     secrets.store(
@@ -766,11 +770,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                         &mut stdin.lock(),
                         crate::secrets::stdin_is_tty(),
                     )?;
-                    let exe = std::env::current_exe().context("locating Provefab binary")?;
-                    commands::claude_api_settings(
-                        &paths.claude_config_api(),
-                        &commands::api_key_helper(&exe, &paths.home),
-                    )?;
+                    commands::claude_api_settings(&paths.claude_config_api(), &helper)?;
                     println!(
                         "stored; Claude Code models with auth = \"api_key\" use it (config dir {})",
                         paths.claude_config_api().display()
