@@ -159,23 +159,49 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// How long a Keychain read may take before it is abandoned.
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a `security` call came back with.
+enum Keychain {
+    Found(String),
+    Missing,
+    TimedOut,
+}
+
 /// `security` with `args`: its stdout (and stderr, for attribute listings) on
-/// success. Never prompts.
-async fn security_out(security: &Path, args: &[&str], with_stderr: bool) -> Option<String> {
-    let out = Command::new(security)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .ok()?;
+/// success. A locked or unapproved Keychain item can make it prompt, so the
+/// call is bounded by `limit`, stdin is closed and the child is killed when
+/// the limit passes.
+async fn security_out(
+    security: &Path,
+    args: &[&str],
+    with_stderr: bool,
+    limit: Duration,
+) -> Keychain {
+    let mut cmd = Command::new(security);
+    cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
+    let out = match tokio::time::timeout(limit, cmd.output()).await {
+        Err(_) => return Keychain::TimedOut,
+        Ok(Err(_)) => return Keychain::Missing,
+        Ok(Ok(out)) => out,
+    };
     if !out.status.success() {
-        return None;
+        return Keychain::Missing;
     }
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     if with_stderr {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
     }
-    Some(text)
+    Keychain::Found(text)
+}
+
+/// The error for a Keychain read that passed `limit`: fixed text, no output.
+fn keychain_timeout(item: &str, limit: Duration, fix: &str) -> String {
+    format!(
+        "timed out after {}s reading the Keychain item {item}: {fix}",
+        limit.as_secs_f64()
+    )
 }
 
 /// The item comment in a `security find-generic-password` listing:
@@ -209,12 +235,22 @@ fn decode_hex_utf8(digits: &str) -> Option<String> {
 /// each overriding its part of the Keychain item `provefab-jira` / `<site>`
 /// (spec §5). The error names the fix, never a secret.
 pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<JiraAuth, String> {
+    jira_auth_within(security, site, env, KEYCHAIN_TIMEOUT).await
+}
+
+async fn jira_auth_within(
+    security: &Path,
+    site: &str,
+    env: Env<'_>,
+    limit: Duration,
+) -> Result<JiraAuth, String> {
+    let item = format!("{JIRA_KEYCHAIN_SERVICE} for {site}");
     let fix = format!(
         "run `provefab login jira --site {site}` or set PROVEFAB_JIRA_EMAIL and PROVEFAB_JIRA_TOKEN"
     );
     let token = match env("PROVEFAB_JIRA_TOKEN") {
         Some(t) => t,
-        None => security_out(
+        None => match security_out(
             security,
             &[
                 "find-generic-password",
@@ -225,15 +261,18 @@ pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<Jira
                 "-w",
             ],
             false,
+            limit,
         )
         .await
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| format!("no Jira API token for {site}: {fix}"))?,
+        {
+            Keychain::Found(t) if !t.trim().is_empty() => t.trim().to_string(),
+            Keychain::TimedOut => return Err(keychain_timeout(&item, limit, &fix)),
+            _ => return Err(format!("no Jira API token for {site}: {fix}")),
+        },
     };
     let email = match env("PROVEFAB_JIRA_EMAIL") {
         Some(e) => e,
-        None => security_out(
+        None => match security_out(
             security,
             &[
                 "find-generic-password",
@@ -243,11 +282,15 @@ pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<Jira
                 site,
             ],
             true,
+            limit,
         )
         .await
-        .as_deref()
-        .and_then(keychain_comment)
-        .ok_or_else(|| format!("no Jira account e-mail for {site}: {fix}"))?,
+        {
+            Keychain::Found(listing) => keychain_comment(&listing)
+                .ok_or_else(|| format!("no Jira account e-mail for {site}: {fix}"))?,
+            Keychain::TimedOut => return Err(keychain_timeout(&item, limit, &fix)),
+            Keychain::Missing => return Err(format!("no Jira account e-mail for {site}: {fix}")),
+        },
     };
     Ok(JiraAuth { email, token })
 }
@@ -255,10 +298,19 @@ pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<Jira
 /// The Linear personal API key: `PROVEFAB_LINEAR_KEY`, else the Keychain item
 /// `provefab-linear` / `provefab` (spec §5).
 pub async fn linear_key(security: &Path, env: Env<'_>) -> Result<String, String> {
+    linear_key_within(security, env, KEYCHAIN_TIMEOUT).await
+}
+
+async fn linear_key_within(
+    security: &Path,
+    env: Env<'_>,
+    limit: Duration,
+) -> Result<String, String> {
     if let Some(k) = env("PROVEFAB_LINEAR_KEY") {
         return Ok(k);
     }
-    security_out(
+    let fix = "run `provefab login linear` or set PROVEFAB_LINEAR_KEY";
+    match security_out(
         security,
         &[
             "find-generic-password",
@@ -269,13 +321,14 @@ pub async fn linear_key(security: &Path, env: Env<'_>) -> Result<String, String>
             "-w",
         ],
         false,
+        limit,
     )
     .await
-    .map(|k| k.trim().to_string())
-    .filter(|k| !k.is_empty())
-    .ok_or_else(|| {
-        "no Linear API key: run `provefab login linear` or set PROVEFAB_LINEAR_KEY".to_string()
-    })
+    {
+        Keychain::Found(k) if !k.trim().is_empty() => Ok(k.trim().to_string()),
+        Keychain::TimedOut => Err(keychain_timeout(LINEAR_KEYCHAIN_SERVICE, limit, fix)),
+        _ => Err(format!("no Linear API key: {fix}")),
+    }
 }
 
 /// How Provefab names an issue: `#123` on GitHub, its key (`ENG-123`) on a tracker.
@@ -939,6 +992,57 @@ esac"#;
         let missing = fake_security(dir.path(), "missing", "exit 44");
         let err = linear_key(&missing, &env_of(&[])).await.unwrap_err();
         assert!(err.contains("provefab login linear"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn keychain_read_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = fake_security(dir.path(), "slow", "sleep 30");
+        let limit = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let token_path = env_of(&[("PROVEFAB_JIRA_EMAIL", "bot@acme.test")]);
+        let email_path = env_of(&[("PROVEFAB_JIRA_TOKEN", "tok-secret")]);
+        let errs = [
+            jira_auth_within(&slow, "acme.atlassian.net", &token_path, limit).await,
+            jira_auth_within(&slow, "acme.atlassian.net", &email_path, limit).await,
+        ];
+        for err in errs {
+            let err = err.unwrap_err();
+            assert!(
+                err.contains("timed out after 0.2s")
+                    && err.contains("provefab-jira")
+                    && err.contains("provefab login jira --site acme.atlassian.net"),
+                "{err}"
+            );
+            assert!(!err.contains("tok-secret") && !err.contains("bot@acme.test"));
+        }
+        let err = linear_key_within(&slow, &env_of(&[]), limit)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("timed out after 0.2s")
+                && err.contains("provefab-linear")
+                && err.contains("provefab login linear"),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // A missing item keeps its own message.
+        let missing = fake_security(dir.path(), "missing", "exit 44");
+        let roomy = Duration::from_secs(5);
+        let err = jira_auth_within(&missing, "acme.atlassian.net", &env_of(&[]), roomy)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("no Jira API token") && !err.contains("timed out"),
+            "{err}"
+        );
+        let err = linear_key_within(&missing, &env_of(&[]), roomy)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("no Linear API key") && !err.contains("timed out"),
+            "{err}"
+        );
     }
 
     #[test]
