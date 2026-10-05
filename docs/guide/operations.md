@@ -32,7 +32,7 @@ provefab run --once          # one pass: everything that can move, then exit
 provefab run --dry-run       # classification and routing only, nothing changes
 ```
 
-Ctrl-C cancels the running stages and kills the agents' processes. Tasks resume at the next start, in the state they were in.
+Ctrl-C and SIGTERM (what launchd sends when it stops the service) cancel the running stages and kill the agents' processes, so `provefab service uninstall` and a launchd stop end the run cleanly. Tasks resume at the next start, in the state they were in.
 
 ## Where things are
 

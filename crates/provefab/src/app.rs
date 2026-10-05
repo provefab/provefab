@@ -505,10 +505,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             commands::tracker_history(&store, &config).await?;
             let pipeline =
                 Arc::new(build_pipeline(&paths, config, oracle, hub, store, policy).await?);
-            let stop = async {
-                let _ = tokio::signal::ctrl_c().await;
-            };
-            scheduler::run(pipeline, RunOptions { workers, once }, stop).await?;
+            scheduler::run(pipeline, RunOptions { workers, once }, shutdown_signal()).await?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Add { url } => {
@@ -778,5 +775,24 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// Completes on Ctrl-C or, on unix, SIGTERM (what launchd sends on stop).
+/// The SIGTERM handler is registered when this is called, so a signal raised
+/// right afterwards is not lost.
+pub fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    #[cfg(unix)]
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    async move {
+        #[cfg(unix)]
+        if let Some(term) = term.as_mut() {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            return;
+        }
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
