@@ -15,7 +15,7 @@ provefab service uninstall             # stop and remove the service
 - it writes the service: `~/Library/LaunchAgents/dev.provefab.run.plist` on macOS, `~/.config/systemd/user/provefab.service` on Linux (then `systemctl --user daemon-reload`, `enable` and `restart`);
 - it freezes the `PATH` of the terminal you run it from.
 
-**On a Linux server**, a user service runs only while you are logged in, unless lingering is on for your account. `install` checks it and, when it is off, prints the command to run once with administrator rights: `sudo loginctl enable-linger <user>`. Provefab never runs `sudo` itself. `provefab doctor` shows a `lingering` line while the service is installed. Logs go to `~/.provefab/logs/run.log` on both systems (`journalctl --user -u provefab` shows systemd's own messages). The service file needs systemd 240 or newer (Ubuntu 20.04 ships 245).
+**On a Linux server**, a user service runs only while you are logged in, unless lingering is on for your account. `install` checks it and, when it is off, prints the command to run once with administrator rights: `sudo loginctl enable-linger <user>`. Provefab never runs `sudo` itself. `provefab doctor` shows a `lingering` line while the service is installed. Logs go to `~/.provefab/logs/run.log` on both systems (`journalctl --user -u provefab` shows systemd's own messages). The service file needs systemd 240 or later.
 
 **Run `install` again** after:
 - installing a new Provefab version (the zip or the Linux archive from the GitHub Releases page, or `cargo install --git https://github.com/provefab/provefab --tag <version> --locked provefab`);

@@ -76,7 +76,7 @@ const NO_WORKER: &str = "no worker CLI on PATH: install Claude Code (`claude`) o
 
 const HEADER: &str = r#"# Provefab configuration, written by `provefab init`.
 # Full reference: https://provefab.com/docs/configuration/
-# No secret here: sign-ins stay in Provefab's directories, keys in the macOS Keychain or, on Linux, in credentials.toml beside this file (readable by you only).
+# No secret here: sign-ins stay in Provefab's directories, keys in the macOS Keychain or, on Linux, in credentials.toml beside this file (readable by your account only).
 
 [jev]
 model = "jev-1.13.0"            # full, pinned version; never "jev-latest"
@@ -781,6 +781,18 @@ mod tests {
     /// Spec section 3: written once into a home that may not exist yet,
     /// loadable, `--dry-run` writes nothing, an existing file is never
     /// changed (exit 3, with or without `--dry-run`).
+    /// Linux final review: the file is protected by its mode, for your
+    /// account, not for "you" (root reads it too).
+    #[test]
+    fn the_init_header_says_who_can_read_the_secrets_file() {
+        let text = init_text(Workers {
+            claude: true,
+            codex: false,
+        })
+        .unwrap();
+        assert!(text.contains("(readable by your account only)"), "{text}");
+    }
+
     #[test]
     fn init_writes_once_and_never_overwrites() {
         let bins = tempfile::tempdir().unwrap();

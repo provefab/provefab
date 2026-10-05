@@ -983,7 +983,7 @@ pub fn credentials_checks(secrets: &Secrets) -> Vec<Check> {
         "credentials",
         secrets
             .preflight()
-            .map(|()| format!("{}, readable by you only", path.display()))
+            .map(|()| format!("{}, readable by your account only", path.display()))
             .map_err(|e| e.to_string()),
     )]
 }
@@ -2255,6 +2255,10 @@ auth = "api_key"
         assert_eq!(
             (ok[0].name.as_str(), ok[0].ok),
             ("credentials", true),
+            "{ok:?}"
+        );
+        assert!(
+            ok[0].detail.ends_with(", readable by your account only"),
             "{ok:?}"
         );
         let path = dir.path().join(crate::secrets::FILE_NAME);

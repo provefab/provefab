@@ -3,12 +3,16 @@
 # signed with Developer ID (hardened runtime), notarized, zipped with the example config.
 # Output: dist/provefab-<version>-macos-universal.zip and its .sha256.
 #
-# Release order: bump the version, run this script, push main and the annotated
-# v<version> tag, then attach the zip to the release right away:
-#   gh release create v<version> dist/*.zip dist/*.zip.sha256 --verify-tag
-# (or `gh release upload v<version> ...` if CI created the release first). The
-# CI tag job (.github/workflows/ci.yml) builds the two Linux archives and adds
-# them to the same release; check that both are there before the landing release.
+# Release order:
+#   1. bump the version, then push main;
+#   2. run the CI workflow by hand on main (GitHub Actions, workflow_dispatch) and
+#      wait for both Linux builds to pass;
+#   3. run this script;
+#   4. push the annotated v<version> tag, then create the release with the zip
+#      right away: gh release create v<version> dist/*.zip dist/*.zip.sha256 --verify-tag
+# The CI tag job (.github/workflows/ci.yml) never creates the release: it waits
+# for this one (up to 30 minutes), then adds the two Linux archives. Check that
+# both are there before the landing release.
 #
 # Needs, once per machine:
 #   - a "Developer ID Application" certificate in the login keychain;

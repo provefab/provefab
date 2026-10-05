@@ -1,7 +1,7 @@
 # Provefab on Linux servers
 
 - Date: 2026-10-05
-- Status: approved design (owner, 2026-10-05); implementation pending
+- Status: approved design (owner, 2026-10-05); implemented in 0.7.0, with the amendments recorded in section 10
 - Feature: Provefab (core and Pro) runs on a headless Linux server or VM, x86_64 and ARM64, as a systemd user service, with secrets in a protected file or environment variables. macOS behaviour is unchanged.
 
 ## 1. Owner decisions
@@ -94,13 +94,13 @@ Out of scope, each with a re-open trigger:
 17. (plan) `provefab login codex` passes `--device-auth` on Linux (verified on `codex-cli 0.156.1`); macOS keeps `codex login`. Why: the CLI's own headless sign-in.
 18. (plan) `ServiceManager` is an enum (`Launchd`, `Systemd`); `Service` is renamed `Launchd`; the binary copy and the log rotation are one shared `service::prepare`, and the binary path one shared `service::binary_path`. Why: one code path per step, no caller outside `app.rs`.
 19. (plan) systemd calls: `daemon-reload`, `enable` and `restart` on install, `disable --now` then `daemon-reload` on uninstall, `show --property=LoadState,ActiveState,MainPID` for status; departs from §4 (`enable --now`, `status`). Why: `enable --now` does not restart a running unit, so a reinstall would keep the old binary; `show` prints `key=value` lines and `status` exits 3 for an inactive unit.
-20. (plan) The unit runs with `KillMode=mixed`, `TimeoutStopSec=30`, `Restart=always`, `RestartSec=30`, and appends both streams to `<home>/logs/run.log`. Why: SIGTERM reaches Provefab alone, which stops its workers itself, as under launchd; `append:` needs systemd 240 or newer (Ubuntu 20.04 ships 245).
+20. (plan) The unit runs with `KillMode=mixed`, `TimeoutStopSec=30`, `Restart=always`, `RestartSec=30`, and appends both streams to `<home>/logs/run.log`. Why: SIGTERM reaches Provefab alone, which stops its workers itself, as under launchd; `append:` needs systemd 240 or later.
 21. (plan) Unit values are escaped (`%`, `\`, `"`, and `$` in `ExecStart`), and a path or `PATH` holding a line break is refused before anything is written. Why: systemd reads the intended values, and nothing can inject a directive.
 22. (plan) Lingering is read with `loginctl show-user <user> --property=Linger`; a failed call reads "unknown" and prints the same command; `<user>` is `$USER` when it is a plain name, else the uid. Why: `loginctl` fails for a user with no session and no lingering; `service install` never runs `sudo` (decision 6).
 23. (plan) The unit directory is `$XDG_CONFIG_HOME/systemd/user` when that is absolute, else `~/.config/systemd/user`; tests inject the directory and the `systemctl` and `loginctl` paths; departs from §8 (fakes "on `PATH`"). Why: injection is how the launchd tests already work and keeps tests parallel-safe.
 24. (plan) Per-system `cfg` in tests only where the system decides (`Secrets::system`, `ServiceManager::for_user`, per-system hints); departs from §8 (gate the fake `security` and `launchctl` tests). Why: with decision 7 those tests run on Linux as well.
 25. (plan) CI builds each architecture natively with `musl-tools` (x86_64 on `ubuntu-latest`, aarch64 on `ubuntu-24.04-arm`), no cross-compiler. Why: no dependency needs OpenSSL (rustls with `aws-lc-rs`, bundled SQLite), both build with `musl-gcc`; proven in Docker for both architectures before CI.
-26. (plan) The release job creates the GitHub release when it is missing, then uploads the Linux archives with `--clobber`; the notarized macOS zip is uploaded by hand. Why: whoever comes second uploads into the existing release.
+26. (plan, amended by the final review) The release job never creates the GitHub release: it waits for the one the owner creates with the notarized macOS zip (every 30 s, up to 30 minutes), then uploads the Linux archives with `--clobber`. Why: one person decides when a release exists and what it says; a release made by CI first would publish without the macOS zip.
 27. (plan) Archives hold `provefab-<v>-linux-<arch>/` with `provefab`, `LICENSE.md`, `provefab.example.toml` and `INSTALL.txt`; `.sha256` is `<hex>  <file>`; the tag job refuses a tag that differs from `v<crate version>`. Why: like the macOS zip, and the installer reads the first field.
 28. (ruling) CI runs on a push to any branch and on pull requests, and by hand (`workflow_dispatch`), which builds, tests and packs both archives without a release. Why: prove the x86_64 musl build before the tag; a pull request branch runs the checks twice, accepted.
 29. (ruling) Docker builds on the owner's Mac use `CARGO_TARGET_DIR` under `target/linux` (honoured by `scripts/package-linux.sh`) and `CARGO_BUILD_JOBS=4`. Why: the Mac's own `target/release` stays untouched, and 14 parallel links exhaust the Docker VM's 8 GB.

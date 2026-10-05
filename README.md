@@ -26,7 +26,7 @@ The pull request then waits for your click. Optionally set `post_merge_checks` p
 
 ## Quick start
 
-Requirements: macOS or Linux (x86_64, ARM64), `git` and `gh` (signed in with `gh auth login`), and at least one worker: `claude` (Claude Code) or `codex` (Codex CLI).
+Requirements: macOS or Linux (x86_64, ARM64; on Linux, the `ca-certificates` package for HTTPS and, for the service, systemd 240 or later), `git` and `gh` (signed in with `gh auth login`), and at least one worker: `claude` (Claude Code) or `codex` (Codex CLI).
 
 With a coding agent, point it at [Set up Provefab with a coding agent](docs/guide/agents.md): it writes and checks the configuration, and leaves the sign-ins, keys and service to you.
 

@@ -21,7 +21,7 @@ It reads these files through `gh` without cloning, or from your clone with `--pa
 
 ## Secrets
 
-No secret goes in `provefab.toml`. On macOS, Provefab keeps its secrets in the Keychain. On Linux it keeps them in `~/.provefab/credentials.toml`: created with mode 600 (readable and writable by your account only), and refused by every command, `run` and `doctor` included, when its mode lets group or others read it (`chmod 600 ~/.provefab/credentials.toml` fixes it). The file is protected by its permissions, not encrypted. Environment variables take precedence on both systems.
+No secret goes in `provefab.toml`. On macOS, Provefab keeps its secrets in the Keychain. On Linux it keeps them in `~/.provefab/credentials.toml`: created with mode 600 (readable and writable by your account only), and refused by `run`, `doctor`, `login` and every command that reads a secret when its mode lets group or others read it (`chmod 600 ~/.provefab/credentials.toml` fixes it). The file is protected by its permissions, not encrypted. Environment variables take precedence on both systems.
 
 | Secret | Where |
 |---|---|
