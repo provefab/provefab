@@ -88,7 +88,7 @@ Put the `provefab:review` label on a pull request, or comment `/provefab review`
 | `classified`, `planning`, `implementing`, `gating`, `reviewing` | in progress | nothing to do |
 | `needs_info` | question asked | answer in a comment |
 | `waiting` | waiting: every model busy or rate-limited, a transient failure, or the daily budget reached | resumes by itself; the reason is in `provefab status` |
-| `pr_open` | PR open (or merged: see `provefab log`) | review, merge or close |
+| `pr_open` | PR open. Once the PR's outcome is known, `provefab status` shows `merged` (post-merge checks may still run), `archived` or `closed` instead, while the stored state stays `pr_open` | review, merge or close |
 | `needs_you` | Provefab needs you (broken environment, a worker that cannot sign in, pass budget spent, reproduction impossible...) | read the comment, fix, `provefab add` |
 | `failed` | Provefab gave up, or you closed the PR without a comment | `provefab add` to start again |
 
