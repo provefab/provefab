@@ -53,15 +53,19 @@ pub struct TrackerConfig {
     pub project: Option<String>,
 }
 
-/// A bare host name: letters, digits, dots and hyphens, at least one dot, no
-/// scheme, port or path.
+/// A bare host name: at least two dot-separated labels of 1 to 63 ASCII
+/// letters, digits or hyphens, none starting or ending with a hyphen, and not
+/// every label numeric (so no IPv4 address). No scheme, port or path.
 pub fn is_host(s: &str) -> bool {
-    !s.is_empty()
-        && s.contains('.')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-        && !s.starts_with(['.', '-'])
-        && !s.ends_with(['.', '-'])
+    let labels: Vec<&str> = s.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|l| {
+            (1..=63).contains(&l.len())
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
+        && !labels.iter().all(|l| l.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `[A-Z][A-Z0-9_]*`: the key part of `ENG-123`.
@@ -829,11 +833,34 @@ esac"#;
 
     #[test]
     fn hosts_and_project_keys() {
-        for ok in ["acme.atlassian.net", "jira.acme-corp.io"] {
+        let long_ok = format!("{}.com", "a".repeat(63));
+        let long_bad = format!("{}.com", "a".repeat(64));
+        for ok in [
+            "acme.atlassian.net",
+            "jira.example.co.uk",
+            "jira.acme-corp.io",
+            "a.b",
+            "1password.com",
+            long_ok.as_str(),
+        ] {
             assert!(is_host(ok), "{ok}");
         }
         for bad in [
             "",
+            "a..b",
+            "a.-b",
+            "a-.b",
+            "-a.b",
+            "a.b-",
+            ".a.b",
+            "a.b.",
+            "1.2.3.4",
+            "192.168.0.1",
+            "10.0",
+            long_bad.as_str(),
+            "a_b.com",
+            "ac me.net",
+            "é.com",
             "acme",
             "https://acme.atlassian.net",
             "acme.atlassian.net/x",
@@ -1159,6 +1186,23 @@ esac"#;
                 .await,
             Err(ForgeError::Spawn { .. })
         ));
+    }
+
+    #[test]
+    fn a_malformed_jira_site_keeps_the_same_error_text() {
+        for site in ["a..b", "10.0.0.1"] {
+            let t = TrackerConfig {
+                kind: TrackerKind::Jira,
+                site: Some(site.into()),
+                project: Some("ENG".into()),
+            };
+            assert_eq!(
+                validate(&t, "provefab"),
+                Err(format!(
+                    "site `{site}` must be a host name such as acme.atlassian.net, without https:// or a path"
+                ))
+            );
+        }
     }
 
     #[tokio::test]
