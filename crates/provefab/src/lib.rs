@@ -30,6 +30,7 @@ pub mod router;
 pub mod routing;
 pub mod rules;
 pub mod scheduler;
+pub mod secrets;
 pub mod service;
 pub mod setup;
 pub mod stage;
