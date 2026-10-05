@@ -25,6 +25,14 @@ pub enum ServiceError {
     LineBreak,
     #[error("{path} is not valid UTF-8; the service file cannot name it")]
     NotUtf8 { path: String },
+    #[error(
+        "neither HOME nor XDG_CONFIG_HOME is an absolute path, so the service file has no place; run from a normal login shell"
+    )]
+    NoHome,
+    #[error(
+        "service: systemctl --user does not answer ({message}); log in as this user (for example over SSH), or set XDG_RUNTIME_DIR=/run/user/$(id -u); on a server, `sudo loginctl enable-linger <user>` keeps your systemd user session running"
+    )]
+    NoUserBus { message: String },
 }
 
 fn xml(s: &str) -> String {
@@ -134,12 +142,12 @@ pub enum ServiceManager {
 }
 
 impl ServiceManager {
-    pub fn for_user(provefab_home: &Path) -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Launchd(Launchd::for_user(provefab_home))
+    pub fn for_user(provefab_home: &Path) -> Result<Self, ServiceError> {
+        Ok(if cfg!(target_os = "macos") {
+            Self::Launchd(Launchd::for_user(provefab_home)?)
         } else {
-            Self::Systemd(crate::systemd::Systemd::for_user(provefab_home))
-        }
+            Self::Systemd(crate::systemd::Systemd::for_user(provefab_home)?)
+        })
     }
 
     pub fn binary(&self) -> PathBuf {
@@ -163,9 +171,11 @@ impl ServiceManager {
         }
     }
 
-    pub async fn uninstall(&self) -> Result<(), ServiceError> {
+    /// Stops and removes the service; returns notes to print (a stop that
+    /// failed although the file is gone).
+    pub async fn uninstall(&self) -> Result<Vec<String>, ServiceError> {
         match self {
-            Self::Launchd(l) => l.uninstall().await,
+            Self::Launchd(l) => l.uninstall().await.map(|()| Vec::new()),
             Self::Systemd(s) => s.uninstall().await,
         }
     }
@@ -206,18 +216,24 @@ pub struct Launchd {
 }
 
 impl Launchd {
-    pub fn for_user(provefab_home: &Path) -> Self {
-        let user_home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        Self {
+    pub fn for_user(provefab_home: &Path) -> Result<Self, ServiceError> {
+        Ok(Self {
             launchctl: "launchctl".into(),
-            agents_dir: user_home.join("Library").join("LaunchAgents"),
+            agents_dir: Self::agents_dir(std::env::var_os("HOME"))?,
             provefab_home: provefab_home.to_path_buf(),
             // SAFETY: getuid has no preconditions and cannot fail.
             uid: unsafe { libc::getuid() },
             bootstrap_retry_delay: Duration::from_secs(1),
-        }
+        })
+    }
+
+    /// `<HOME>/Library/LaunchAgents`; an error, not a relative path, when
+    /// `HOME` is unset or relative.
+    pub fn agents_dir(home: Option<std::ffi::OsString>) -> Result<PathBuf, ServiceError> {
+        home.map(PathBuf::from)
+            .filter(|h| h.is_absolute())
+            .map(|h| h.join("Library").join("LaunchAgents"))
+            .ok_or(ServiceError::NoHome)
     }
 
     pub fn plist_path(&self) -> PathBuf {
@@ -522,6 +538,22 @@ mod tests {
         assert!(!logs.join("run.log.1").exists());
     }
 
+    #[test]
+    fn the_agents_dir_is_never_relative() {
+        assert_eq!(
+            Launchd::agents_dir(Some("/Users/a".into())).unwrap(),
+            PathBuf::from("/Users/a/Library/LaunchAgents")
+        );
+        assert!(matches!(
+            Launchd::agents_dir(None),
+            Err(ServiceError::NoHome)
+        ));
+        assert!(matches!(
+            Launchd::agents_dir(Some("rel".into())),
+            Err(ServiceError::NoHome)
+        ));
+    }
+
     #[tokio::test]
     async fn install_refuses_a_path_that_is_not_utf8() {
         use std::os::unix::ffi::OsStrExt;
@@ -558,7 +590,7 @@ mod tests {
     fn macos_uses_launchd() {
         assert!(matches!(
             ServiceManager::for_user(Path::new("/h")),
-            ServiceManager::Launchd(_)
+            Ok(ServiceManager::Launchd(_))
         ));
     }
 
@@ -567,7 +599,7 @@ mod tests {
     fn other_systems_use_systemd() {
         assert!(matches!(
             ServiceManager::for_user(Path::new("/h")),
-            ServiceManager::Systemd(_)
+            Ok(ServiceManager::Systemd(_))
         ));
     }
 
@@ -575,6 +607,7 @@ mod tests {
     async fn launchd_has_no_notes_and_no_checks() {
         let dir = tempfile::tempdir().unwrap();
         let m = ServiceManager::Launchd(service(dir.path()));
+        assert!(m.uninstall().await.unwrap().is_empty());
         assert!(m.notes().await.is_empty());
         assert!(m.checks().await.is_empty());
     }

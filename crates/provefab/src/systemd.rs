@@ -90,19 +90,34 @@ pub struct Systemd {
 }
 
 impl Systemd {
-    pub fn for_user(provefab_home: &Path) -> Self {
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .unwrap_or_default();
-        Self {
+    pub fn for_user(provefab_home: &Path) -> Result<Self, ServiceError> {
+        let config = Self::config_dir(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )?;
+        Ok(Self {
             systemctl: "systemctl".into(),
             loginctl: "loginctl".into(),
             unit_dir: config.join("systemd").join("user"),
             provefab_home: provefab_home.to_path_buf(),
             user: current_user(),
-        }
+        })
+    }
+
+    /// `$XDG_CONFIG_HOME` when absolute, else `$HOME/.config`; an error, not
+    /// a relative path, when neither is (Linux final review).
+    pub fn config_dir(
+        xdg: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    ) -> Result<PathBuf, ServiceError> {
+        xdg.map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                home.map(PathBuf::from)
+                    .filter(|h| h.is_absolute())
+                    .map(|h| h.join(".config"))
+            })
+            .ok_or(ServiceError::NoHome)
     }
 
     pub fn unit_path(&self) -> PathBuf {
@@ -162,6 +177,13 @@ impl Systemd {
         if texts.iter().any(|t| t.contains('\n') || t.contains('\r')) {
             return Err(ServiceError::LineBreak);
         }
+        // Without a user bus nothing can start: say so before writing anything.
+        self.systemctl(&["show-environment"])
+            .await
+            .map_err(|e| match e {
+                ServiceError::Systemctl { message, .. } => ServiceError::NoUserBus { message },
+                other => other,
+            })?;
         let io = |what: &Path, e: std::io::Error| {
             ServiceError::Io(what.display().to_string(), e.to_string())
         };
@@ -170,21 +192,30 @@ impl Systemd {
         let path = self.unit_path();
         std::fs::write(&path, unit(&bin, workers, path_env, &self.provefab_home))
             .map_err(|e| io(&path, e))?;
-        self.systemctl(&["daemon-reload"]).await?;
+        if let Err(e) = self.systemctl(&["daemon-reload"]).await {
+            // A unit systemd never loaded would only mislead `doctor`.
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
         self.systemctl(&["enable", UNIT]).await?;
         self.systemctl(&["restart", UNIT]).await?;
         Ok(path)
     }
 
-    pub async fn uninstall(&self) -> Result<(), ServiceError> {
-        let _ = self.systemctl(&["disable", "--now", UNIT]).await;
+    /// Stops and removes the unit. A stop that fails is a note, not an
+    /// error: the unit file still goes, and the person reads why.
+    pub async fn uninstall(&self) -> Result<Vec<String>, ServiceError> {
+        let mut notes = Vec::new();
+        if let Err(e) = self.systemctl(&["disable", "--now", UNIT]).await {
+            notes.push(format!("{e}; the unit file is removed anyway"));
+        }
         let p = self.unit_path();
         if p.exists() {
             std::fs::remove_file(&p)
                 .map_err(|e| ServiceError::Io(p.display().to_string(), e.to_string()))?;
         }
         let _ = self.systemctl(&["daemon-reload"]).await;
-        Ok(())
+        Ok(notes)
     }
 
     /// `running (pid N)`, `loaded, <state>`, `installed, not loaded`, or
@@ -397,7 +428,7 @@ mod tests {
         assert!(dir.path().join("home/logs").is_dir());
         assert_eq!(
             calls(dir.path()),
-            "--user daemon-reload\n--user enable provefab.service\n--user restart provefab.service\n"
+            "--user show-environment\n--user daemon-reload\n--user enable provefab.service\n--user restart provefab.service\n"
         );
         std::fs::write(
             dir.path().join("show.txt"),
@@ -405,7 +436,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.status().await, "running (pid 42)");
-        s.uninstall().await.unwrap();
+        assert!(s.uninstall().await.unwrap().is_empty());
         assert!(!path.exists());
         assert!(
             calls(dir.path())
@@ -440,7 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_systemctl_is_an_error_naming_the_call() {
+    async fn without_a_user_bus_nothing_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = systemd(dir.path(), "echo Linger=yes");
         s.systemctl = fake(
@@ -456,10 +487,73 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("systemctl --user daemon-reload")
-                && err.contains("Failed to connect to bus"),
+            err.contains("Failed to connect to bus")
+                && err.contains("XDG_RUNTIME_DIR=/run/user/$(id -u)")
+                && err.contains("enable-linger"),
             "{err}"
         );
+        assert!(!s.binary().exists() && !s.unit_path().exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_reload_removes_the_unit_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = systemd(dir.path(), "echo Linger=yes");
+        s.systemctl = fake(
+            dir.path(),
+            "noreload",
+            "[ \"$2\" = daemon-reload ] && { echo 'reload refused' >&2; exit 1; }; exit 0",
+        );
+        let exe = dir.path().join("built");
+        std::fs::write(&exe, "binary").unwrap();
+        let err = s
+            .install(&exe, 1, "/usr/bin")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("systemctl --user daemon-reload") && err.contains("reload refused"),
+            "{err}"
+        );
+        assert!(!s.unit_path().exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_disable_is_a_note_and_the_unit_still_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = systemd(dir.path(), "echo Linger=yes");
+        s.systemctl = fake(
+            dir.path(),
+            "nodisable",
+            "[ \"$2\" = disable ] && { echo 'Unit provefab.service not loaded.' >&2; exit 1; }; exit 0",
+        );
+        std::fs::create_dir_all(&s.unit_dir).unwrap();
+        std::fs::write(s.unit_path(), "unit").unwrap();
+        let notes = s.uninstall().await.unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("disable --now") && notes[0].contains("not loaded"),
+            "{notes:?}"
+        );
+        assert!(!s.unit_path().exists());
+    }
+
+    #[test]
+    fn the_unit_dir_is_never_relative() {
+        let dir = |xdg: Option<&str>, home: Option<&str>| {
+            Systemd::config_dir(xdg.map(Into::into), home.map(Into::into))
+        };
+        assert_eq!(dir(Some("/x"), Some("/h")).unwrap(), PathBuf::from("/x"));
+        assert_eq!(
+            dir(Some("rel"), Some("/h")).unwrap(),
+            PathBuf::from("/h/.config")
+        );
+        assert_eq!(dir(None, Some("/h")).unwrap(), PathBuf::from("/h/.config"));
+        assert!(matches!(dir(None, None), Err(ServiceError::NoHome)));
+        assert!(matches!(
+            dir(Some("rel"), Some("also-rel")),
+            Err(ServiceError::NoHome)
+        ));
     }
 
     #[tokio::test]

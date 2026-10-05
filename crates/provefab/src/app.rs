@@ -651,11 +651,10 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             );
             checks.extend(commands::rules_checks(&tools, &config, &paths, &gh()).await);
             checks.extend(commands::credentials_checks(&tools.secrets));
-            checks.extend(
-                crate::service::ServiceManager::for_user(&paths.home)
-                    .checks()
-                    .await,
-            );
+            // No place for a service file means no service to report on.
+            if let Ok(service) = crate::service::ServiceManager::for_user(&paths.home) {
+                checks.extend(service.checks().await);
+            }
             if let Some(e) = &jev_failed {
                 setup::jev_unavailable(&mut checks, e);
             }
@@ -720,7 +719,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             ))
         }
         Cmd::Service { action } => {
-            let service = crate::service::ServiceManager::for_user(&paths.home);
+            let service = crate::service::ServiceManager::for_user(&paths.home)?;
             match action {
                 ServiceAction::Install { workers } => {
                     // Fail before installing a service that could never start.
@@ -740,7 +739,9 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     }
                 }
                 ServiceAction::Uninstall => {
-                    service.uninstall().await?;
+                    for note in service.uninstall().await? {
+                        println!("{note}");
+                    }
                     println!("uninstalled");
                 }
                 ServiceAction::Status => println!("{}", service.status().await),
