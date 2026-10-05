@@ -89,8 +89,10 @@ Put the `provefab:review` label on a pull request, or comment `/provefab review`
 | `needs_info` | question asked | answer in a comment |
 | `waiting` | waiting: every model busy or rate-limited, a transient failure, or the daily budget reached | resumes by itself; the reason is in `provefab status` |
 | `pr_open` | PR open (or merged: see `provefab log`) | review, merge or close |
-| `needs_you` | Provefab needs you (broken environment, pass budget spent, reproduction impossible...) | read the comment, fix, `provefab add` |
+| `needs_you` | Provefab needs you (broken environment, a worker that cannot sign in, pass budget spent, reproduction impossible...) | read the comment, fix, `provefab add` |
 | `failed` | Provefab gave up, or you closed the PR without a comment | `provefab add` to start again |
+
+When a worker cannot sign in (its sign-in expired or was revoked), the task goes to `needs_you` without spending an attempt, and the comment names the command to run, such as `provefab login claude` or `provefab login codex`. After that, `provefab add` starts the task again.
 
 ## Reading `provefab log <id>`
 

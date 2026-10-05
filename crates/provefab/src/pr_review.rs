@@ -614,6 +614,9 @@ where
         else {
             return Ok(task.state);
         };
+        if let Some(s) = self.signed_out(task, repo, &model, &outcome).await? {
+            return Ok(s);
+        }
         let review = match outcome {
             Ok(Outcome::Finished(r)) => r
                 .structured_output
