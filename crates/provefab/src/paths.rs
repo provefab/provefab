@@ -3,17 +3,21 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// `dir` and any missing parent, created 0700; nothing changes when `dir`
-/// already exists.
+/// `dir` created 0700, its missing parents with the default mode; nothing
+/// changes when `dir` already exists.
 pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     if dir.is_dir() {
         return Ok(());
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        // Created meanwhile by another process: as good.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +137,10 @@ mod tests {
         let fresh = Paths::new(&dir.path().join("a/.provefab"));
         fresh.ensure_home().unwrap();
         assert_eq!(mode(&fresh.home), 0o700);
+        // Only the home itself: a parent it creates gets the default mode.
+        let reference = dir.path().join("reference");
+        std::fs::create_dir(&reference).unwrap();
+        assert_eq!(mode(&dir.path().join("a")), mode(&reference));
         let open = dir.path().join("open");
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
