@@ -1222,3 +1222,132 @@ async fn a_failed_price_refresh_waits_before_trying_again() {
     // One attempt: models.dev, then LiteLLM. Later ticks wait.
     assert_eq!(broken.received_requests().await.unwrap().len(), 2);
 }
+
+const SIGNED_OUT: &str = "Failed to authenticate: OAuth session expired and could not be refreshed";
+
+/// The happy path, except that one stage ends with the given provider error.
+fn provider_error_in(
+    stage: &'static str,
+    error: &'static str,
+) -> impl Fn(&ModelEntry, &StageRequest, &UnboundedSender<WorkerEvent>) -> Option<StageResult> {
+    move |m, req, tx| {
+        if stage_of(&req.prompt) == stage {
+            exit(ExitReason::ProviderError(error.into()))
+        } else {
+            happy(m, req, tx)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_signed_out_worker_in_plan_needs_you() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(provider_error_in("plan", SIGNED_OUT)),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), NeedsYou);
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().attempts, 0);
+    let plans = p
+        .runner
+        .stages()
+        .iter()
+        .filter(|(_, s)| s == "plan")
+        .count();
+    assert_eq!(plans, 1);
+    let posted = p.hub.posted.lock().unwrap().clone();
+    assert!(
+        posted.last().unwrap().contains("provefab login claude"),
+        "{posted:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_signed_out_worker_in_implement_needs_you() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(provider_error_in("implement", SIGNED_OUT)),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), NeedsYou);
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().attempts, 0);
+    let posted = p.hub.posted.lock().unwrap().clone();
+    assert!(
+        posted.last().unwrap().contains("provefab login claude"),
+        "{posted:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_signed_out_worker_in_review_needs_you() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(provider_error_in(
+            "review",
+            "401 Unauthorized: token expired",
+        )),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), NeedsYou);
+    assert_eq!(p.store.task(id).await.unwrap().unwrap().attempts, 0);
+    let posted = p.hub.posted.lock().unwrap().clone();
+    assert!(
+        posted.last().unwrap().contains("provefab login codex"),
+        "{posted:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_error_that_is_not_sign_in_still_fails_the_plan() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(provider_error_in("plan", "overloaded_error")),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), Failed);
+}
+
+#[tokio::test]
+async fn a_signed_out_worker_never_posts_or_stores_a_token() {
+    let f = fixture(&["test -f feature.txt"]);
+    let p = pipeline(
+        &f,
+        Box::new(provider_error_in(
+            "plan",
+            "Failed to authenticate: OAuth token sk-ant-oat01-SECRETSECRETSECRET expired",
+        )),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), NeedsYou);
+    let posted = p.hub.posted.lock().unwrap().clone();
+    assert!(
+        posted.iter().all(|c| !c.contains("SECRETSECRET")),
+        "{posted:?}"
+    );
+    let transitions = p.store.transitions(id).await.unwrap();
+    assert!(
+        transitions
+            .iter()
+            .all(|t| !t.reason.contains("SECRETSECRET")),
+        "{transitions:?}"
+    );
+}

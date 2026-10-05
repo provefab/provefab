@@ -13,7 +13,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::agents::StageRunner;
-use crate::config::{Config, ModelEntry, RepoConfig};
+use crate::config::{Auth, Config, ModelEntry, RepoConfig, WorkerKind};
 use crate::cooldown::Cooldowns;
 use crate::forge::{Change, ForgeError, Git, PrState, branch_name, is_bot_comment, weakened_tests};
 use crate::gates::{GateReport, ProgressScore, run_gates};
@@ -208,6 +208,44 @@ pub(crate) fn exit_name(e: &ExitReason) -> String {
         ExitReason::Crashed { code, stderr_tail } => {
             format!("crashed ({code:?}): {stderr_tail}")
         }
+    }
+}
+
+/// Provider error texts of a sign-in that expired or was revoked, lowercase.
+/// The first is the message of 2026-10-03: `Failed to authenticate: OAuth
+/// session expired and could not be refreshed`.
+const SIGN_IN_MARKERS: &[&str] = &[
+    "failed to authenticate",
+    "oauth",
+    "not logged in",
+    "please run /login",
+    "invalid api key",
+    "invalid_api_key",
+    "unauthorized",
+    "401",
+    "refresh token",
+    "authentication",
+];
+
+/// Whether a worker run ended because its sign-in no longer works.
+pub(crate) fn sign_in_failed(e: &ExitReason) -> bool {
+    match e {
+        ExitReason::ProviderError(m) => {
+            let m = m.to_lowercase();
+            SIGN_IN_MARKERS.iter().any(|k| m.contains(k))
+        }
+        _ => false,
+    }
+}
+
+/// The command that signs a model's worker in again (as `setup` names them).
+pub(crate) fn login_command(model: &ModelEntry) -> Option<&'static str> {
+    match (model.worker, model.auth) {
+        (WorkerKind::ClaudeCode, Auth::Subscription) => Some("provefab login claude"),
+        (WorkerKind::ClaudeCode, Auth::ApiKey) => Some("provefab login claude --api-key"),
+        (WorkerKind::Codex, Auth::Subscription) => Some("provefab login codex"),
+        (WorkerKind::Codex, Auth::ApiKey) => Some("provefab login codex --api-key"),
+        (WorkerKind::Pi, _) => None,
     }
 }
 
@@ -718,6 +756,41 @@ where
         let repo = self.repo(&task).cloned();
         self.give_up(&task, repo.as_ref(), TaskState::NeedsYou, public, detail)
             .await
+    }
+
+    /// A worker that cannot sign in is an environment problem, not a failure
+    /// of the issue: the task waits for a person and no attempt is spent.
+    pub(crate) async fn signed_out(
+        &self,
+        task: &TaskRow,
+        repo: &RepoConfig,
+        model: &ModelEntry,
+        outcome: &Result<Outcome, String>,
+    ) -> Result<Option<TaskState>, PipelineError> {
+        let Ok(Outcome::Finished(r)) = outcome else {
+            return Ok(None);
+        };
+        if !sign_in_failed(&r.exit) {
+            return Ok(None);
+        }
+        let public = match login_command(model) {
+            Some(login) => format!(
+                "the {} worker (model {}) could not sign in: run `{login}`, then `provefab add` to start again",
+                model.provider_key(),
+                model.id
+            ),
+            None => format!(
+                "the {} worker (model {}) could not sign in: sign in to provider {} again, then `provefab add` to start again",
+                model.provider_key(),
+                model.id,
+                model.provider
+            ),
+        };
+        let detail = crate::rules::redact_credentials(&exit_name(&r.exit));
+        let state = self
+            .give_up(task, Some(repo), TaskState::NeedsYou, &public, &detail)
+            .await?;
+        Ok(Some(state))
     }
 
     /// `NeedsYou` or `Failed`: record why, then tell the issue and label it.
@@ -2306,6 +2379,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
         else {
             return Ok(task.state);
         };
+        if let Some(s) = self.signed_out(task, repo, &model, &outcome).await? {
+            return Ok(s);
+        }
         let plan = match outcome {
             Ok(Outcome::Finished(r)) => r
                 .structured_output
@@ -2599,6 +2675,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
         else {
             return Ok(task.state);
         };
+        if let Some(s) = self.signed_out(task, repo, &model, &outcome).await? {
+            return Ok(s);
+        }
         match outcome {
             Ok(Outcome::Finished(r)) if r.exit == ExitReason::Completed => {
                 self.go(task.id, TaskState::Gating, "implementation finished")
@@ -3099,6 +3178,9 @@ Please reply with what should happen, what happens instead, and how to reproduce
         else {
             return Ok(task.state);
         };
+        if let Some(s) = self.signed_out(task, repo, &model, &outcome).await? {
+            return Ok(s);
+        }
         let review = match outcome {
             Ok(Outcome::Finished(r)) => r
                 .structured_output
@@ -3641,6 +3723,23 @@ pub fn numstat_lines(rows: &[(Option<u32>, Option<u32>, String)]) -> u32 {
 #[cfg(test)]
 mod tests {
     /// A detail the public text already ends with is not repeated.
+    #[test]
+    fn only_a_sign_in_provider_error_is_a_sign_in_failure() {
+        let pe = |m: &str| ExitReason::ProviderError(m.into());
+        assert!(sign_in_failed(&pe(
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        )));
+        assert!(!sign_in_failed(&pe("overloaded_error")));
+        assert!(!sign_in_failed(&pe("Internal server error")));
+        assert!(!sign_in_failed(&ExitReason::RateLimited(
+            "Failed to authenticate".into()
+        )));
+        assert!(!sign_in_failed(&ExitReason::Crashed {
+            code: Some(1),
+            stderr_tail: "401 unauthorized".into()
+        }));
+    }
+
     #[test]
     fn reason_text_does_not_repeat_the_detail() {
         assert_eq!(reason_text("out of scope: x", "x"), "out of scope: x");
