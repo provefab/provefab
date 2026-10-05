@@ -578,6 +578,12 @@ pub fn fix_for(check: &Check, config: Option<&Config>) -> Option<String> {
             ));
         }
         "jev key" => "provefab login jev",
+        "lingering" => {
+            return Some(format!(
+                "sudo loginctl enable-linger {}",
+                crate::systemd::current_user()
+            ));
+        }
         "credentials" if check.detail.contains("chmod 600") => {
             return Some(format!(
                 "chmod 600 {}",
@@ -1394,6 +1400,10 @@ mod tests {
     #[test]
     fn sign_in_and_key_checks_carry_the_command_that_fixes_them() {
         let config = Config::from_toml_str(TRACKED).unwrap();
+        let lingering_fix = format!(
+            "sudo loginctl enable-linger {}",
+            crate::systemd::current_user()
+        );
         for (name, fix) in [
             ("gh login", Some("gh auth login")),
             ("claude login", Some("provefab login claude")),
@@ -1413,6 +1423,7 @@ mod tests {
                     "provefab login jev"
                 }),
             ),
+            ("lingering", Some(lingering_fix.as_str())),
             (
                 "tracker acme/api",
                 Some("provefab login jira --site acme.atlassian.net"),

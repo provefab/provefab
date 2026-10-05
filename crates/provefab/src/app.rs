@@ -142,14 +142,14 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Copy this binary to <home>/bin, write the agent and load it.
+    /// Copy this binary to <home>/bin, write the service and (re)start it.
     Install {
         #[arg(long, default_value_t = 1)]
         workers: usize,
     },
-    /// Unload the agent and remove it.
+    /// Stop the service and remove it.
     Uninstall,
-    /// Whether the agent is loaded and running.
+    /// Whether the service is loaded and running.
     Status,
 }
 
@@ -629,6 +629,11 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             );
             checks.extend(commands::rules_checks(&tools, &config, &paths, &gh()).await);
             checks.extend(commands::credentials_checks(&tools.secrets));
+            checks.extend(
+                crate::service::ServiceManager::for_user(&paths.home)
+                    .checks()
+                    .await,
+            );
             if let Some(e) = &jev_failed {
                 setup::jev_unavailable(&mut checks, e);
             }
@@ -686,21 +691,24 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             ))
         }
         Cmd::Service { action } => {
-            let service = crate::service::Service::for_user(&paths.home);
+            let service = crate::service::ServiceManager::for_user(&paths.home);
             match action {
                 ServiceAction::Install { workers } => {
-                    // Fail before installing an agent that could never start.
+                    // Fail before installing a service that could never start.
                     load_config(&paths)?;
                     let exe = std::env::current_exe().context("locating Provefab binary")?;
                     let path_env = std::env::var("PATH").unwrap_or_default();
-                    let plist = service.install(&exe, workers, &path_env).await?;
+                    let file = service.install(&exe, workers, &path_env).await?;
                     println!(
                         "installed {} (binary {}, logs {})",
-                        plist.display(),
+                        file.display(),
                         service.binary().display(),
                         paths.home.join("logs").join("run.log").display()
                     );
                     println!("{}", service.status().await);
+                    for note in service.notes().await {
+                        println!("{note}");
+                    }
                 }
                 ServiceAction::Uninstall => {
                     service.uninstall().await?;
@@ -812,7 +820,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Completes on Ctrl-C or, on unix, SIGTERM (what launchd sends on stop).
+/// Completes on Ctrl-C or, on unix, SIGTERM (what launchd and systemd send on stop).
 /// The SIGTERM handler is registered when this is called, so a signal raised
 /// right afterwards is not lost.
 pub fn shutdown_signal() -> impl std::future::Future<Output = ()> {

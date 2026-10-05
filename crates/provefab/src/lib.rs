@@ -35,6 +35,7 @@ pub mod service;
 pub mod setup;
 pub mod stage;
 pub mod store;
+pub mod systemd;
 pub mod task;
 #[cfg(feature = "testkit")]
 pub mod testkit;

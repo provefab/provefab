@@ -1,5 +1,6 @@
-//! `provefab service`: run `provefab run` as a launchd agent, independent of any
-//! terminal or Claude session (spec §3.6, D47).
+//! `provefab service`: run `provefab run` as a background service, a launchd
+//! agent on macOS or a systemd user service elsewhere, independent of any
+//! terminal or Claude session (spec §3.6, D47; Linux spec §4).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -18,6 +19,10 @@ pub enum ServiceError {
     Launchctl { args: String, message: String },
     #[error("PATH is empty; run from a normal terminal")]
     EmptyPath,
+    #[error("service: systemctl {args}: {message}")]
+    Systemctl { args: String, message: String },
+    #[error("a path or PATH holds a line break; the service file cannot hold it")]
+    LineBreak,
 }
 
 fn xml(s: &str) -> String {
@@ -75,8 +80,110 @@ pub fn plist(bin: &Path, workers: usize, path_env: &str, provefab_home: &Path) -
     )
 }
 
-/// Where things go; tests point these at temporary directories and a fake `launchctl`.
-pub struct Service {
+/// The copy the service runs, shared by both backends: rebuilding the
+/// checkout never pulls it away (D47).
+pub fn binary_path(provefab_home: &Path) -> PathBuf {
+    provefab_home.join("bin").join("provefab")
+}
+
+/// Copies `exe` to `<home>/bin/provefab` (temporary name, then rename: a
+/// running service keeps its old inode), creates `<home>/logs` and rotates
+/// a run log past 10 MB. Both backends call it right before (re)starting
+/// the service, the only time rotation is safe: the service holds the log open.
+pub(crate) fn prepare(provefab_home: &Path, exe: &Path) -> Result<PathBuf, ServiceError> {
+    use std::os::unix::fs::PermissionsExt;
+    let io = |what: &Path, e: std::io::Error| {
+        ServiceError::Io(what.display().to_string(), e.to_string())
+    };
+    let bin = binary_path(provefab_home);
+    for dir in [provefab_home.join("bin"), provefab_home.join("logs")] {
+        std::fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
+    }
+    let log = provefab_home.join("logs").join("run.log");
+    if let Ok(meta) = std::fs::metadata(&log) {
+        const ROTATE_AT: u64 = 10 * 1024 * 1024;
+        if meta.len() > ROTATE_AT {
+            let rotated = log.with_file_name("run.log.1");
+            std::fs::rename(&log, &rotated).map_err(|e| io(&log, e))?;
+        }
+    }
+    let tmp = bin.with_extension("new");
+    std::fs::copy(exe, &tmp).map_err(|e| io(&tmp, e))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| io(&tmp, e))?;
+    std::fs::rename(&tmp, &bin).map_err(|e| io(&bin, e))?;
+    Ok(bin)
+}
+
+/// The service backend of this system (Linux spec §4, plan decision 12).
+pub enum ServiceManager {
+    Launchd(Launchd),
+    Systemd(crate::systemd::Systemd),
+}
+
+impl ServiceManager {
+    pub fn for_user(provefab_home: &Path) -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Launchd(Launchd::for_user(provefab_home))
+        } else {
+            Self::Systemd(crate::systemd::Systemd::for_user(provefab_home))
+        }
+    }
+
+    pub fn binary(&self) -> PathBuf {
+        match self {
+            Self::Launchd(l) => l.binary(),
+            Self::Systemd(s) => s.binary(),
+        }
+    }
+
+    /// Copies the binary, writes the service file and (re)starts it; returns
+    /// the service file.
+    pub async fn install(
+        &self,
+        exe: &Path,
+        workers: usize,
+        path_env: &str,
+    ) -> Result<PathBuf, ServiceError> {
+        match self {
+            Self::Launchd(l) => l.install(exe, workers, path_env).await,
+            Self::Systemd(s) => s.install(exe, workers, path_env).await,
+        }
+    }
+
+    pub async fn uninstall(&self) -> Result<(), ServiceError> {
+        match self {
+            Self::Launchd(l) => l.uninstall().await,
+            Self::Systemd(s) => s.uninstall().await,
+        }
+    }
+
+    pub async fn status(&self) -> String {
+        match self {
+            Self::Launchd(l) => l.status().await,
+            Self::Systemd(s) => s.status().await,
+        }
+    }
+
+    /// What `service install` prints after installing: lingering on systemd.
+    pub async fn notes(&self) -> Vec<String> {
+        match self {
+            Self::Launchd(_) => Vec::new(),
+            Self::Systemd(s) => s.notes().await,
+        }
+    }
+
+    /// `doctor`'s service lines: lingering when a systemd unit is installed.
+    pub async fn checks(&self) -> Vec<crate::commands::Check> {
+        match self {
+            Self::Launchd(_) => Vec::new(),
+            Self::Systemd(s) => s.checks().await,
+        }
+    }
+}
+
+/// The launchd backend; tests point it at temporary directories and a fake `launchctl`.
+pub struct Launchd {
     pub launchctl: PathBuf,
     /// `~/Library/LaunchAgents`.
     pub agents_dir: PathBuf,
@@ -86,7 +193,7 @@ pub struct Service {
     pub bootstrap_retry_delay: Duration,
 }
 
-impl Service {
+impl Launchd {
     pub fn for_user(provefab_home: &Path) -> Self {
         let user_home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -107,7 +214,7 @@ impl Service {
 
     /// The copy launchd runs: rebuilding the checkout never pulls it away (D47).
     pub fn binary(&self) -> PathBuf {
-        self.provefab_home.join("bin").join("provefab")
+        binary_path(&self.provefab_home)
     }
 
     async fn launchctl(&self, args: &[&str]) -> Result<String, ServiceError> {
@@ -168,43 +275,18 @@ impl Service {
         workers: usize,
         path_env: &str,
     ) -> Result<PathBuf, ServiceError> {
-        use std::os::unix::fs::PermissionsExt;
         if path_env.trim().is_empty() {
             return Err(ServiceError::EmptyPath);
         }
-        let io = |what: &Path, e: std::io::Error| {
-            ServiceError::Io(what.display().to_string(), e.to_string())
-        };
-        let bin = self.binary();
-        for dir in [
-            bin.parent().unwrap_or(&self.provefab_home).to_path_buf(),
-            self.provefab_home.join("logs"),
-            self.agents_dir.clone(),
-        ] {
-            std::fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
-        }
-        // launchd holds the log file open for the life of the agent, so rotation
-        // can only safely happen here, before `launchctl bootstrap` (re)starts it.
-        let log = self.provefab_home.join("logs").join("run.log");
-        if let Ok(meta) = std::fs::metadata(&log) {
-            const ROTATE_AT: u64 = 10 * 1024 * 1024;
-            if meta.len() > ROTATE_AT {
-                let rotated = log.with_file_name("run.log.1");
-                std::fs::rename(&log, &rotated).map_err(|e| io(&log, e))?;
-            }
-        }
-        // Copy to a temporary name, then rename: a running agent keeps its old inode.
-        let tmp = bin.with_extension("new");
-        std::fs::copy(exe, &tmp).map_err(|e| io(&tmp, e))?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| io(&tmp, e))?;
-        std::fs::rename(&tmp, &bin).map_err(|e| io(&bin, e))?;
+        std::fs::create_dir_all(&self.agents_dir)
+            .map_err(|e| ServiceError::Io(self.agents_dir.display().to_string(), e.to_string()))?;
+        let bin = prepare(&self.provefab_home, exe)?;
         let plist_path = self.plist_path();
         std::fs::write(
             &plist_path,
             plist(&bin, workers, path_env, &self.provefab_home),
         )
-        .map_err(|e| io(&plist_path, e))?;
+        .map_err(|e| ServiceError::Io(plist_path.display().to_string(), e.to_string()))?;
         // A previous version may be loaded: unload it first (not loaded is fine).
         let target = format!("{}/{LABEL}", self.domain());
         let _ = self.launchctl(&["bootout", &target]).await;
@@ -281,7 +363,7 @@ mod tests {
         assert!(plist(Path::new("/a&b"), 1, "x<y", Path::new("/h")).contains("/a&amp;b"));
     }
 
-    fn service(dir: &Path) -> Service {
+    fn service(dir: &Path) -> Launchd {
         let fake = dir.join("launchctl");
         std::fs::write(
             &fake,
@@ -292,7 +374,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Service {
+        Launchd {
             launchctl: fake,
             agents_dir: dir.join("LaunchAgents"),
             provefab_home: dir.join("home"),
@@ -301,11 +383,11 @@ mod tests {
         }
     }
 
-    fn service_with_failing_print(dir: &Path) -> Service {
+    fn service_with_failing_print(dir: &Path) -> Launchd {
         let fake = dir.join("launchctl");
         std::fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = print ]; then exit 1; fi\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Service {
+        Launchd {
             launchctl: fake,
             agents_dir: dir.join("LaunchAgents"),
             provefab_home: dir.join("home"),
@@ -375,7 +457,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let s = Service {
+        let s = Launchd {
             launchctl: fake,
             agents_dir: dir.path().join("LaunchAgents"),
             provefab_home: dir.path().join("home"),
@@ -439,5 +521,31 @@ mod tests {
 
         assert!(!s.binary().exists());
         assert!(!s.plist_path().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_launchd() {
+        assert!(matches!(
+            ServiceManager::for_user(Path::new("/h")),
+            ServiceManager::Launchd(_)
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn other_systems_use_systemd() {
+        assert!(matches!(
+            ServiceManager::for_user(Path::new("/h")),
+            ServiceManager::Systemd(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn launchd_has_no_notes_and_no_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = ServiceManager::Launchd(service(dir.path()));
+        assert!(m.notes().await.is_empty());
+        assert!(m.checks().await.is_empty());
     }
 }
