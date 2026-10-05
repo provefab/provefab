@@ -78,6 +78,8 @@ impl Protected {
             };
             let first = first.to_string_lossy();
             SECRET_FILES.contains(&first.as_ref())
+                // The temporary file a write renames over the credentials.
+                || first.starts_with(".credentials.toml.")
                 || first.starts_with(DATABASE)
                 || SECRET_DIRS.contains(&first.as_ref())
         })
@@ -244,6 +246,7 @@ mod tests {
             h.join("license.key"),
             h.join("provefab.db"),
             h.join("provefab.db-wal"),
+            h.join(".credentials.toml.4f2a9c.tmp"),
             h.join("claude/.credentials.json"),
             h.join("codex-api/auth.json"),
             h.join("claude-api"),
