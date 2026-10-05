@@ -259,7 +259,7 @@ async fn ticket_repo<'a, H: Hub>(
             let labelled: Vec<&RepoConfig> = many
                 .iter()
                 .copied()
-                .filter(|r| labels.contains(&r.label))
+                .filter(|r| labels.iter().any(|l| l.eq_ignore_ascii_case(&r.label)))
                 .collect();
             match labelled.as_slice() {
                 [one] => *one,

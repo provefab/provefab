@@ -257,3 +257,22 @@ async fn add_picks_the_repository_by_label_when_a_project_is_shared() {
     let t = p.store.task_by_url(JIRA).await.unwrap().unwrap();
     assert_eq!(t.repo, "o/s");
 }
+
+#[tokio::test]
+async fn add_matches_the_ticket_label_case_insensitively() {
+    use provefab::commands::add;
+    let mut f = fixture(&["true"]);
+    tracked(&mut f, TrackerKind::Jira);
+    f.config.repos[0].label = "api".into();
+    let mut web = f.config.repos[0].clone();
+    web.slug = "o/s".into();
+    web.label = "web".into();
+    f.config.repos.push(web);
+    let mut p = pipeline(&f, Box::new(happy), FakeOracle::default(), keyed_hub(JIRA)).await;
+    p.hub.issue.labels = vec!["Web".into()];
+    add(&p.store, &f.config, &p.hub, &p.git, &p.paths, JIRA)
+        .await
+        .unwrap();
+    let t = p.store.task_by_url(JIRA).await.unwrap().unwrap();
+    assert_eq!(t.repo, "o/s");
+}
