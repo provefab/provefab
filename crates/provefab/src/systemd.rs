@@ -190,11 +190,15 @@ impl Systemd {
         std::fs::create_dir_all(&self.unit_dir).map_err(|e| io(&self.unit_dir, e))?;
         let bin = crate::service::prepare(&self.provefab_home, exe)?;
         let path = self.unit_path();
+        let existed = path.exists();
         std::fs::write(&path, unit(&bin, workers, path_env, &self.provefab_home))
             .map_err(|e| io(&path, e))?;
         if let Err(e) = self.systemctl(&["daemon-reload"]).await {
-            // A unit systemd never loaded would only mislead `doctor`.
-            let _ = std::fs::remove_file(&path);
+            // A first unit systemd never loaded would only mislead `doctor`;
+            // on a reinstall the service already exists, so its unit stays.
+            if !existed {
+                let _ = std::fs::remove_file(&path);
+            }
             return Err(e);
         }
         self.systemctl(&["enable", UNIT]).await?;
@@ -516,6 +520,24 @@ mod tests {
             "{err}"
         );
         assert!(!s.unit_path().exists());
+    }
+
+    /// A reinstall whose reload fails keeps the unit that was already there.
+    #[tokio::test]
+    async fn a_failed_reload_on_reinstall_keeps_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = systemd(dir.path(), "echo Linger=yes");
+        s.systemctl = fake(
+            dir.path(),
+            "noreload",
+            "[ \"$2\" = daemon-reload ] && { echo 'reload refused' >&2; exit 1; }; exit 0",
+        );
+        std::fs::create_dir_all(&s.unit_dir).unwrap();
+        std::fs::write(s.unit_path(), "old unit").unwrap();
+        let exe = dir.path().join("built");
+        std::fs::write(&exe, "binary").unwrap();
+        assert!(s.install(&exe, 1, "/usr/bin").await.is_err());
+        assert!(s.unit_path().exists());
     }
 
     #[tokio::test]
