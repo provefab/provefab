@@ -808,7 +808,9 @@ pub async fn export(
 }
 
 /// Deletes the record of finished tasks last updated before `before`
-/// (`YYYY-MM-DD`); a dry run unless `yes`.
+/// (`YYYY-MM-DD`), and the maintenance runs that finished before it except
+/// the latest of each repository and kind and those with a pull request; a
+/// dry run unless `yes`.
 pub async fn prune(store: &Store, before: &str, yes: bool) -> Result<String, CommandError> {
     let at = parse_date(before).ok_or(CommandError::BadDate("--before must be YYYY-MM-DD"))?;
     let tasks = store.prunable_tasks(at).await?;
@@ -819,8 +821,14 @@ pub async fn prune(store: &Store, before: &str, yes: bool) -> Result<String, Com
     if yes {
         let ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
         let (events, findings) = store.prune_record(&ids).await?;
-        let _ = writeln!(out, "deleted {events} events, {findings} findings");
+        let runs = store.prune_maintenance_runs(at).await?;
+        let _ = writeln!(
+            out,
+            "deleted {events} events, {findings} findings, {runs} maintenance runs"
+        );
     } else {
+        let runs = store.prunable_maintenance_runs(at).await?;
+        let _ = writeln!(out, "maintenance runs: {runs} finished before the date");
         out.push_str("dry run: pass --yes to delete\n");
     }
     Ok(out)

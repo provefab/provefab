@@ -757,6 +757,59 @@ async fn prune_deletes_only_with_yes_and_only_finished_tasks() {
 }
 
 #[tokio::test]
+async fn prune_deletes_old_maintenance_runs_only_with_yes() {
+    let f = fixture(&["true"]);
+    let p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    for (at, pr) in [
+        (100, None),
+        (200, Some("https://github.com/o/r/pull/7")),
+        (300, None),
+        (400, None),
+    ] {
+        p.store
+            .record_maintenance_run(&provefab::store::MaintenanceRun {
+                id: 0,
+                repo: "o/r".into(),
+                kind: "periodic".into(),
+                started_at: at,
+                finished_at: Some(at + 5),
+                model_id: None,
+                cost_usd: None,
+                quota_units: None,
+                outcome: "ok".into(),
+                pr_url: pr.map(String::from),
+                detail: None,
+            })
+            .await
+            .unwrap();
+    }
+    let dry = provefab::commands::prune(&p.store, "2999-01-01", false)
+        .await
+        .unwrap();
+    assert!(dry.contains("maintenance runs: 2"), "{dry}");
+    assert_eq!(p.store.maintenance_runs(None).await.unwrap().len(), 4);
+    let done = provefab::commands::prune(&p.store, "2999-01-01", true)
+        .await
+        .unwrap();
+    assert!(done.contains("2 maintenance runs"), "{done}");
+    let left: Vec<i64> = p
+        .store
+        .maintenance_runs(None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.started_at)
+        .collect();
+    assert_eq!(left, [200, 400]);
+}
+
+#[tokio::test]
 async fn prune_keeps_an_open_pr() {
     let (_f, p, id) = open_task_with_findings().await;
     let task = p.store.task(id).await.unwrap().unwrap();

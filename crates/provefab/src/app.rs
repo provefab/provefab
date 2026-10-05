@@ -65,7 +65,7 @@ enum Cmd {
         #[arg(long)]
         with_text: bool,
     },
-    /// Delete the record of finished tasks last updated before a date (dry run without --yes).
+    /// Delete the record of finished tasks and old maintenance runs from before a date (dry run without --yes).
     Prune {
         #[arg(long)]
         before: String,
