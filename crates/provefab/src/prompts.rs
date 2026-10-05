@@ -206,6 +206,18 @@ mod tests {
     }
 
     #[test]
+    fn review_prompt_demands_concrete_findings() {
+        let p = render(Template::Review, &[("diff", "+added line")]);
+        assert!(p.contains("concrete and actionable"), "{p}");
+        assert!(p.contains("introduced by this change"), "{p}");
+        assert!(p.contains("shown to matter"), "{p}");
+        assert!(
+            p.contains("A repository rule is broken only by what this diff concretely does"),
+            "{p}"
+        );
+    }
+
+    #[test]
     fn marked_values_sit_between_their_markers() {
         let p = render(Template::Implement, &[("feedback", "FB")]);
         let begin = p
