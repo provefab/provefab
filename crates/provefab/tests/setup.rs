@@ -212,7 +212,11 @@ fn an_agent_configures_a_repository_and_reads_each_exit_code() {
         (jev["ok"].as_bool(), jev["fix"].as_str()),
         (
             Some(false),
-            Some("security add-generic-password -s provefab-typesafe -a provefab -w")
+            Some(if cfg!(target_os = "macos") {
+                "security add-generic-password -s provefab-typesafe -a provefab -w"
+            } else {
+                "provefab login jev"
+            })
         )
     );
 

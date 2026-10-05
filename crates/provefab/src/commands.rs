@@ -16,6 +16,7 @@ use crate::paths::Paths;
 use crate::ports::{Forge, Hub};
 use crate::post_merge::CheckState;
 use crate::record::{Event, MergedBy, StoredEvent, parse_date, redact_event, redact_text};
+use crate::secrets::{ANTHROPIC_ITEM, Name, SecretError, Secrets};
 use crate::store::{NewIssue, Store, StoreError};
 use crate::task::{TaskMode, TaskState};
 use crate::tracker::{TicketUrl, TrackerKind, parse_ticket_url, split_key};
@@ -875,17 +876,13 @@ pub fn lock(path: &Path) -> std::io::Result<Option<File>> {
     }
 }
 
-/// Keychain service name for the TypeSafe key (`security add-generic-password
-/// -s provefab-typesafe -a provefab -w <key>`).
-pub const KEYCHAIN_SERVICE: &str = "provefab-typesafe";
-
-/// Keychain service holding the user's Anthropic API key (bring your own key).
-pub const ANTHROPIC_KEYCHAIN_SERVICE: &str = "provefab-anthropic";
+/// What `apiKeyHelper` runs after the binary (Linux spec §3, decision 5).
+pub const HELPER_COMMAND: &str = "secrets get anthropic";
 
 /// Writes `apiKeyHelper` into the API-key config dir's `settings.json`, keeping
-/// any other setting: Claude Code then asks the Keychain for the key at each
+/// any other setting: Claude Code then asks Provefab for the key at each
 /// refresh, and the key never enters the agent's environment.
-pub fn claude_api_settings(config_dir: &Path) -> std::io::Result<()> {
+pub fn claude_api_settings(config_dir: &Path, helper: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(config_dir)?;
     let path = config_dir.join("settings.json");
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
@@ -895,29 +892,37 @@ pub fn claude_api_settings(config_dir: &Path) -> std::io::Result<()> {
     if !v.is_object() {
         v = serde_json::json!({});
     }
-    v["apiKeyHelper"] = serde_json::Value::String(format!(
-        "security find-generic-password -s {ANTHROPIC_KEYCHAIN_SERVICE} -a provefab -w"
-    ));
+    v["apiKeyHelper"] = serde_json::Value::String(helper.to_string());
     std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default())
 }
 
-/// `TYPESAFE_API_KEY`, else the macOS Keychain (spec §2.3).
-pub async fn typesafe_key() -> Option<String> {
-    if let Some(k) = std::env::var("TYPESAFE_API_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-    {
-        return Some(k.trim().to_string());
+/// `TYPESAFE_API_KEY`, else the stored key (spec §2.3, Linux spec §3).
+pub async fn typesafe_key(
+    secrets: &Secrets,
+    env: crate::tracker::Env<'_>,
+) -> Result<Option<String>, SecretError> {
+    if let Some(k) = env("TYPESAFE_API_KEY") {
+        return Ok(Some(k));
     }
-    let out = Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !key.is_empty()).then_some(key)
+    secrets.get(&Name::Typesafe).await
+}
+
+/// `credentials`: the secrets file's mode and syntax, when there is a file
+/// (Linux spec §3). Nothing for the Keychain.
+pub fn credentials_checks(secrets: &Secrets) -> Vec<Check> {
+    let Secrets::File { path } = secrets else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        return Vec::new();
+    }
+    vec![check(
+        "credentials",
+        secrets
+            .preflight()
+            .map(|()| format!("{}, readable by you only", path.display()))
+            .map_err(|e| e.to_string()),
+    )]
 }
 
 /// One doctor finding.
@@ -936,8 +941,8 @@ pub struct Tools {
     pub claude: PathBuf,
     pub codex: PathBuf,
     pub pi: PathBuf,
-    /// macOS `security`, to check the Keychain holds an API key.
-    pub security: PathBuf,
+    /// Where Provefab's own secrets are: the Keychain or the secrets file.
+    pub secrets: Secrets,
 }
 
 impl Default for Tools {
@@ -948,7 +953,7 @@ impl Default for Tools {
             claude: "claude".into(),
             codex: "codex".into(),
             pi: "pi".into(),
-            security: "security".into(),
+            secrets: Secrets::system(&crate::paths::Paths::from_env().home),
         }
     }
 }
@@ -1161,22 +1166,15 @@ pub async fn doctor(
     }
     if uses_mode(WorkerKind::ClaudeCode, Auth::ApiKey) {
         let fix = "run `provefab login claude --api-key`";
-        let key = probe(
-            &tools.security,
-            &[
-                "find-generic-password",
-                "-s",
-                ANTHROPIC_KEYCHAIN_SERVICE,
-                "-a",
-                "provefab",
-            ],
-            &[],
-        )
-        .await
-        .map(|_| format!("Keychain item `{ANTHROPIC_KEYCHAIN_SERVICE}`"))
-        .map_err(|_| format!("no Keychain item `{ANTHROPIC_KEYCHAIN_SERVICE}`: {fix}"));
+        let what = tools.secrets.describe(&Name::Anthropic);
+        let key = match tools.secrets.has(&Name::Anthropic).await {
+            Ok(true) => Ok(what.clone()),
+            Ok(false) => Err(format!("no {what}: {fix}")),
+            Err(e) => Err(format!("{e}: {fix}")),
+        };
+        // An install signed in before 0.7.0 keeps its `security` helper on macOS.
         let helper = std::fs::read_to_string(paths.claude_config_api().join("settings.json"))
-            .is_ok_and(|t| t.contains(ANTHROPIC_KEYCHAIN_SERVICE));
+            .is_ok_and(|t| t.contains(HELPER_COMMAND) || t.contains(ANTHROPIC_ITEM));
         checks.push(check(
             "claude api key",
             key.and_then(|k| {
@@ -1184,7 +1182,7 @@ pub async fn doctor(
                     Ok(k)
                 } else {
                     Err(format!(
-                        "the API-key config dir does not read the Keychain: {fix}"
+                        "the API-key config dir does not read the stored key: {fix}"
                     ))
                 }
             }),
@@ -1273,7 +1271,12 @@ pub async fn doctor(
             name: "jev key".into(),
             ok: false,
             detail: format!(
-                "missing: set TYPESAFE_API_KEY or add Keychain item `{KEYCHAIN_SERVICE}`; routing falls back to the standard tier"
+                "missing: set TYPESAFE_API_KEY or {}; routing falls back to the standard tier",
+                if tools.secrets.is_keychain() {
+                    format!("add Keychain item `{}`", crate::secrets::TYPESAFE_ITEM)
+                } else {
+                    "run `provefab login jev`".to_string()
+                }
             ),
         }),
     }
@@ -1386,7 +1389,7 @@ pub async fn tracker_checks(
             }
             TrackerKind::Linear => format!("linear {project}"),
         };
-        let answer = match crate::tracker::Remote::from_tracker(t, &tools.security, env).await {
+        let answer = match crate::tracker::Remote::from_tracker(t, &tools.secrets, env).await {
             Ok(Some(remote)) => remote.check().await.map_err(|e| e.to_string()),
             Ok(None) => continue,
             Err(e) => Err(e),
@@ -1480,7 +1483,11 @@ mod tests {
     fn claude_api_settings_point_at_the_keychain_and_keep_other_settings() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
-        claude_api_settings(dir.path()).unwrap();
+        claude_api_settings(
+            dir.path(),
+            "security find-generic-password -s provefab-anthropic -a provefab -w",
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
         )
@@ -1492,7 +1499,11 @@ mod tests {
         );
         // A fresh dir gets the file too.
         let fresh = tempfile::tempdir().unwrap();
-        claude_api_settings(&fresh.path().join("claude-api")).unwrap();
+        claude_api_settings(
+            &fresh.path().join("claude-api"),
+            "security find-generic-password -s provefab-anthropic -a provefab -w",
+        )
+        .unwrap();
         assert!(fresh.path().join("claude-api/settings.json").exists());
     }
 
@@ -1574,7 +1585,7 @@ mod tests {
     async fn tracker_checks_name_missing_credentials_per_repository() {
         let dir = tempfile::tempdir().unwrap();
         let tools = Tools {
-            security: fake(dir.path(), "security", "exit 44"),
+            secrets: crate::secrets::Secrets::keychain(fake(dir.path(), "security", "exit 44")),
             ..Tools::default()
         };
         let config = Config::from_toml_str(
@@ -1610,7 +1621,7 @@ mod tests {
             ),
             codex: d.join("missing-codex"),
             pi: d.join("missing-pi"),
-            security: d.join("missing-security"),
+            secrets: crate::secrets::Secrets::keychain(d.join("missing-security")),
         };
         let config = Config::from_toml_str(
             "[jev]\nmodel = \"jev-1.13\"\n[[models]]\nid = \"c\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\n",
@@ -1653,7 +1664,7 @@ mod tests {
                 "if [ \"$1\" = login ]; then echo 'WARNING: proceeding, even though we could not update PATH'; echo 'Not logged in'; exit 1; fi; echo 'codex-cli 0.130.0'",
             ),
             pi: d.join("missing-pi"),
-            security: d.join("missing-security"),
+            secrets: crate::secrets::Secrets::keychain(d.join("missing-security")),
         };
         let config = Config::from_toml_str(
             "[jev]\nmodel = \"jev-1.13\"\n[[models]]\nid = \"x\"\nworker = \"codex\"\nmodel = \"gpt-5.5\"\ntier = \"standard\"\n",
@@ -1710,7 +1721,7 @@ mod tests {
                 "if [ \"$1\" = login ]; then echo 'WARNING: proceeding'; echo; echo 'Logged in using an API key - sk-***'; exit 0; fi; echo 'codex-cli 0.130.0'",
             ),
             pi: d.join("missing-pi"),
-            security: d.join("missing-security"),
+            secrets: crate::secrets::Secrets::keychain(d.join("missing-security")),
         };
         let config = Config::from_toml_str(
             "[jev]\nmodel = \"jev-1.13\"\n[[models]]\nid = \"x\"\nworker = \"codex\"\nmodel = \"gpt-5.5\"\ntier = \"standard\"\nauth = \"api_key\"\n",
@@ -1742,7 +1753,7 @@ mod tests {
             ),
             codex: d.join("missing-codex"),
             pi: d.join("missing-pi"),
-            security: d.join("missing-security"),
+            secrets: crate::secrets::Secrets::keychain(d.join("missing-security")),
         };
         let config = Config::from_toml_str(
             r#"
@@ -1786,7 +1797,7 @@ tier = "standard"
             claude: fake(d, "claude", "echo '2.1.281 (Claude Code)'"),
             codex: d.join("missing-codex"),
             pi: d.join("missing-pi"),
-            security: fake(d, "security", "exit 0"),
+            secrets: crate::secrets::Secrets::keychain(fake(d, "security", "exit 0")),
         };
         let config = Config::from_toml_str(
             r#"
@@ -1848,7 +1859,7 @@ checks = ["./scripts/check-migration.sh"]
             claude: fake(d, "claude", "echo '2.1.281 (Claude Code)'"),
             codex: fake(d, "codex", "echo 'codex 0.50'"),
             pi: d.join("missing-pi"),
-            security: d.join("missing-security"),
+            secrets: crate::secrets::Secrets::keychain(d.join("missing-security")),
         };
         let paths = Paths::new(d);
         let mut table = crate::prices::PriceTable::from_models_dev(
@@ -1906,7 +1917,7 @@ auth = "api_key"
                 "if [ \"$1\" = login ]; then echo \"Logged in using an API key - sk-***\"; exit 0; fi; echo 'codex-cli 0.156.1'",
             ),
             pi: d.join("missing-pi"),
-            security: fake(d, "security", "exit 0"),
+            secrets: crate::secrets::Secrets::keychain(fake(d, "security", "exit 0")),
         };
         let config = Config::from_toml_str(
             r#"
@@ -1927,7 +1938,11 @@ auth = "api_key"
 "#,
         )
         .unwrap();
-        claude_api_settings(&Paths::new(d).claude_config_api()).unwrap();
+        claude_api_settings(
+            &Paths::new(d).claude_config_api(),
+            "PROVEFAB_HOME=/h /bin/provefab secrets get anthropic",
+        )
+        .unwrap();
         let checks = doctor(&tools, &config, &Paths::new(d), None).await;
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         let get = |n: &str| checks.iter().find(|c| c.name == n).cloned().unwrap();
@@ -1941,7 +1956,7 @@ auth = "api_key"
         );
         // A missing key fails with the command that fixes it.
         let tools = Tools {
-            security: fake(d, "security2", "exit 44"),
+            secrets: crate::secrets::Secrets::keychain(fake(d, "security2", "exit 44")),
             ..tools
         };
         let checks = doctor(&tools, &config, &Paths::new(d), None).await;
@@ -1987,5 +2002,99 @@ auth = "api_key"
         assert!(bad.detail.contains("jev.model"), "{bad:?}");
         let good = jev_check(&client("jev-1.13.0")).await;
         assert!(good.ok && good.detail.contains("jev-1.13.0"), "{good:?}");
+    }
+
+    #[tokio::test]
+    async fn typesafe_key_prefers_the_environment_then_the_store() {
+        use crate::secrets::{Name, Secrets};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secrets::file(dir.path());
+        assert_eq!(typesafe_key(&s, &|_: &str| None::<String>).await, Ok(None));
+        s.set_values(&[(Name::Typesafe, "ts_file")]).unwrap();
+        assert_eq!(
+            typesafe_key(&s, &|_: &str| None::<String>)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ts_file")
+        );
+        let env = |k: &str| (k == "TYPESAFE_API_KEY").then(|| "ts_env".to_string());
+        assert_eq!(
+            typesafe_key(&s, &env).await.unwrap().as_deref(),
+            Some("ts_env")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_reads_the_anthropic_key_from_the_file_on_linux() {
+        use crate::secrets::{Name, Secrets};
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tools = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: fake(d, "claude", "echo '2.1.281 (Claude Code)'"),
+            codex: d.join("missing-codex"),
+            pi: d.join("missing-pi"),
+            secrets: Secrets::file(d),
+        };
+        let config = Config::from_toml_str(
+            "[jev]\nmodel = \"jev-1.13.0\"\n[[models]]\nid = \"c\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\nauth = \"api_key\"\n",
+        )
+        .unwrap();
+        let paths = Paths::new(d);
+        let get = |checks: &[Check]| {
+            checks
+                .iter()
+                .find(|c| c.name == "claude api key")
+                .cloned()
+                .unwrap()
+        };
+        let missing = get(&doctor(&tools, &config, &paths, None).await);
+        assert!(!missing.ok, "{missing:?}");
+        assert!(
+            missing.detail.starts_with("no `anthropic` in "),
+            "{missing:?}"
+        );
+        tools
+            .secrets
+            .set_values(&[(Name::Anthropic, "sk-ant-SENTINEL")])
+            .unwrap();
+        claude_api_settings(
+            &paths.claude_config_api(),
+            "PROVEFAB_HOME=/h /bin/provefab secrets get anthropic",
+        )
+        .unwrap();
+        let found = get(&doctor(&tools, &config, &paths, None).await);
+        assert!(found.ok, "{found:?}");
+        assert!(!found.detail.contains("SENTINEL"), "{found:?}");
+        // No key yet: the jev line names the Linux fix.
+        let jev = doctor(&tools, &config, &paths, None)
+            .await
+            .into_iter()
+            .find(|c| c.name == "jev key")
+            .unwrap();
+        assert!(jev.detail.contains("provefab login jev"), "{jev:?}");
+    }
+
+    #[test]
+    fn credentials_line_only_for_an_existing_file() {
+        use crate::secrets::{Name, Secrets};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secrets::file(dir.path());
+        assert!(credentials_checks(&s).is_empty());
+        assert!(credentials_checks(&Secrets::keychain("security")).is_empty());
+        s.set_values(&[(Name::Linear, "lin")]).unwrap();
+        let ok = credentials_checks(&s);
+        assert_eq!(
+            (ok[0].name.as_str(), ok[0].ok),
+            ("credentials", true),
+            "{ok:?}"
+        );
+        let path = dir.path().join(crate::secrets::FILE_NAME);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let bad = credentials_checks(&s);
+        assert!(!bad[0].ok && bad[0].detail.contains("chmod 600"), "{bad:?}");
     }
 }

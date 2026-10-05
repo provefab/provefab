@@ -4,18 +4,17 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::process::Command;
 
 use crate::config::{Config, RepoConfig};
 use crate::forge::{Comment, ForgeError, Gh, Issue, PrStatus, PullRequest, RepoRoot};
 use crate::jira::Jira;
 use crate::linear::Linear;
 use crate::ports::{Forge, Tracker};
+use crate::secrets::{Name, SecretError, Secrets};
 use crate::store::TaskRow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -107,9 +106,6 @@ pub fn validate(cfg: &TrackerConfig, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub const JIRA_KEYCHAIN_SERVICE: &str = "provefab-jira";
-pub const LINEAR_KEYCHAIN_SERVICE: &str = "provefab-linear";
-
 /// Reads one environment variable; tests pass their own.
 pub type Env<'a> = &'a (dyn Fn(&str) -> Option<String> + Sync);
 
@@ -163,175 +159,51 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// How long a Keychain read may take before it is abandoned.
-const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// What a `security` call came back with.
-enum Keychain {
-    Found(String),
-    Missing,
-    TimedOut,
-}
-
-/// `security` with `args`: its stdout (and stderr, for attribute listings) on
-/// success. A locked or unapproved Keychain item can make it prompt, so the
-/// call is bounded by `limit`, stdin is closed and the child is killed when
-/// the limit passes.
-async fn security_out(
-    security: &Path,
-    args: &[&str],
-    with_stderr: bool,
-    limit: Duration,
-) -> Keychain {
-    let mut cmd = Command::new(security);
-    cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
-    let out = match tokio::time::timeout(limit, cmd.output()).await {
-        Err(_) => return Keychain::TimedOut,
-        Ok(Err(_)) => return Keychain::Missing,
-        Ok(Ok(out)) => out,
-    };
-    if !out.status.success() {
-        return Keychain::Missing;
+/// A store error for a caller whose fix is `fix`: a Keychain timeout gets
+/// the fix appended; a refused or malformed file already names its own.
+fn store_error(e: SecretError, fix: &str) -> String {
+    match e {
+        SecretError::TimedOut { .. } => format!("{e}: {fix}"),
+        other => other.to_string(),
     }
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-    if with_stderr {
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-    }
-    Keychain::Found(text)
-}
-
-/// The error for a Keychain read that passed `limit`: fixed text, no output.
-fn keychain_timeout(item: &str, limit: Duration, fix: &str) -> String {
-    format!(
-        "timed out after {}s reading the Keychain item {item}: {fix}",
-        limit.as_secs_f64()
-    )
-}
-
-/// The item comment in a `security find-generic-password` listing:
-/// `    "icmt"<blob>="bot@acme.test"`. A non-ASCII comment is printed as hex
-/// followed by a quoted rendering, `0x6A6F73C3A9  "jos\303\251"`; the hex
-/// digits are decoded as UTF-8.
-fn keychain_comment(listing: &str) -> Option<String> {
-    listing.lines().find_map(|l| {
-        let v = l.trim().strip_prefix("\"icmt\"<blob>=")?;
-        if let Some(rest) = v.strip_prefix("0x") {
-            let digits = rest.split_whitespace().next().unwrap_or("");
-            return decode_hex_utf8(digits).filter(|s| !s.is_empty());
-        }
-        let v = v.strip_prefix('"')?.strip_suffix('"')?;
-        (!v.is_empty()).then(|| v.to_string())
-    })
-}
-
-fn decode_hex_utf8(digits: &str) -> Option<String> {
-    if !digits.len().is_multiple_of(2) || !digits.is_ascii() {
-        return None;
-    }
-    let bytes = (0..digits.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).ok())
-        .collect::<Option<Vec<u8>>>()?;
-    String::from_utf8(bytes).ok()
 }
 
 /// Jira credentials for `site`: `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN`,
-/// each overriding its part of the Keychain item `provefab-jira` / `<site>`
-/// (spec §5). The error names the fix, never a secret.
-pub async fn jira_auth(security: &Path, site: &str, env: Env<'_>) -> Result<JiraAuth, String> {
-    jira_auth_within(security, site, env, KEYCHAIN_TIMEOUT).await
-}
-
-async fn jira_auth_within(
-    security: &Path,
-    site: &str,
-    env: Env<'_>,
-    limit: Duration,
-) -> Result<JiraAuth, String> {
-    let item = format!("{JIRA_KEYCHAIN_SERVICE} for {site}");
+/// each overriding its part of the stored `jira.<site>` credentials (spec §5,
+/// Linux spec §3). The error names the fix, never a secret.
+pub async fn jira_auth(secrets: &Secrets, site: &str, env: Env<'_>) -> Result<JiraAuth, String> {
     let fix = format!(
         "run `provefab login jira --site {site}` or set PROVEFAB_JIRA_EMAIL and PROVEFAB_JIRA_TOKEN"
     );
     let token = match env("PROVEFAB_JIRA_TOKEN") {
         Some(t) => t,
-        None => match security_out(
-            security,
-            &[
-                "find-generic-password",
-                "-s",
-                JIRA_KEYCHAIN_SERVICE,
-                "-a",
-                site,
-                "-w",
-            ],
-            false,
-            limit,
-        )
-        .await
-        {
-            Keychain::Found(t) if !t.trim().is_empty() => t.trim().to_string(),
-            Keychain::TimedOut => return Err(keychain_timeout(&item, limit, &fix)),
-            _ => return Err(format!("no Jira API token for {site}: {fix}")),
+        None => match secrets.get(&Name::JiraToken(site.to_string())).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Err(format!("no Jira API token for {site}: {fix}")),
+            Err(e) => return Err(store_error(e, &fix)),
         },
     };
     let email = match env("PROVEFAB_JIRA_EMAIL") {
         Some(e) => e,
-        None => match security_out(
-            security,
-            &[
-                "find-generic-password",
-                "-s",
-                JIRA_KEYCHAIN_SERVICE,
-                "-a",
-                site,
-            ],
-            true,
-            limit,
-        )
-        .await
-        {
-            Keychain::Found(listing) => keychain_comment(&listing)
-                .ok_or_else(|| format!("no Jira account e-mail for {site}: {fix}"))?,
-            Keychain::TimedOut => return Err(keychain_timeout(&item, limit, &fix)),
-            Keychain::Missing => return Err(format!("no Jira account e-mail for {site}: {fix}")),
+        None => match secrets.get(&Name::JiraEmail(site.to_string())).await {
+            Ok(Some(e)) => e,
+            Ok(None) => return Err(format!("no Jira account e-mail for {site}: {fix}")),
+            Err(e) => return Err(store_error(e, &fix)),
         },
     };
     Ok(JiraAuth { email, token })
 }
 
-/// The Linear personal API key: `PROVEFAB_LINEAR_KEY`, else the Keychain item
-/// `provefab-linear` / `provefab` (spec §5).
-pub async fn linear_key(security: &Path, env: Env<'_>) -> Result<String, String> {
-    linear_key_within(security, env, KEYCHAIN_TIMEOUT).await
-}
-
-async fn linear_key_within(
-    security: &Path,
-    env: Env<'_>,
-    limit: Duration,
-) -> Result<String, String> {
+/// The Linear personal API key: `PROVEFAB_LINEAR_KEY`, else the stored one.
+pub async fn linear_key(secrets: &Secrets, env: Env<'_>) -> Result<String, String> {
     if let Some(k) = env("PROVEFAB_LINEAR_KEY") {
         return Ok(k);
     }
     let fix = "run `provefab login linear` or set PROVEFAB_LINEAR_KEY";
-    match security_out(
-        security,
-        &[
-            "find-generic-password",
-            "-s",
-            LINEAR_KEYCHAIN_SERVICE,
-            "-a",
-            "provefab",
-            "-w",
-        ],
-        false,
-        limit,
-    )
-    .await
-    {
-        Keychain::Found(k) if !k.trim().is_empty() => Ok(k.trim().to_string()),
-        Keychain::TimedOut => Err(keychain_timeout(LINEAR_KEYCHAIN_SERVICE, limit, fix)),
-        _ => Err(format!("no Linear API key: {fix}")),
+    match secrets.get(&Name::Linear).await {
+        Ok(Some(k)) => Ok(k),
+        Ok(None) => Err(format!("no Linear API key: {fix}")),
+        Err(e) => Err(store_error(e, fix)),
     }
 }
 
@@ -679,7 +551,7 @@ impl Remote {
     /// the `provefab login` to run. Shared by `provefab run` and `doctor`.
     pub async fn from_tracker(
         t: &TrackerConfig,
-        security: &Path,
+        secrets: &Secrets,
         env: Env<'_>,
     ) -> Result<Option<Self>, String> {
         let project = t.project.as_deref().unwrap_or_default();
@@ -687,15 +559,15 @@ impl Remote {
             TrackerKind::Github => return Ok(None),
             TrackerKind::Jira => {
                 // Host names are case-insensitive; `provefab login jira`
-                // stores the Keychain item under the lower-case site.
+                // stores the credentials under the lower-case site.
                 let site = t.site.as_deref().unwrap_or_default().to_lowercase();
-                let auth = jira_auth(security, &site, env).await?;
+                let auth = jira_auth(secrets, &site, env).await?;
                 Remote::Jira(Jira::new(&format!("https://{site}"), &site, project, auth))
             }
             TrackerKind::Linear => Remote::Linear(Linear::new(
                 crate::linear::API,
                 project,
-                linear_key(security, env).await?,
+                linear_key(secrets, env).await?,
             )),
         }))
     }
@@ -729,13 +601,13 @@ impl Routed {
     pub async fn from_config(
         config: &Config,
         gh: Gh,
-        security: &Path,
+        secrets: &Secrets,
         env: Env<'_>,
     ) -> Result<Self, String> {
         let mut remotes = HashMap::new();
         for repo in &config.repos {
             let Some(t) = &repo.tracker else { continue };
-            if let Some(remote) = Remote::from_tracker(t, security, env).await? {
+            if let Some(remote) = Remote::from_tracker(t, secrets, env).await? {
                 remotes.insert(repo.slug.to_lowercase(), remote);
             }
         }
@@ -850,6 +722,7 @@ mod tests {
     use crate::forge::Gh;
     use crate::jira::Jira;
     use crate::ports::{Forge, Tracker};
+    use crate::secrets::{Name, Secrets};
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -879,7 +752,7 @@ mod tests {
     /// attributes (the comment holds the e-mail) without it.
     const KEYCHAIN: &str = r#"case "$*" in
   *"-s provefab-jira -a acme.atlassian.net -w") echo "kc-token" ;;
-  *"-s provefab-jira -a acme.atlassian.net") echo 'keychain: "/Users/x/Library/Keychains/login.keychain-db"'; echo 'attributes:'; echo '    "acct"<blob>="acme.atlassian.net"'; echo '    "icmt"<blob>="bot@acme.test"' ;;
+  *"-s provefab-jira -a acme.atlassian.net") echo 'attributes:'; echo '    "icmt"<blob>="bot@acme.test"' ;;
   *"-s provefab-linear -a provefab -w") echo "lin_api_kc" ;;
   *) exit 44 ;;
 esac"#;
@@ -932,54 +805,117 @@ esac"#;
     }
 
     #[tokio::test]
-    async fn jira_credentials_come_from_the_environment_then_the_keychain() {
+    async fn jira_credentials_come_from_the_environment_then_the_store() {
         let dir = tempfile::tempdir().unwrap();
-        let security = fake_security(dir.path(), "security", KEYCHAIN);
+        let file = Secrets::file(dir.path());
+        file.set_values(&[
+            (Name::JiraToken("acme.atlassian.net".into()), "file-token"),
+            (
+                Name::JiraEmail("acme.atlassian.net".into()),
+                "file@acme.test",
+            ),
+        ])
+        .unwrap();
+        let keychain = Secrets::keychain(fake_security(dir.path(), "security", KEYCHAIN));
         let env = env_of(&[
             ("PROVEFAB_JIRA_EMAIL", "env@acme.test"),
             ("PROVEFAB_JIRA_TOKEN", "env-token"),
         ]);
-        let a = jira_auth(&security, "acme.atlassian.net", &env)
-            .await
-            .unwrap();
-        assert_eq!(
-            (a.email.as_str(), a.token.as_str()),
-            ("env@acme.test", "env-token")
-        );
-        let none = env_of(&[]);
-        let a = jira_auth(&security, "acme.atlassian.net", &none)
-            .await
-            .unwrap();
-        assert_eq!(
-            (a.email.as_str(), a.token.as_str()),
-            ("bot@acme.test", "kc-token")
-        );
-        assert!(!format!("{a:?}").contains("kc-token"), "{a:?}");
-        let err = jira_auth(&security, "other.atlassian.net", &none)
-            .await
-            .unwrap_err();
+        for (s, email, token) in [
+            (&file, "file@acme.test", "file-token"),
+            (&keychain, "bot@acme.test", "kc-token"),
+        ] {
+            let a = jira_auth(s, "acme.atlassian.net", &env).await.unwrap();
+            assert_eq!(
+                (a.email.as_str(), a.token.as_str()),
+                ("env@acme.test", "env-token")
+            );
+            let a = jira_auth(s, "acme.atlassian.net", &env_of(&[]))
+                .await
+                .unwrap();
+            assert_eq!((a.email.as_str(), a.token.as_str()), (email, token));
+            assert!(!format!("{a:?}").contains(token), "{a:?}");
+            let err = jira_auth(s, "other.atlassian.net", &env_of(&[]))
+                .await
+                .unwrap_err();
+            assert!(
+                err.starts_with("no Jira API token for other.atlassian.net"),
+                "{err}"
+            );
+            assert!(
+                err.contains("provefab login jira --site other.atlassian.net"),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_linear_key_comes_from_the_environment_then_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = Secrets::file(dir.path());
+        file.set_values(&[(Name::Linear, "lin_api_file")]).unwrap();
+        let keychain = Secrets::keychain(fake_security(dir.path(), "security", KEYCHAIN));
+        let env = env_of(&[("PROVEFAB_LINEAR_KEY", "lin_api_env")]);
+        for (s, stored) in [(&file, "lin_api_file"), (&keychain, "lin_api_kc")] {
+            assert_eq!(linear_key(s, &env).await.unwrap(), "lin_api_env");
+            assert_eq!(linear_key(s, &env_of(&[])).await.unwrap(), stored);
+        }
+        let empty = Secrets::file(&dir.path().join("none"));
+        let err = linear_key(&empty, &env_of(&[])).await.unwrap_err();
         assert!(
-            err.contains("provefab login jira --site other.atlassian.net"),
+            err.starts_with("no Linear API key") && err.contains("provefab login linear"),
             "{err}"
         );
     }
 
-    #[test]
-    fn keychain_comment_decodes_hex_utf8() {
-        let hex = |h: &str| format!("    \"icmt\"<blob>=0x{h}  \"jos\\303\\251@acme.test\"");
-        assert_eq!(
-            keychain_comment(&hex("6A6F73C3A94061636D652E74657374")).as_deref(),
-            Some("josé@acme.test")
+    #[tokio::test]
+    async fn a_keychain_timeout_names_the_item_and_the_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = Secrets::Keychain {
+            security: fake_security(dir.path(), "slow", "sleep 30"),
+            timeout: Duration::from_millis(200),
+        };
+        let token_path = env_of(&[("PROVEFAB_JIRA_EMAIL", "bot@acme.test")]);
+        let email_path = env_of(&[("PROVEFAB_JIRA_TOKEN", "tok-secret")]);
+        for env in [&token_path, &email_path] {
+            let err = jira_auth(&slow, "acme.atlassian.net", env)
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("timed out after 0.2s")
+                    && err.contains("provefab-jira")
+                    && err.contains("provefab login jira --site acme.atlassian.net"),
+                "{err}"
+            );
+            assert!(!err.contains("tok-secret") && !err.contains("bot@acme.test"));
+        }
+        let err = linear_key(&slow, &env_of(&[])).await.unwrap_err();
+        assert!(
+            err.contains("timed out after 0.2s")
+                && err.contains("provefab-linear")
+                && err.contains("provefab login linear"),
+            "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_open_to_others_stops_the_tracker_with_its_fix_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = Secrets::file(dir.path());
+        file.set_values(&[(Name::Linear, "lin_api_file")]).unwrap();
+        let path = dir.path().join(crate::secrets::FILE_NAME);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = linear_key(&file, &env_of(&[])).await.unwrap_err();
         assert_eq!(
-            keychain_comment(&hex("6a6f73c3a94061636d652e74657374")).as_deref(),
-            Some("josé@acme.test")
+            err,
+            format!(
+                "{} can be read by group or others: run `chmod 600 {}`",
+                path.display(),
+                path.display()
+            )
         );
-        // Odd length, invalid UTF-8, no digits.
-        assert_eq!(keychain_comment(&hex("6A6F7")), None);
-        assert_eq!(keychain_comment(&hex("C328")), None);
-        assert_eq!(keychain_comment(&hex("")), None);
-        assert_eq!(keychain_comment("    \"icmt\"<blob>=<NULL>"), None);
+        assert!(!err.contains("lin_api_file"));
     }
 
     #[tokio::test]
@@ -991,7 +927,8 @@ esac"#;
   *) exit 44 ;;
 esac"#;
         let security = fake_security(dir.path(), "security", script);
-        let a = jira_auth(&security, "acme.atlassian.net", &env_of(&[]))
+        let s = Secrets::keychain(security);
+        let a = jira_auth(&s, "acme.atlassian.net", &env_of(&[]))
             .await
             .unwrap();
         assert_eq!(
@@ -1000,76 +937,10 @@ esac"#;
         );
         let debug = format!("{a:?}");
         assert!(!debug.contains("kc-token") && !debug.contains("acme.test"));
-        let err = jira_auth(&security, "other.atlassian.net", &env_of(&[]))
+        let err = jira_auth(&s, "other.atlassian.net", &env_of(&[]))
             .await
             .unwrap_err();
         assert!(!err.contains("kc-token") && !err.contains("acme.test"));
-    }
-
-    #[tokio::test]
-    async fn the_linear_key_comes_from_the_environment_then_the_keychain() {
-        let dir = tempfile::tempdir().unwrap();
-        let security = fake_security(dir.path(), "security", KEYCHAIN);
-        let env = env_of(&[("PROVEFAB_LINEAR_KEY", "lin_api_env")]);
-        assert_eq!(linear_key(&security, &env).await.unwrap(), "lin_api_env");
-        assert_eq!(
-            linear_key(&security, &env_of(&[])).await.unwrap(),
-            "lin_api_kc"
-        );
-        let missing = fake_security(dir.path(), "missing", "exit 44");
-        let err = linear_key(&missing, &env_of(&[])).await.unwrap_err();
-        assert!(err.contains("provefab login linear"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn keychain_read_times_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let slow = fake_security(dir.path(), "slow", "sleep 30");
-        let limit = Duration::from_millis(200);
-        let started = std::time::Instant::now();
-        let token_path = env_of(&[("PROVEFAB_JIRA_EMAIL", "bot@acme.test")]);
-        let email_path = env_of(&[("PROVEFAB_JIRA_TOKEN", "tok-secret")]);
-        let errs = [
-            jira_auth_within(&slow, "acme.atlassian.net", &token_path, limit).await,
-            jira_auth_within(&slow, "acme.atlassian.net", &email_path, limit).await,
-        ];
-        for err in errs {
-            let err = err.unwrap_err();
-            assert!(
-                err.contains("timed out after 0.2s")
-                    && err.contains("provefab-jira")
-                    && err.contains("provefab login jira --site acme.atlassian.net"),
-                "{err}"
-            );
-            assert!(!err.contains("tok-secret") && !err.contains("bot@acme.test"));
-        }
-        let err = linear_key_within(&slow, &env_of(&[]), limit)
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("timed out after 0.2s")
-                && err.contains("provefab-linear")
-                && err.contains("provefab login linear"),
-            "{err}"
-        );
-        assert!(started.elapsed() < Duration::from_secs(10));
-        // A missing item keeps its own message.
-        let missing = fake_security(dir.path(), "missing", "exit 44");
-        let roomy = Duration::from_secs(5);
-        let err = jira_auth_within(&missing, "acme.atlassian.net", &env_of(&[]), roomy)
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("no Jira API token") && !err.contains("timed out"),
-            "{err}"
-        );
-        let err = linear_key_within(&missing, &env_of(&[]), roomy)
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("no Linear API key") && !err.contains("timed out"),
-            "{err}"
-        );
     }
 
     #[test]
@@ -1312,7 +1183,7 @@ esac"#;
     #[tokio::test]
     async fn a_jira_site_in_upper_case_uses_the_lower_case_keychain_item_and_url() {
         let dir = tempfile::tempdir().unwrap();
-        let security = fake_security(dir.path(), "security", KEYCHAIN);
+        let security = Secrets::keychain(fake_security(dir.path(), "security", KEYCHAIN));
         let t = TrackerConfig {
             kind: TrackerKind::Jira,
             site: Some("Acme.Atlassian.net".into()),
@@ -1333,7 +1204,7 @@ esac"#;
     async fn routed_is_built_from_the_config_and_names_missing_credentials() {
         let config = Config::from_toml_str(CONFIG).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let nothing = fake_security(dir.path(), "security", "exit 44");
+        let nothing = Secrets::keychain(fake_security(dir.path(), "security", "exit 44"));
         let env = env_of(&[
             ("PROVEFAB_JIRA_EMAIL", "e@acme.test"),
             ("PROVEFAB_JIRA_TOKEN", "tok"),

@@ -17,6 +17,7 @@ use crate::pipeline::Pipeline;
 use crate::policy::{OpenPrOnly, ReviewPolicy};
 use crate::ports::JevOracle;
 use crate::scheduler::{self, RunOptions};
+use crate::secrets::Secrets;
 use crate::setup::{self, SetupError};
 use crate::store::Store;
 use crate::{codex_setup, plugins};
@@ -291,12 +292,19 @@ fn load_config(paths: &Paths) -> anyhow::Result<Config> {
         .map_err(|e| anyhow::anyhow!(crate::rules::redact_credentials(&format!("{e:#}"))))
 }
 
-async fn oracle(config: &Config) -> anyhow::Result<Option<JevOracle>> {
-    let Some(key) = commands::typesafe_key().await else {
-        eprintln!(
-            "provefab: no TypeSafe key; Jev fallbacks apply (standard tier, no loop detector, no triage)"
-        );
-        return Ok(None);
+async fn oracle(config: &Config, secrets: &Secrets) -> anyhow::Result<Option<JevOracle>> {
+    let key = match commands::typesafe_key(secrets, &crate::tracker::process_env).await {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            eprintln!(
+                "provefab: no TypeSafe key; Jev fallbacks apply (standard tier, no loop detector, no triage)"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!("provefab: {e}; Jev fallbacks apply");
+            return Ok(None);
+        }
     };
     let client = jev::JevClient::new(key, config.jev.model.clone(), crate::jevq::DEADLINE)?;
     Ok(Some(JevOracle { client }))
@@ -311,22 +319,18 @@ fn gh() -> Gh {
 /// The hub `run` and `add` use: each repository's issues on its tracker, code
 /// on GitHub. Missing Jira or Linear credentials stop the command here, with
 /// the `provefab login` to run.
-async fn routed(config: &Config) -> anyhow::Result<crate::tracker::Routed> {
-    crate::tracker::Routed::from_config(
-        config,
-        gh(),
-        std::path::Path::new("security"),
-        &crate::tracker::process_env,
-    )
-    .await
-    .map_err(anyhow::Error::msg)
+async fn routed(config: &Config, secrets: &Secrets) -> anyhow::Result<crate::tracker::Routed> {
+    crate::tracker::Routed::from_config(config, gh(), secrets, &crate::tracker::process_env)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
 /// `provefab login jira --site <site>` and `provefab login linear` (spec §5):
 /// the token is typed at the Keychain's own prompt, so it never passes through
 /// Provefab or a command line. The Jira e-mail is kept as the item's comment.
 fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()> {
-    use crate::tracker::{JIRA_KEYCHAIN_SERVICE, LINEAR_KEYCHAIN_SERVICE, is_host};
+    use crate::secrets::{JIRA_ITEM, LINEAR_ITEM};
+    use crate::tracker::is_host;
     let mut args: Vec<String> = vec!["add-generic-password".into(), "-U".into(), "-s".into()];
     let done = match worker {
         LoginWorker::Jira => {
@@ -344,7 +348,7 @@ fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()
                 bail!("an account e-mail address is required");
             }
             args.extend([
-                JIRA_KEYCHAIN_SERVICE.into(),
+                JIRA_ITEM.into(),
                 "-a".into(),
                 site.clone(),
                 "-j".into(),
@@ -359,11 +363,7 @@ fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()
             if site.is_some() {
                 bail!("--site is for `provefab login jira` only");
             }
-            args.extend([
-                LINEAR_KEYCHAIN_SERVICE.into(),
-                "-a".into(),
-                "provefab".into(),
-            ]);
+            args.extend([LINEAR_ITEM.into(), "-a".into(), "provefab".into()]);
             println!(
                 "Enter a Linear personal API key (from Linear's settings) at the Keychain prompt."
             );
@@ -397,8 +397,10 @@ pub async fn open_pipeline(
     policy: Arc<dyn ReviewPolicy>,
 ) -> anyhow::Result<RunPipeline> {
     let config = load_config(paths)?;
-    let oracle = oracle(&config).await?;
-    let hub = routed(&config).await?;
+    let secrets = Secrets::system(&paths.home);
+    secrets.preflight()?;
+    let oracle = oracle(&config, &secrets).await?;
+    let hub = routed(&config, &secrets).await?;
     let store = Store::open(&paths.db()).await?;
     build_pipeline(paths, config, oracle, hub, store, policy).await
 }
@@ -487,13 +489,15 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             once,
         } => {
             let config = load_config(&paths)?;
+            let secrets = Secrets::system(&paths.home);
+            secrets.preflight()?;
             let policy = ext.policy.clone();
             for w in policy.warnings(&config) {
                 eprintln!("provefab: {w}");
             }
             policy.check(&config).map_err(anyhow::Error::msg)?;
-            let oracle = oracle(&config).await?;
-            let hub = routed(&config).await?;
+            let oracle = oracle(&config, &secrets).await?;
+            let hub = routed(&config, &secrets).await?;
             if dry_run {
                 for line in scheduler::dry_run(&config, &hub, &oracle).await? {
                     println!("{line}");
@@ -510,7 +514,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
         }
         Cmd::Add { url } => {
             let config = load_config(&paths)?;
-            let hub = routed(&config).await?;
+            let hub = routed(&config, &Secrets::system(&paths.home)).await?;
             let store = Store::open(&paths.db()).await?;
             let git = Git {
                 program: "git".into(),
@@ -578,23 +582,19 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     println!("FAIL {:<22} {}", c.name, c.detail);
                 }
             }
-            let (oracle, jev_failed) = match oracle(&config).await {
+            let tools = Tools::default();
+            let (oracle, jev_failed) = match oracle(&config, &tools.secrets).await {
                 Ok(o) => (o, None),
                 Err(e) if json => (None, Some(e)),
                 Err(e) => return Err(e),
             };
-            let mut checks = commands::doctor(
-                &Tools::default(),
-                &config,
-                &paths,
-                oracle.as_ref().map(|o| &o.client),
-            )
-            .await;
+            let mut checks =
+                commands::doctor(&tools, &config, &paths, oracle.as_ref().map(|o| &o.client)).await;
             checks.extend(
-                commands::tracker_checks(&Tools::default(), &config, &crate::tracker::process_env)
-                    .await,
+                commands::tracker_checks(&tools, &config, &crate::tracker::process_env).await,
             );
-            checks.extend(commands::rules_checks(&Tools::default(), &config, &paths, &gh()).await);
+            checks.extend(commands::rules_checks(&tools, &config, &paths, &gh()).await);
+            checks.extend(commands::credentials_checks(&tools.secrets));
             if let Some(e) = &jev_failed {
                 setup::jev_unavailable(&mut checks, e);
             }
@@ -705,7 +705,7 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                             "add-generic-password",
                             "-U",
                             "-s",
-                            commands::ANTHROPIC_KEYCHAIN_SERVICE,
+                            crate::secrets::ANTHROPIC_ITEM,
                             "-a",
                             "provefab",
                             "-w",
@@ -715,7 +715,13 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     if !status.success() {
                         bail!("could not store the key in the Keychain");
                     }
-                    commands::claude_api_settings(&paths.claude_config_api())?;
+                    commands::claude_api_settings(
+                        &paths.claude_config_api(),
+                        &format!(
+                            "security find-generic-password -s {} -a provefab -w",
+                            crate::secrets::ANTHROPIC_ITEM
+                        ),
+                    )?;
                     println!(
                         "stored; Claude Code models with auth = \"api_key\" use it (config dir {})",
                         paths.claude_config_api().display()

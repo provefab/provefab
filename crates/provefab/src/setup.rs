@@ -76,7 +76,7 @@ const NO_WORKER: &str = "no worker CLI on PATH: install Claude Code (`claude`) o
 
 const HEADER: &str = r#"# Provefab configuration, written by `provefab init`.
 # Full reference: https://provefab.com/docs/configuration/
-# No secret here: sign-ins stay in Provefab's directories, keys in the macOS Keychain.
+# No secret here: sign-ins stay in Provefab's directories, keys in the macOS Keychain or, on Linux, in credentials.toml beside this file (readable by you only).
 
 [jev]
 model = "jev-1.13.0"            # full, pinned version; never "jev-latest"
@@ -569,10 +569,22 @@ pub fn fix_for(check: &Check, config: Option<&Config>) -> Option<String> {
         "claude api key" => "provefab login claude --api-key",
         "codex login" | "codex guard hook" => "provefab login codex",
         "codex api login" | "codex api guard hook" => "provefab login codex --api-key",
-        "jev key" => {
+        // `cfg!` here, `is_keychain()` in `doctor`: the same answer on a real
+        // install, where the backend is chosen per system.
+        "jev key" if cfg!(target_os = "macos") => {
             return Some(format!(
                 "security add-generic-password -s {} -a provefab -w",
-                crate::commands::KEYCHAIN_SERVICE
+                crate::secrets::TYPESAFE_ITEM
+            ));
+        }
+        "jev key" => "provefab login jev",
+        "credentials" if check.detail.contains("chmod 600") => {
+            return Some(format!(
+                "chmod 600 {}",
+                crate::paths::Paths::from_env()
+                    .home
+                    .join(crate::secrets::FILE_NAME)
+                    .display()
             ));
         }
         name => {
@@ -1395,7 +1407,11 @@ mod tests {
             ),
             (
                 "jev key",
-                Some("security add-generic-password -s provefab-typesafe -a provefab -w"),
+                Some(if cfg!(target_os = "macos") {
+                    "security add-generic-password -s provefab-typesafe -a provefab -w"
+                } else {
+                    "provefab login jev"
+                }),
             ),
             (
                 "tracker acme/api",
@@ -1419,6 +1435,27 @@ mod tests {
             };
             assert_eq!(fix_for(&passed, Some(&config)), None, "{name}");
         }
+        // `credentials` is fixed by chmod only when the mode is the fault.
+        let credentials_fix = format!(
+            "chmod 600 {}",
+            crate::paths::Paths::from_env()
+                .home
+                .join(crate::secrets::FILE_NAME)
+                .display()
+        );
+        let open = failed(
+            "credentials",
+            "/h/credentials.toml can be read by group or others: run `chmod 600 /h/credentials.toml`",
+        );
+        assert_eq!(
+            fix_for(&open, Some(&config)).as_deref(),
+            Some(credentials_fix.as_str())
+        );
+        let malformed = failed(
+            "credentials",
+            "/h/credentials.toml is not valid TOML: fix it, or move it away and sign in again with `provefab login`",
+        );
+        assert_eq!(fix_for(&malformed, Some(&config)), None);
         let missing = failed("configuration", &format!("{NO_CONFIG} /h/provefab.toml"));
         assert_eq!(fix_for(&missing, None).as_deref(), Some("provefab init"));
         let invalid = failed(
