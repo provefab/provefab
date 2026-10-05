@@ -4,6 +4,7 @@
 
 pub mod adapters;
 mod paths;
+mod protected;
 mod shell;
 
 use std::path::{Path, PathBuf};
@@ -53,6 +54,30 @@ pub enum Decision {
 
 /// `cwd` resolves relative paths; `root` is the task's worktree.
 pub fn check(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
+    check_with(call, cwd, root, &protected::Protected::from_env(root))
+}
+
+/// `check`, with the Provefab homes whose secrets no stage may read.
+fn check_with(
+    call: &ToolCall,
+    cwd: &Path,
+    root: &Path,
+    protected: &protected::Protected,
+) -> Decision {
+    let secret = match call {
+        ToolCall::Shell { command } => shell::check_secret_reads(command, Some(cwd), protected),
+        ToolCall::ShellUnknownCwd { command } => {
+            shell::check_secret_reads(command, None, protected)
+        }
+        ToolCall::Read { paths, .. } => paths
+            .iter()
+            .find_map(|p| protected.check_word(&p.to_string_lossy(), Some(cwd), true))
+            .map_or(Decision::Allow, Decision::Deny),
+        _ => Decision::Allow,
+    };
+    if secret != Decision::Allow {
+        return secret;
+    }
     match call {
         ToolCall::Shell { command } => shell::check_command(command, cwd, root),
         ToolCall::ShellUnknownCwd { command } => shell::check_command_from(command, None, root),

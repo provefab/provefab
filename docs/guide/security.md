@@ -19,6 +19,9 @@ Every tool call of the three workers goes through the same guard, `provefab guar
 - `git` commands that write history or the remote (commit, push, tag, remote, config), `gh`, network tools (`curl`, `wget`, `nc`, `ssh`, `scp`) and package publishing commands;
 - when a shell command is ambiguous (subshell, `eval`, `sh` at the end of a pipe), it refuses;
 - in a review of a person's pull request, every write and every shell command but the read-only ones listed in [Pull request reviews](pr-review.md#what-a-review-does).
+- in every stage, reading Provefab's own secrets: `~/.provefab/credentials.toml`, `license.key`, the database (`provefab.db`) and the workers' sign-in directories (`claude/`, `claude-api/`, `codex/`, `codex-api/`), through a read tool or a shell command, symbolic links followed (the task's worktree stays readable); and running `security` or `provefab secrets`.
+
+Agents run as your account, so file permissions alone do not keep these files from them: these refusals are what keeps your keys out of an agent's context. Like the rest of the guard, they are a tripwire, not a sandbox: a script an agent writes and then runs is not read.
 
 Agents do not have push credentials either:
 - their environment is emptied of them;

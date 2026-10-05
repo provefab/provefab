@@ -98,3 +98,49 @@ fn the_review_marker_refuses_running_the_pull_requests_code() {
         "no marker, stage policy"
     );
 }
+
+/// Linux final review, finding 1: a stage reads none of the secrets in
+/// Provefab's home, whatever the tool; its worktree stays readable.
+#[test]
+fn a_stage_cannot_read_the_secrets_in_the_provefab_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().canonicalize().unwrap();
+    let home = user.join(".provefab");
+    let root = home.join("worktrees/3");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        home.join("credentials.toml"),
+        "linear = \"lin_api_SENTINEL\"\n",
+    )
+    .unwrap();
+    let env = [
+        ("HOME", user.to_str().unwrap()),
+        ("PROVEFAB_HOME", home.to_str().unwrap()),
+    ];
+    let decide = |input: String| {
+        let out = guard_with("claude-code", Some(&root), &input, &env);
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let creds = home.join("credentials.toml");
+    for input in [
+        format!(
+            r#"{{"tool_name":"Read","tool_input":{{"file_path":"{}"}}}}"#,
+            creds.display()
+        ),
+        r#"{"tool_name":"Bash","tool_input":{"command":"cat ~/.provefab/credentials.toml"}}"#
+            .to_string(),
+        r#"{"tool_name":"Bash","tool_input":{"command":"provefab secrets get anthropic"}}"#
+            .to_string(),
+        r#"{"tool_name":"Bash","tool_input":{"command":"security find-generic-password -s provefab-linear -w"}}"#
+            .to_string(),
+    ] {
+        let stdout = decide(input.clone());
+        assert!(stdout.contains(r#""permissionDecision":"deny""#), "{input}: {stdout}");
+        assert!(!stdout.contains("SENTINEL"), "{stdout}");
+    }
+    let own = format!(
+        r#"{{"tool_name":"Read","tool_input":{{"file_path":"{}"}}}}"#,
+        root.join("src").display()
+    );
+    assert_eq!(decide(own), "");
+}

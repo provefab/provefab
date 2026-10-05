@@ -100,6 +100,81 @@ pub(super) fn check_command_from(command: &str, start: Option<PathBuf>, root: &P
     Decision::Allow
 }
 
+/// Programs that walk a directory tree: given a Provefab home or a directory
+/// above it, they read its secrets.
+const RECURSIVE: [&str; 11] = [
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "tar", "zip", "cp",
+];
+
+/// Refuses, in every stage, a command that reads a secret in a Provefab home
+/// (any word that resolves there, redirects and `--opt=path` included, `cd`
+/// followed), runs `security`, or asks a Provefab binary for a secret
+/// (`secrets`, or `secrets get` after any program name, a renamed copy
+/// included). A command the main check cannot parse is left to it.
+pub(super) fn check_secret_reads(
+    command: &str,
+    start: Option<&Path>,
+    protected: &super::protected::Protected,
+) -> Decision {
+    let Ok(segments) = split_segments(command) else {
+        return Decision::Allow;
+    };
+    let mut cur = start.map(Path::to_path_buf);
+    for seg in segments {
+        let Ok(words) = shell_words::split(&seg.text) else {
+            continue;
+        };
+        let (argv, _) = split_redirects(&words);
+        let argv = strip_prefixes(&argv).unwrap_or_default();
+        let program = argv
+            .first()
+            .map(|f| basename(f).to_lowercase())
+            .unwrap_or_default();
+        if program == "security" {
+            return Decision::Deny(
+                "`security` reads the macOS Keychain; workers cannot run it".into(),
+            );
+        }
+        let asks_provefab = program.starts_with("provefab")
+            && argv[1..]
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .is_some_and(|a| a == "secrets");
+        if asks_provefab || words.windows(2).any(|w| w[0] == "secrets" && w[1] == "get") {
+            return Decision::Deny("workers cannot ask Provefab for a secret".into());
+        }
+        let recursive = RECURSIVE.contains(&program.as_str());
+        for word in &words {
+            let word = word.trim_start_matches(|c: char| c.is_ascii_digit() || "<>&|".contains(c));
+            let after_eq = word.split_once('=').map(|(_, v)| v);
+            for cand in std::iter::once(word).chain(after_eq) {
+                if cand.is_empty() {
+                    continue;
+                }
+                if let Some(why) = protected.check_word(cand, cur.as_deref(), recursive) {
+                    return Decision::Deny(why);
+                }
+            }
+        }
+        if program == "cd" || program == "pushd" {
+            cur = argv[1..]
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .map(|t| protected.expand(t))
+                .and_then(|t| {
+                    let t = PathBuf::from(t);
+                    if t.is_absolute() {
+                        Some(t)
+                    } else {
+                        cur.as_ref().map(|c| c.join(t))
+                    }
+                })
+                .filter(|t| !t.to_string_lossy().contains('$'));
+        }
+    }
+    Decision::Allow
+}
+
 /// Programs a review of a person's pull request may run (final review I1):
 /// they read files and history, and none runs code the pull request wrote.
 /// Spelled exactly: a path such as `./cat` could be the pull request's own file.

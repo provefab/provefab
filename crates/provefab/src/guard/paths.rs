@@ -91,7 +91,7 @@ pub(super) fn check_read(path: &Path, cwd: &Path, root: &Path) -> Decision {
 
 /// Canonicalises the longest existing ancestor (following symlinks), then
 /// re-appends the components that do not exist yet.
-fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
+pub(super) fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
     let mut existing = path.to_path_buf();
     let mut missing: Vec<OsString> = Vec::new();
     loop {
