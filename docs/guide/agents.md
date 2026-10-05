@@ -5,7 +5,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
 ## Rules
 
 - Never handle a secret: do not ask for, type, read, print or store a token, an API key or a password.
-- Never install Provefab, a worker CLI or the Provefab service. Never sign anything in. Never put a label on an issue. Never run `provefab run`, `provefab login`, `provefab service`, `gh auth login` or `security`.
+- Never install Provefab, a worker CLI or the Provefab service. Never sign anything in. Never put a label on an issue. Never run `provefab run`, `provefab login`, `provefab service`, `gh auth login`, `security` or `sudo`.
 - Run only the commands on this page. When one fails, report its error to the person instead of working around it.
 - Change `provefab.toml` only through `provefab init` and `provefab repos add`, unless the person asks you to edit it.
 
@@ -45,7 +45,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
    - Exit code 1: the file does not load, or cannot be read or written. Report the error, and go to step 4.
 
 4. **Check everything:** run `provefab doctor --json`. It prints one JSON object per line: `name`, `ok`, `detail`, and `fix` when a command fixes the problem.
-   - For the lines with `"ok": false` and a `fix`, show the person each distinct `fix` command once, in the order of the lines, to run in their own terminal. Several lines can share one `fix`: `provefab login codex` signs Codex in and also sets up the `codex guard hook` (the hook Provefab installs in its own Codex directory). Do not run a `fix` yourself: these commands sign in or store a key. The one exception is `provefab init`, the `fix` of a missing configuration: run step 2.
+   - For the lines with `"ok": false` and a `fix`, show the person each distinct `fix` command once, in the order of the lines, to run in their own terminal. Several lines can share one `fix`: `provefab login codex` signs Codex in and also sets up the `codex guard hook` (the hook Provefab installs in its own Codex directory). `provefab login jev` stores the Jev key. Do not run a `fix` yourself: these commands sign in or store a key. The one exception is `provefab init`, the `fix` of a missing configuration: run step 2.
    - For each line with `"ok": false` and no `fix`, show the person its `name` and `detail`. A missing tool (`git`, `gh`, `claude`, `codex`) is theirs to install.
    - Lines with `"ok": true` need nothing: they report what was found (tools and versions, gates, rules, prices, the repository's risk policy, and so on).
    - Show the person the `detail` of every line whose `detail` contains the word "warning" in any case, on `"ok": true` lines too, and of every line named `warning`. They need no command, and they are not failures.
@@ -57,7 +57,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
 
 5. **End with a short summary for the person:**
    - what is configured: the file's path, the models, the repository with its `base` and `gates` (or why it was not added), and that Provefab keeps its own clone;
-   - the commands left for them, to run in their own terminal: each distinct `fix` that still fails, `provefab run --dry-run` to preview how the open issues would be handled, `provefab service install --workers 1` to start the service, and the `provefab` label on an issue when they want Provefab to work on it;
+   - the commands left for them, to run in their own terminal: each distinct `fix` that still fails, `provefab run --dry-run` to preview how the open issues would be handled, `provefab service install --workers 1` to start the service (on Linux, also the `sudo loginctl enable-linger` command that `service install` prints), and the `provefab` label on an issue when they want Provefab to work on it;
    - when `doctor` still fails, what that means: at startup, Provefab drops each model whose worker (`claude`, `codex`) fails its `doctor` lines, and stops when no model is left; Provefab reads issues and opens pull requests through `gh`, so the `gh login` line has to pass first.
 
 ## Exit codes

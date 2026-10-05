@@ -2,7 +2,7 @@
 
 ## The service
 
-Provefab runs as a launchd agent: it starts at login and restarts if it stops.
+Provefab runs as a background service: a launchd agent on macOS, a systemd user service on Linux. It starts by itself and restarts if it stops.
 
 ```bash
 provefab service install --workers 1   # install or update, then (re)start
@@ -12,11 +12,13 @@ provefab service uninstall             # stop and remove the service
 
 `install` does three things:
 - it copies the current binary to `~/.provefab/bin/provefab`, so rebuilding the repository never breaks the service;
-- it writes `~/Library/LaunchAgents/dev.provefab.run.plist`;
+- it writes the service: `~/Library/LaunchAgents/dev.provefab.run.plist` on macOS, `~/.config/systemd/user/provefab.service` on Linux (then `systemctl --user daemon-reload`, `enable` and `restart`);
 - it freezes the `PATH` of the terminal you run it from.
 
+**On a Linux server**, a user service runs only while you are logged in, unless lingering is on for your account. `install` checks it and, when it is off, prints the command to run once with administrator rights: `sudo loginctl enable-linger <user>`. Provefab never runs `sudo` itself. `provefab doctor` shows a `lingering` line while the service is installed. Logs go to `~/.provefab/logs/run.log` on both systems (`journalctl --user -u provefab` shows systemd's own messages). The service file needs systemd 240 or newer (Ubuntu 20.04 ships 245).
+
 **Run `install` again** after:
-- installing a new Provefab version (the zip from the GitHub Releases page, or `cargo install --git https://github.com/provefab/provefab --tag <version> --locked provefab`);
+- installing a new Provefab version (the zip or the Linux archive from the GitHub Releases page, or `cargo install --git https://github.com/provefab/provefab --tag <version> --locked provefab`);
 - installing or moving a tool (`claude`, `codex`, `gh`, `cargo`...);
 - editing `provefab.toml`.
 
@@ -32,7 +34,7 @@ provefab run --once          # one pass: everything that can move, then exit
 provefab run --dry-run       # classification and routing only, nothing changes
 ```
 
-Ctrl-C and SIGTERM (what launchd sends when it stops the service) cancel the running stages and kill the agents' processes, so `provefab service uninstall` and a launchd stop end the run cleanly. Tasks resume at the next start, in the state they were in.
+Ctrl-C and SIGTERM (what launchd and systemd send when they stop the service) cancel the running stages and kill the agents' processes, so `provefab service uninstall` and a stop of the service end the run cleanly. Tasks resume at the next start, in the state they were in.
 
 ## Where things are
 
@@ -46,7 +48,8 @@ Ctrl-C and SIGTERM (what launchd sends when it stops the service) cancel the run
 | `~/.provefab/sessions/<id>/` | agent transcripts and check outputs, per stage |
 | `~/.provefab/post-merge/` | temporary detached worktrees, one per check step, removed when the step ends |
 | `~/.provefab/claude/`, `~/.provefab/codex/` | worker plan logins, kept apart from your own sessions |
-| `~/.provefab/claude-api/`, `~/.provefab/codex-api/` | worker API-key sign-ins (the Anthropic key itself stays in the Keychain) |
+| `~/.provefab/claude-api/`, `~/.provefab/codex-api/` | worker API-key sign-ins (the Anthropic key itself stays in the Keychain or `credentials.toml`) |
+| `~/.provefab/credentials.toml` | on Linux, the Jev key, the Anthropic key and the Jira and Linear credentials (mode 600) |
 | `~/.provefab/prices.json` | model prices, refreshed at most once a day from models.dev (LiteLLM as fallback) |
 | `~/.provefab/bin/provefab` | the binary the service runs |
 
@@ -88,7 +91,10 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do. `provefab
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `jev ... Unknown model` | `jev.model` without its patch number | use the full version, for example `jev-1.13.0` |
-| `jev key missing` | no key | `security add-generic-password -s provefab-typesafe -a provefab -w <key>` |
+| `jev key missing` | no key | `provefab login jev` (on macOS also `security add-generic-password -s provefab-typesafe -a provefab -w`) |
+| `credentials FAIL ... can be read by group or others` | `credentials.toml` was copied or edited with a wider mode | `chmod 600 ~/.provefab/credentials.toml` |
+| `lingering FAIL` (Linux) | the service stops when you log out and does not start at boot | `sudo loginctl enable-linger <user>`, once |
+| `service install` fails with `Failed to connect to bus` (Linux) | no user systemd session in this shell (for example after `su`) | log in over SSH as that user, or set `XDG_RUNTIME_DIR=/run/user/$(id -u)` |
 | `claude login FAIL` | Claude session missing or expired | `provefab login claude` |
 | `codex guard hook FAIL` | the Codex guard hook is not trusted | `provefab login codex` |
 | `claude api key FAIL` | a model has `auth = "api_key"` but no key is stored, or the API-key config dir does not read it | `provefab login claude --api-key` |

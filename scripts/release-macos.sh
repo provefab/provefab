@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Builds the provefab release for macOS: one universal binary (Apple Silicon + Intel),
 # signed with Developer ID (hardened runtime), notarized, zipped with the example config.
-# Output: dist/provefab-<version>-macos-universal.zip and its .sha256, to attach to the
-# GitHub release of the matching tag (gh release create v<version> dist/*.zip dist/*.sha256).
+# Output: dist/provefab-<version>-macos-universal.zip and its .sha256.
+#
+# Release order: bump the version, run this script, push main and the annotated
+# v<version> tag, then attach the zip to the release right away:
+#   gh release create v<version> dist/*.zip dist/*.zip.sha256 --verify-tag
+# (or `gh release upload v<version> ...` if CI created the release first). The
+# CI tag job (.github/workflows/ci.yml) builds the two Linux archives and adds
+# them to the same release; check that both are there before the landing release.
 #
 # Needs, once per machine:
 #   - a "Developer ID Application" certificate in the login keychain;

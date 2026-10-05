@@ -21,18 +21,18 @@ It reads these files through `gh` without cloning, or from your clone with `--pa
 
 ## Secrets
 
-No secret goes in `provefab.toml`.
+No secret goes in `provefab.toml`. On macOS, Provefab keeps its secrets in the Keychain. On Linux it keeps them in `~/.provefab/credentials.toml`: created with mode 600 (readable and writable by your account only), and refused by every command, `run` and `doctor` included, when its mode lets group or others read it (`chmod 600 ~/.provefab/credentials.toml` fixes it). The file is protected by its permissions, not encrypted. Environment variables take precedence on both systems.
 
 | Secret | Where |
 |---|---|
-| TypeSafe (Jev) key | `TYPESAFE_API_KEY` variable, otherwise the macOS Keychain: `security add-generic-password -s provefab-typesafe -a provefab -w <key>` |
+| TypeSafe (Jev) key | `TYPESAFE_API_KEY` variable, otherwise `provefab login jev` (macOS Keychain item `provefab-typesafe`, or `typesafe` in `credentials.toml`); on macOS `security add-generic-password -s provefab-typesafe -a provefab -w` also works |
 | Claude subscription login | `provefab login claude` (directory `~/.provefab/claude`) |
-| Anthropic API key | `provefab login claude --api-key`: stored in the Keychain (`provefab-anthropic`), read by Claude Code through `apiKeyHelper` (directory `~/.provefab/claude-api`) |
-| Codex (ChatGPT) subscription login | `provefab login codex` (directory `~/.provefab/codex`) |
+| Anthropic API key | `provefab login claude --api-key`: stored in the Keychain (`provefab-anthropic`) or as `anthropic` in `credentials.toml`; Claude Code asks Provefab for it through `apiKeyHelper` (directory `~/.provefab/claude-api`). If you move the `provefab` binary, run this login again |
+| Codex (ChatGPT) subscription login | `provefab login codex` (directory `~/.provefab/codex`); on Linux with a device code, entered in a browser on another machine |
 | OpenAI API key | `provefab login codex --api-key` (directory `~/.provefab/codex-api`) |
 | GitHub | `gh auth login` (Provefab uses `gh` and `git` with your permissions) |
-| Jira Cloud | `provefab login jira --site <site>`: e-mail and API token in the Keychain (`provefab-jira`); or `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` |
-| Linear | `provefab login linear`: personal API key in the Keychain (`provefab-linear`); or `PROVEFAB_LINEAR_KEY` |
+| Jira Cloud | `provefab login jira --site <site>`: e-mail and API token in the Keychain (`provefab-jira`) or under `[jira."<site>"]` in `credentials.toml`; or `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` |
+| Linear | `provefab login linear`: personal API key in the Keychain (`provefab-linear`) or as `linear` in `credentials.toml`; or `PROVEFAB_LINEAR_KEY` |
 
 **Plans for work.** Provefab runs the official CLIs with whatever login you give them. For professional use, prefer a business plan (Claude Team or Enterprise, ChatGPT Business) or API keys: consumer plans can restrict commercial use (for example, Anthropic's consumer terms for EEA and Swiss residents say "Non-commercial use only"). Check your plan's terms; this is not legal advice.
 

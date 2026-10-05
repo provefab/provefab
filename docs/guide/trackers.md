@@ -13,7 +13,7 @@ One Jira project or one Linear team per repository. Several repositories may sha
 ### Jira Cloud
 
 1. Create an API token for the Atlassian account Provefab will use: <https://id.atlassian.com/manage-profile/security/api-tokens>. The account needs to browse the project, comment and edit labels.
-2. Store it: `provefab login jira --site acme.atlassian.net`. Provefab asks for the account e-mail; the token is typed at the Keychain's own prompt (service `provefab-jira`, account `acme.atlassian.net`). The e-mail is kept as the item's comment, and an e-mail with non-ASCII characters is read correctly. `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` override it. A Keychain read (Jira or Linear) that takes longer than 10 seconds fails with an error that states the limit and names the item and the `provefab login` command to run.
+2. Store it: `provefab login jira --site acme.atlassian.net`. Provefab asks for the account e-mail, then the token: on macOS at the Keychain's own prompt (service `provefab-jira`, account `acme.atlassian.net`, the e-mail kept as the item's comment, read correctly with non-ASCII characters), on Linux without echo, into `[jira."acme.atlassian.net"]` of `~/.provefab/credentials.toml`. `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` override it. A Keychain read (Jira or Linear) that takes longer than 10 seconds fails with an error that states the limit and names the item and the `provefab login` command to run.
 3. In `provefab.toml`:
 
    ```toml
@@ -33,7 +33,7 @@ One Jira project or one Linear team per repository. Several repositories may sha
 ### Linear
 
 1. Create a personal API key in Linear's settings, for an account that is a member of the team.
-2. Store it: `provefab login linear` (service `provefab-linear`, account `provefab`). `PROVEFAB_LINEAR_KEY` overrides it.
+2. Store it: `provefab login linear` (Keychain service `provefab-linear`, account `provefab`; on Linux `linear` in `credentials.toml`). `PROVEFAB_LINEAR_KEY` overrides it.
 3. In `provefab.toml`:
 
    ```toml

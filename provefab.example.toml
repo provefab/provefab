@@ -1,7 +1,7 @@
 # Provefab configuration: copy this file to ~/.provefab/provefab.toml
 # (or to $PROVEFAB_HOME/provefab.toml), then adapt it.
 # Full reference: docs/guide/configuration.md
-# No secret here: the TypeSafe key goes in the macOS Keychain.
+# No secret here: the TypeSafe key goes in the macOS Keychain, or on Linux in credentials.toml (provefab login jev).
 
 [jev]
 model = "jev-1.13.0"            # full, pinned version; never "jev-latest"

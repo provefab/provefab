@@ -4,7 +4,7 @@ Provefab turns labelled GitHub, Jira or Linear issues into pull requests that ar
 
 [![Provefab in 12 seconds: a force push denied, a failing test and a blocking review sent back, then a pull request waiting for your review](docs/assets/provefab-loop.gif)](https://provefab.com/#demo)
 
-It runs on your Mac as a service. AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI, signed in with your own plan or your own API key, chosen per model), and Jev, TypeSafe's classifier, rates each issue so that every stage runs on the cheapest model that can do it: your plans first, then your API keys by price, with prices updated daily. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
+It runs as a service on your Mac or on a Linux server (x86_64 or ARM64). AI coding agents write the code (Claude Code, Codex or Pi, each through its own unmodified CLI, signed in with your own plan or your own API key, chosen per model), and Jev, TypeSafe's classifier, rates each issue so that every stage runs on the cheapest model that can do it: your plans first, then your API keys by price, with prices updated daily. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
 
 ```
 issue labelled `provefab`
@@ -26,30 +26,34 @@ The pull request then waits for your click. Optionally set `post_merge_checks` p
 
 ## Quick start
 
-Requirements: macOS, `git` and `gh` (signed in with `gh auth login`), and at least one worker: `claude` (Claude Code) or `codex` (Codex CLI).
+Requirements: macOS or Linux (x86_64, ARM64), `git` and `gh` (signed in with `gh auth login`), and at least one worker: `claude` (Claude Code) or `codex` (Codex CLI).
 
 With a coding agent, point it at [Set up Provefab with a coding agent](docs/guide/agents.md): it writes and checks the configuration, and leaves the sign-ins, keys and service to you.
 
 ```bash
 # 1. Install the binary (it embeds the worker plugins), one of:
-#    a. the installer (macOS, into ~/.local/bin, no sudo):
+#    a. the installer (macOS or Linux, into ~/.local/bin, no sudo):
 curl -fsSL https://provefab.com/install.sh | sh
-#    b. the signed and notarized build, no Rust needed: download
-#       provefab-<version>-macos-universal.zip from the Releases page, unzip, then
-sudo install -m 755 provefab /usr/local/bin/provefab
+#    b. a release archive, no Rust needed: from the Releases page,
+#       provefab-<version>-macos-universal.zip (signed and notarized) or
+#       provefab-<version>-linux-<x86_64|aarch64>.tar.gz (static), unpack, then
+mkdir -p ~/.local/bin && install -m 755 provefab ~/.local/bin/provefab
 #    c. from source, with Rust 1.96 or newer:
-cargo install --git https://github.com/provefab/provefab --tag v0.6.0 --locked provefab
+cargo install --git https://github.com/provefab/provefab --tag v0.7.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
+#    On a server without a browser, Claude shows a link and takes the code
+#    you paste; Codex shows a device code to enter on another machine.
 provefab login claude        # Claude plan login, in ~/.provefab/claude
 provefab login codex         # ChatGPT plan login, in ~/.provefab/codex, and trust for the guard hook
 # ...or your own API keys, for models with auth = "api_key" (see docs/guide/configuration.md):
 provefab login claude --api-key
 provefab login codex --api-key
 
-# 3. Jev (TypeSafe) key, in the macOS Keychain. Without a key, Provefab runs
-#    with cautious defaults.
-security add-generic-password -s provefab-typesafe -a provefab -w <your-key>
+# 3. Jev (TypeSafe) key: in the macOS Keychain, or on Linux in
+#    ~/.provefab/credentials.toml (readable by your account only, mode 600,
+#    not encrypted). Without a key, Provefab runs with cautious defaults.
+provefab login jev
 
 # 4. Configure, then check. `init` writes ~/.provefab/provefab.toml with the
 #    models of the workers it finds; `repos add` detects your checks
@@ -61,7 +65,8 @@ provefab doctor
 # 5. Try it without changing anything: classify and route the open issues.
 provefab run --dry-run
 
-# 6. Start the service (starts at login, restarts by itself).
+# 6. Start the service: a launchd agent on macOS, a systemd user service on
+#    Linux (on a server, also run the `sudo loginctl enable-linger` command it prints).
 provefab service install --workers 1
 ```
 
