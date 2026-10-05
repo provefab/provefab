@@ -395,7 +395,7 @@ fn secret_login(
         LoginWorker::Jev => (
             Entry::Typesafe,
             "your TypeSafe (Jev) API key",
-            "stored; Provefab reads it at its next start (`provefab service install` restarts the service)".to_string(),
+            "stored; Provefab reads it at its next start (if you run the service, `provefab service install` restarts it)".to_string(),
         ),
         LoginWorker::Claude | LoginWorker::Codex => {
             unreachable!("worker logins are handled in dispatch")

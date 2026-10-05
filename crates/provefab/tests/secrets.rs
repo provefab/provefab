@@ -182,3 +182,25 @@ fn the_home_a_command_creates_is_owner_only() {
     let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
 }
+
+/// Linux final review: the Jev login does not imply a service is installed.
+#[test]
+fn the_jev_login_speaks_of_the_service_only_if_you_run_it() {
+    let t = tempfile::tempdir().unwrap();
+    let (home, bin) = (t.path().join("home"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    // macOS stores at `security`'s prompt: a fake that accepts.
+    fake(&bin, "security", "exit 0");
+    let out = provefab(&home, &bin, &["login", "jev"], "ts_SENTINEL\n");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("stored; Provefab reads it at its next start (if you run the service, `provefab service install` restarts it)"),
+        "{text}"
+    );
+}
