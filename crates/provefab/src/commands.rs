@@ -916,6 +916,49 @@ pub fn claude_api_settings(config_dir: &Path, helper: &str) -> std::io::Result<(
     std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default())
 }
 
+/// Whether the API-key config dir's `apiKeyHelper` reads the stored key: a
+/// Provefab binary that still exists, running `secrets get anthropic`, or,
+/// only where the Keychain is the store, the `security` helper an install
+/// signed in before 0.7.0 keeps.
+fn key_helper_check(settings: &Path, keychain: bool) -> Result<(), String> {
+    let unread = || "the API-key config dir does not read the stored key".to_string();
+    let helper = std::fs::read_to_string(settings)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("apiKeyHelper")?.as_str().map(str::to_string))
+        .ok_or_else(unread)?;
+    let words = shell_words::split(&helper).map_err(|_| unread())?;
+    if keychain
+        && words.first().is_some_and(|w| w == "security")
+        && words.iter().any(|w| w == ANTHROPIC_ITEM)
+    {
+        return Ok(());
+    }
+    let is_assignment = |w: &String| {
+        w.split_once('=').is_some_and(|(n, _)| {
+            !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let command: Vec<&str> = words
+        .iter()
+        .skip_while(|w| is_assignment(w))
+        .map(String::as_str)
+        .collect();
+    let expected: Vec<&str> = HELPER_COMMAND.split(' ').collect();
+    match command.split_first() {
+        Some((exe, rest)) if rest == expected.as_slice() => {
+            if Path::new(exe).is_file() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the key helper runs {exe}, which is not there any more"
+                ))
+            }
+        }
+        _ => Err(unread()),
+    }
+}
+
 /// `TYPESAFE_API_KEY`, else the stored key (spec §2.3, Linux spec §3).
 pub async fn typesafe_key(
     secrets: &Secrets,
@@ -1192,24 +1235,13 @@ pub async fn doctor(
             Ok(false) => Err(format!("no {what}: {fix}")),
             Err(e) => Err(crate::tracker::store_error(e, fix)),
         };
-        // An install signed in before 0.7.0 keeps its `security` helper, which
-        // reads the Keychain: it counts only where the Keychain is the store.
-        let helper = std::fs::read_to_string(paths.claude_config_api().join("settings.json"))
-            .is_ok_and(|t| {
-                t.contains(HELPER_COMMAND)
-                    || (tools.secrets.is_keychain() && t.contains(ANTHROPIC_ITEM))
-            });
+        let helper = key_helper_check(
+            &paths.claude_config_api().join("settings.json"),
+            tools.secrets.is_keychain(),
+        );
         checks.push(check(
             "claude api key",
-            key.and_then(|k| {
-                if helper {
-                    Ok(k)
-                } else {
-                    Err(format!(
-                        "the API-key config dir does not read the stored key: {fix}"
-                    ))
-                }
-            }),
+            key.and_then(|k| helper.map(|()| k).map_err(|e| format!("{e}: {fix}"))),
         ));
     }
     if uses(WorkerKind::Codex) {
@@ -1997,7 +2029,7 @@ auth = "api_key"
         .unwrap();
         claude_api_settings(
             &Paths::new(d).claude_config_api(),
-            "PROVEFAB_HOME=/h /bin/provefab secrets get anthropic",
+            &api_key_helper(&tools.claude, d).unwrap(),
         )
         .unwrap();
         let checks = doctor(&tools, &config, &Paths::new(d), None).await;
@@ -2119,12 +2151,32 @@ auth = "api_key"
             .unwrap();
         claude_api_settings(
             &paths.claude_config_api(),
-            "PROVEFAB_HOME=/h /bin/provefab secrets get anthropic",
+            &api_key_helper(&tools.claude, d).unwrap(),
         )
         .unwrap();
         let found = get(&doctor(&tools, &config, &paths, None).await);
         assert!(found.ok, "{found:?}");
         assert!(!found.detail.contains("SENTINEL"), "{found:?}");
+        // Linux final review: a helper naming a binary that moved away fails,
+        // with the login that writes a new one.
+        let gone = d.join("moved/provefab");
+        claude_api_settings(
+            &paths.claude_config_api(),
+            &api_key_helper(&gone, d).unwrap(),
+        )
+        .unwrap();
+        let moved = get(&doctor(&tools, &config, &paths, None).await);
+        assert!(!moved.ok, "{moved:?}");
+        assert!(
+            moved.detail.contains(&gone.display().to_string())
+                && moved.detail.contains("provefab login claude --api-key"),
+            "{moved:?}"
+        );
+        claude_api_settings(
+            &paths.claude_config_api(),
+            &api_key_helper(&tools.claude, d).unwrap(),
+        )
+        .unwrap();
         // No key yet: the jev line names the Linux fix.
         let jev = doctor(&tools, &config, &paths, None)
             .await
