@@ -571,6 +571,9 @@ pub fn fix_for(check: &Check, config: Option<&Config>) -> Option<String> {
         "codex api login" | "codex api guard hook" => "provefab login codex --api-key",
         // `cfg!` here, `is_keychain()` in `doctor`: the same answer on a real
         // install, where the backend is chosen per system.
+        // Only a missing key: a store that cannot be read is fixed on the
+        // `credentials` line, and the login would be refused the same way.
+        "jev key" if !check.detail.starts_with("missing") => return None,
         "jev key" if cfg!(target_os = "macos") => {
             return Some(format!(
                 "security add-generic-password -s {} -a provefab -w",
@@ -1415,14 +1418,6 @@ mod tests {
                 "codex api guard hook",
                 Some("provefab login codex --api-key"),
             ),
-            (
-                "jev key",
-                Some(if cfg!(target_os = "macos") {
-                    "security add-generic-password -s provefab-typesafe -a provefab -w"
-                } else {
-                    "provefab login jev"
-                }),
-            ),
             ("lingering", Some(lingering_fix.as_str())),
             (
                 "tracker acme/api",
@@ -1446,6 +1441,23 @@ mod tests {
             };
             assert_eq!(fix_for(&passed, Some(&config)), None, "{name}");
         }
+        // `jev key` has a fix only when the key is missing; a store that
+        // cannot be read has its own fix, on the `credentials` line.
+        let jev_fix = if cfg!(target_os = "macos") {
+            "security add-generic-password -s provefab-typesafe -a provefab -w"
+        } else {
+            "provefab login jev"
+        };
+        let missing = failed(
+            "jev key",
+            "missing: set TYPESAFE_API_KEY or run `provefab login jev`",
+        );
+        assert_eq!(fix_for(&missing, Some(&config)).as_deref(), Some(jev_fix));
+        let refused = failed(
+            "jev key",
+            "/h/credentials.toml can be read by group or others: run `chmod 600 /h/credentials.toml`",
+        );
+        assert_eq!(fix_for(&refused, Some(&config)), None);
         // `credentials` is fixed by chmod only when the mode is the fault.
         let credentials_fix = format!(
             "chmod 600 {}",

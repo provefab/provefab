@@ -168,6 +168,17 @@ fn run_and_doctor_refuse_a_file_open_to_others() {
         "{text}"
     );
     assert!(!text.contains("SENTINEL"), "{text}");
+    // The `jev key` line shows why the store was refused, and no login fix:
+    // `provefab login jev` would be refused the same way.
+    let jev = text
+        .lines()
+        .find(|l| l.contains("\"jev key\""))
+        .unwrap_or_default();
+    assert!(
+        jev.contains("\"ok\":false") && jev.contains("chmod 600"),
+        "{text}"
+    );
+    assert!(!jev.contains("\"fix\""), "{text}");
 }
 
 /// Linux final review (C1): a command that creates Provefab's home creates

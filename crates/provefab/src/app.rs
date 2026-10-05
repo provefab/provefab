@@ -317,22 +317,35 @@ fn load_config(paths: &Paths) -> anyhow::Result<Config> {
         .map_err(|e| anyhow::anyhow!(crate::rules::redact_credentials(&format!("{e:#}"))))
 }
 
-async fn oracle(config: &Config, secrets: &Secrets) -> anyhow::Result<Option<JevOracle>> {
+/// The Jev client: `Ok(None)` without a key, the inner `Err` when the store
+/// holding the key could not be read.
+async fn jev_client(
+    config: &Config,
+    secrets: &Secrets,
+) -> anyhow::Result<Result<Option<JevOracle>, crate::secrets::SecretError>> {
     let key = match commands::typesafe_key(secrets, &crate::tracker::process_env).await {
         Ok(Some(key)) => key,
+        Ok(None) => return Ok(Ok(None)),
+        Err(e) => return Ok(Err(e)),
+    };
+    let client = jev::JevClient::new(key, config.jev.model.clone(), crate::jevq::DEADLINE)?;
+    Ok(Ok(Some(JevOracle { client })))
+}
+
+async fn oracle(config: &Config, secrets: &Secrets) -> anyhow::Result<Option<JevOracle>> {
+    match jev_client(config, secrets).await? {
+        Ok(Some(o)) => Ok(Some(o)),
         Ok(None) => {
             eprintln!(
                 "provefab: no TypeSafe key; Jev fallbacks apply (standard tier, no loop detector, no triage)"
             );
-            return Ok(None);
+            Ok(None)
         }
         Err(e) => {
             eprintln!("provefab: {e}; Jev fallbacks apply");
-            return Ok(None);
+            Ok(None)
         }
-    };
-    let client = jev::JevClient::new(key, config.jev.model.clone(), crate::jevq::DEADLINE)?;
-    Ok(Some(JevOracle { client }))
+    }
 }
 
 fn gh() -> Gh {
@@ -624,9 +637,11 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                 secrets: Secrets::system(&paths.home),
                 ..Tools::default()
             };
-            let (oracle, jev_failed) = match oracle(&config, &tools.secrets).await {
-                Ok(o) => (o, None),
-                Err(e) if json => (None, Some(e)),
+            let (oracle, jev_failed, store_failed) = match jev_client(&config, &tools.secrets).await
+            {
+                Ok(Ok(o)) => (o, None, None),
+                Ok(Err(e)) => (None, None, Some(e)),
+                Err(e) if json => (None, Some(e), None),
                 Err(e) => return Err(e),
             };
             let mut checks =
@@ -643,6 +658,13 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             );
             if let Some(e) = &jev_failed {
                 setup::jev_unavailable(&mut checks, e);
+            }
+            // The key's store could not be read: say why on the `jev key`
+            // line, whose fix then is the `credentials` line's.
+            if let Some(e) = &store_failed {
+                for c in checks.iter_mut().filter(|c| c.name == "jev key") {
+                    c.detail = e.to_string();
+                }
             }
             if json {
                 // Plan decision 6: every finding is a line.
