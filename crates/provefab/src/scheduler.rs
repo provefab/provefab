@@ -130,10 +130,12 @@ pub fn local_day(at: i64) -> i64 {
     (at + utc_offset(at)).div_euclid(86_400)
 }
 
-// `time_t` and `c_long` are `i64` on 64-bit macOS and Linux.
+// `time_t` and `c_long` are `i64` on 64-bit macOS and Linux. The `time_t`
+// alias itself is deprecated on musl (its width changed in musl 1.2), so the
+// value stays an `i64`, which `localtime_r` takes on every 64-bit target.
 #[allow(clippy::unnecessary_cast)]
 fn utc_offset(at: i64) -> i64 {
-    let t = at as libc::time_t;
+    let t: i64 = at;
     // SAFETY: `localtime_r` reads `t` and writes only into `tm`, which we
     // own; an all-zero `tm` is a valid value of this plain C struct.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
