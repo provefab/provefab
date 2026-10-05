@@ -74,7 +74,7 @@ Each finding in the PR's **Review notes** has a key (`F1`, `F2`...). To record w
 
 `provefab export [--repo <owner/name>] [--since YYYY-MM-DD] [--with-text]` prints the record as JSON Lines, one line per event and one per finding. `--since` keeps events from that date and the findings of reviews from that date; `--repo` matches any case. By default free text (plans, finding text, your reasons, ignored command lines, reproduction and gate commands, error exits) is replaced by its length and SHA-256, and an event this version does not know exports `{"unknown": true}` instead of its payload. `--with-text` includes it. File paths (finding locations, risk-classified paths) and model names are exported as is. Command output is never exported.
 
-`provefab prune --before YYYY-MM-DD [--yes]` deletes the record of finished tasks last updated before that date. Without `--yes` it lists the tasks and deletes nothing.
+`provefab prune --before YYYY-MM-DD [--yes]` deletes the record of finished tasks last updated before that date. It also deletes maintenance runs that finished before that date. It keeps the latest run of each repository and kind, and any run that opened a pull request (later rule proposals read those runs to remember refused rules and the numbers already used). Without `--yes` it lists the tasks, prints how many maintenance runs it would delete, and deletes nothing.
 
 ## Reviewing a pull request a person wrote
 

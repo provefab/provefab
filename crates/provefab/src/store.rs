@@ -15,6 +15,19 @@ use crate::post_merge::{CheckState, FailedCommand, FailureKind, bounded};
 use crate::record::{Disposition, Event, FindingRow, RULE_VERSION, Rule, StoredEvent};
 use crate::task::{TaskKind, TaskMode, TaskState};
 
+/// Which maintenance runs prune deletes (one `?`: the cutoff). The latest run
+/// of each repository and kind is the one `last_maintenance_run` returns. A
+/// macro so queries stay `&'static str` through `concat!`.
+macro_rules! prunable_maintenance {
+    () => {
+        "finished_at IS NOT NULL AND finished_at < ? \
+         AND pr_url IS NULL \
+         AND id NOT IN (SELECT (SELECT m2.id FROM maintenance_runs m2 \
+             WHERE LOWER(m2.repo) = LOWER(m.repo) AND m2.kind = m.kind \
+             ORDER BY m2.started_at DESC, m2.id DESC LIMIT 1) FROM maintenance_runs m)"
+    };
+}
+
 /// A finding `f` belongs to the last review round of its pass: the highest
 /// round of the pass's `review` events, so a final review without findings
 /// still defines the round (spec section 3.3). A macro so queries stay
@@ -1219,6 +1232,37 @@ impl Store {
         Ok((events, findings))
     }
 
+    /// How many maintenance runs `prune_maintenance_runs(before)` would delete.
+    pub async fn prunable_maintenance_runs(&self, before: i64) -> Result<u64, StoreError> {
+        let row = sqlx::query(concat!(
+            "SELECT COUNT(*) AS n FROM maintenance_runs WHERE ",
+            prunable_maintenance!()
+        ))
+        .bind(before)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("n") as u64)
+    }
+
+    /// Deletes the maintenance runs that finished before `before`, in one
+    /// transaction; returns how many. Kept: the latest run of each repository
+    /// and kind (as `last_maintenance_run` orders them), any run with a pull
+    /// request (later proposals read it, whatever its age) and any run that
+    /// has not finished.
+    pub async fn prune_maintenance_runs(&self, before: i64) -> Result<u64, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let n = sqlx::query(concat!(
+            "DELETE FROM maintenance_runs WHERE ",
+            prunable_maintenance!()
+        ))
+        .bind(before)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(n)
+    }
+
     /// Worker runs (stage runs with a model, not gates) started at or after `since`,
     /// across all tasks (the daily budget, D53).
     pub async fn worker_runs_since(&self, since: i64) -> Result<u32, StoreError> {
@@ -1876,6 +1920,59 @@ mod tests {
         );
         assert_eq!(s.maintenance_runs(None).await.unwrap().len(), 3);
         assert!(s.maintenance_runs(Some("x/y")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_maintenance_runs_keeps_the_latest_per_repository_and_kind() {
+        let (_d, s) = store().await;
+        let run = |repo: &str, kind: &str, at: i64, pr: Option<&str>, done: bool| MaintenanceRun {
+            id: 0,
+            repo: repo.into(),
+            kind: kind.into(),
+            started_at: at,
+            finished_at: done.then_some(at + 5),
+            model_id: None,
+            cost_usd: None,
+            quota_units: None,
+            outcome: "ok".into(),
+            pr_url: pr.map(String::from),
+            detail: None,
+        };
+        for r in [
+            run("O/R", "periodic", 10, None, true),
+            run("O/R", "periodic", 20, None, true),
+            run("O/R", "periodic", 30, None, true),
+            run(
+                "o/r",
+                "rules",
+                15,
+                Some("https://github.com/o/r/pull/7"),
+                true,
+            ),
+            run("o/r", "rules", 25, None, true),
+            run("x/y", "periodic", 12, None, true),
+            run("O/R", "periodic", 5, None, false),
+        ] {
+            s.record_maintenance_run(&r).await.unwrap();
+        }
+        assert_eq!(s.prunable_maintenance_runs(21).await.unwrap(), 1);
+        assert_eq!(s.prunable_maintenance_runs(1000).await.unwrap(), 2);
+        assert_eq!(s.prune_maintenance_runs(1000).await.unwrap(), 2);
+        let mut left: Vec<i64> = s
+            .maintenance_runs(None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.started_at)
+            .collect();
+        left.sort();
+        assert_eq!(left, [5, 12, 15, 25, 30]);
+        let kept = s.maintenance_runs(Some("o/r")).await.unwrap();
+        assert!(
+            kept.iter()
+                .any(|r| r.pr_url.as_deref() == Some("https://github.com/o/r/pull/7"))
+        );
+        assert_eq!(s.prune_maintenance_runs(1000).await.unwrap(), 0);
     }
 
     #[tokio::test]
