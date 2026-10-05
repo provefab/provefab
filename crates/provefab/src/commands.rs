@@ -1181,11 +1181,15 @@ pub async fn doctor(
         let key = match tools.secrets.has(&Name::Anthropic).await {
             Ok(true) => Ok(what.clone()),
             Ok(false) => Err(format!("no {what}: {fix}")),
-            Err(e) => Err(format!("{e}: {fix}")),
+            Err(e) => Err(crate::tracker::store_error(e, fix)),
         };
-        // An install signed in before 0.7.0 keeps its `security` helper on macOS.
+        // An install signed in before 0.7.0 keeps its `security` helper, which
+        // reads the Keychain: it counts only where the Keychain is the store.
         let helper = std::fs::read_to_string(paths.claude_config_api().join("settings.json"))
-            .is_ok_and(|t| t.contains(HELPER_COMMAND) || t.contains(ANTHROPIC_ITEM));
+            .is_ok_and(|t| {
+                t.contains(HELPER_COMMAND)
+                    || (tools.secrets.is_keychain() && t.contains(ANTHROPIC_ITEM))
+            });
         checks.push(check(
             "claude api key",
             key.and_then(|k| {
@@ -2105,6 +2109,62 @@ auth = "api_key"
             .find(|c| c.name == "jev key")
             .unwrap();
         assert!(jev.detail.contains("provefab login jev"), "{jev:?}");
+    }
+
+    /// A refused file names only its own fix; the old `security` helper
+    /// counts on the Keychain only.
+    #[tokio::test]
+    async fn doctor_api_key_line_names_the_right_fix_per_store() {
+        use crate::secrets::{Name, Secrets};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let file = Tools {
+            git: fake(d, "git", "echo 'git version 2.50'"),
+            gh: fake(d, "gh", "echo 'gh version 2.80'"),
+            claude: fake(d, "claude", "echo '2.1.281 (Claude Code)'"),
+            codex: d.join("missing-codex"),
+            pi: d.join("missing-pi"),
+            secrets: Secrets::file(d),
+        };
+        let config = Config::from_toml_str(
+            "[jev]\nmodel = \"jev-1.13.0\"\n[[models]]\nid = \"c\"\nworker = \"claude-code\"\nmodel = \"sonnet\"\ntier = \"standard\"\nauth = \"api_key\"\n",
+        )
+        .unwrap();
+        let paths = Paths::new(d);
+        let key = |checks: Vec<Check>| {
+            checks
+                .into_iter()
+                .find(|c| c.name == "claude api key")
+                .unwrap()
+        };
+        file.secrets
+            .set_values(&[(Name::Anthropic, "sk-ant-SENTINEL")])
+            .unwrap();
+        let old = "security find-generic-password -s provefab-anthropic -a provefab -w";
+        claude_api_settings(&paths.claude_config_api(), old).unwrap();
+        let on_file = key(doctor(&file, &config, &paths, None).await);
+        assert!(
+            !on_file.ok && on_file.detail.contains("does not read the stored key"),
+            "{on_file:?}"
+        );
+        let keychain = Tools {
+            secrets: Secrets::keychain(fake(d, "security", "exit 0")),
+            ..file.clone()
+        };
+        let on_keychain = key(doctor(&keychain, &config, &paths, None).await);
+        assert!(on_keychain.ok, "{on_keychain:?}");
+        let path = d.join(crate::secrets::FILE_NAME);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let open = key(doctor(&file, &config, &paths, None).await);
+        assert_eq!(
+            open.detail,
+            format!(
+                "{} can be read by group or others: run `chmod 600 {}`",
+                path.display(),
+                path.display()
+            )
+        );
     }
 
     #[test]

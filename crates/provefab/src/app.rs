@@ -448,13 +448,11 @@ async fn build_pipeline(
     store: Store,
     policy: Arc<dyn ReviewPolicy>,
 ) -> anyhow::Result<RunPipeline> {
-    let checks = commands::doctor(
-        &Tools::default(),
-        &config,
-        paths,
-        oracle.as_ref().map(|o| &o.client),
-    )
-    .await;
+    let tools = Tools {
+        secrets: Secrets::system(&paths.home),
+        ..Tools::default()
+    };
+    let checks = commands::doctor(&tools, &config, paths, oracle.as_ref().map(|o| &o.client)).await;
     let failed = |name: &str| checks.iter().any(|c| c.name == name && !c.ok);
     if let Some(c) = checks.iter().find(|c| c.name == "jev" && !c.ok) {
         eprintln!(
@@ -615,7 +613,10 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                     println!("FAIL {:<22} {}", c.name, c.detail);
                 }
             }
-            let tools = Tools::default();
+            let tools = Tools {
+                secrets: Secrets::system(&paths.home),
+                ..Tools::default()
+            };
             let (oracle, jev_failed) = match oracle(&config, &tools.secrets).await {
                 Ok(o) => (o, None),
                 Err(e) if json => (None, Some(e)),

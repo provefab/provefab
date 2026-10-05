@@ -161,7 +161,7 @@ fn base64(bytes: &[u8]) -> String {
 
 /// A store error for a caller whose fix is `fix`: a Keychain timeout gets
 /// the fix appended; a refused or malformed file already names its own.
-fn store_error(e: SecretError, fix: &str) -> String {
+pub(crate) fn store_error(e: SecretError, fix: &str) -> String {
     match e {
         SecretError::TimedOut { .. } => format!("{e}: {fix}"),
         other => other.to_string(),
