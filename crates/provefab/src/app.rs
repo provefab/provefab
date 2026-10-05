@@ -512,6 +512,13 @@ async fn build_pipeline(
 
 async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
     let paths = Paths::from_env();
+    // A home this command creates is its owner's only; `doctor` and the
+    // key helper only read.
+    if !matches!(cmd, Cmd::Doctor { .. } | Cmd::Secrets { .. }) {
+        paths
+            .ensure_home()
+            .with_context(|| format!("creating {}", paths.home.display()))?;
+    }
     match cmd {
         Cmd::Guard { .. } => unreachable!("handled before the runtime starts"),
         Cmd::Run {

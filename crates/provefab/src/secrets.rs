@@ -15,6 +15,10 @@ pub const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// The secrets file in Provefab's home, on systems without the Keychain.
 pub const FILE_NAME: &str = "credentials.toml";
 
+/// Beside the file: writers hold it (`flock`) around read, change, write, so
+/// two logins at once each keep the other's entry.
+pub const LOCK_NAME: &str = ".credentials.lock";
+
 /// Keychain services (`security ... -s <service>`), unchanged since 0.1.
 pub const TYPESAFE_ITEM: &str = "provefab-typesafe";
 pub const ANTHROPIC_ITEM: &str = "provefab-anthropic";
@@ -97,6 +101,12 @@ pub enum SecretError {
     KeychainWrite,
     #[error("nothing was entered; nothing was stored")]
     NothingEntered,
+    #[error("{path} is not a regular file: move it away, then sign in again with `provefab login`")]
+    NotAFile { path: String },
+    #[error(
+        "could not turn off echo on this terminal, so nothing was read; pipe the value in instead"
+    )]
+    EchoUnavailable,
 }
 
 fn io_error(path: &Path, e: &std::io::Error) -> SecretError {
@@ -179,36 +189,82 @@ fn decode_hex_utf8(digits: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// The file's table; `None` when there is no file. Refuses a mode that
-/// grants anything to group or others before reading a byte (spec §3).
+/// The file's table; `None` when there is no file. Opened once, without
+/// blocking (a FIFO would wait for a writer), and checked on that handle:
+/// only a regular file, and refused when its mode grants anything to group or
+/// others, before a byte is read (spec §3).
 fn read_table(path: &Path) -> Result<Option<toml::Table>, SecretError> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = match std::fs::metadata(path) {
+    use std::io::Read;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let shown = || path.display().to_string();
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io_error(path, &e)),
-        Ok(m) => m,
+        Ok(f) => f,
     };
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(SecretError::OpenToOthers {
-            path: path.display().to_string(),
-        });
+    let meta = file.metadata().map_err(|e| io_error(path, &e))?;
+    if !meta.is_file() {
+        return Err(SecretError::NotAFile { path: shown() });
     }
-    let text = std::fs::read_to_string(path).map_err(|e| io_error(path, &e))?;
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(SecretError::OpenToOthers { path: shown() });
+    }
+    let mut text = String::new();
+    (&file)
+        .read_to_string(&mut text)
+        .map_err(|e| io_error(path, &e))?;
     toml::from_str::<toml::Table>(&text)
         .map(Some)
-        .map_err(|_| SecretError::Malformed {
-            path: path.display().to_string(),
-        })
+        .map_err(|_| SecretError::Malformed { path: shown() })
 }
 
-/// Temporary file in the same directory, created 0600, then renamed over
-/// the file: a reader sees the old file or the new one, never a part.
+/// An exclusive `flock` on `<dir>/.credentials.lock`, released when dropped.
+struct WriteLock {
+    _file: std::fs::File,
+}
+
+impl WriteLock {
+    fn take(dir: &Path) -> Result<Self, SecretError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = dir.join(LOCK_NAME);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| io_error(&path, &e))?;
+        // SAFETY: flock only takes a lock on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io_error(&path, &std::io::Error::last_os_error()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// A suffix no other writer picks: the temporary file is created with
+/// `create_new`, so a name already taken is never written through.
+fn random_suffix() -> String {
+    use std::hash::BuildHasher;
+    let seed = (std::process::id(), std::time::SystemTime::now());
+    format!(
+        "{:016x}",
+        std::collections::hash_map::RandomState::new().hash_one(seed)
+    )
+}
+
+/// Temporary file in the same directory, created 0600 with a random name,
+/// then renamed over the file and the directory synced: a reader sees the old
+/// file or the new one, never a part, and the rename survives a crash.
 fn write_atomic(path: &Path, text: &str) -> Result<(), SecretError> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).map_err(|e| io_error(dir, &e))?;
-    let tmp = dir.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let tmp = dir.join(format!(".{FILE_NAME}.{}.tmp", random_suffix()));
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -217,7 +273,8 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), SecretError> {
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
     };
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -227,29 +284,30 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), SecretError> {
 
 /// Echo off on a terminal until dropped (decision 8).
 struct EchoOff {
+    fd: i32,
     saved: libc::termios,
 }
 
 impl EchoOff {
-    fn new() -> Option<Self> {
+    fn new(fd: i32) -> Option<Self> {
         let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: tcgetattr fills the struct when it returns 0; fd 0 is stdin.
-        if unsafe { libc::tcgetattr(0, t.as_mut_ptr()) } != 0 {
+        // SAFETY: tcgetattr fills the struct when it returns 0.
+        if unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } != 0 {
             return None;
         }
         // SAFETY: initialised by the successful tcgetattr above.
         let saved = unsafe { t.assume_init() };
         let mut quiet = saved;
         quiet.c_lflag &= !libc::ECHO;
-        // SAFETY: a valid termios for fd 0, obtained from tcgetattr.
-        (unsafe { libc::tcsetattr(0, libc::TCSANOW, &quiet) } == 0).then_some(Self { saved })
+        // SAFETY: a valid termios for `fd`, obtained from tcgetattr.
+        (unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } == 0).then_some(Self { fd, saved })
     }
 }
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
         // SAFETY: restores the attributes read in `new`.
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.saved) };
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
     }
 }
 
@@ -259,9 +317,23 @@ pub fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(0) == 1 }
 }
 
-/// One line from `input`, trimmed, with echo off while a person types.
-fn read_hidden(input: &mut dyn BufRead, tty: bool) -> Result<String, SecretError> {
-    let echo = if tty { EchoOff::new() } else { None };
+/// Prompts for `what`, then reads one line from `input`, trimmed. On a
+/// terminal (`tty`, descriptor `fd`) echo is off while the person types; when
+/// it cannot be turned off, nothing is read, so a value is never shown under
+/// "(not shown)".
+fn read_hidden_on(
+    input: &mut dyn BufRead,
+    tty: bool,
+    fd: i32,
+    what: &str,
+) -> Result<String, SecretError> {
+    let echo = if tty {
+        Some(EchoOff::new(fd).ok_or(SecretError::EchoUnavailable)?)
+    } else {
+        None
+    };
+    print!("Paste {what} (not shown), then press Enter: ");
+    let _ = std::io::stdout().flush();
     let mut line = String::new();
     let read = input.read_line(&mut line);
     drop(echo);
@@ -401,6 +473,9 @@ impl Secrets {
         let Self::File { path } = self else {
             return Err(SecretError::KeychainWrite);
         };
+        let dir = path.parent().unwrap_or(Path::new("."));
+        crate::paths::create_private_dir_all(dir).map_err(|e| io_error(dir, &e))?;
+        let _lock = WriteLock::take(dir)?;
         let mut table = read_table(path)?.unwrap_or_default();
         for (name, value) in values {
             let keys = name.keys();
@@ -459,9 +534,7 @@ impl Secrets {
                 }
             }
             Self::File { .. } => {
-                print!("Paste {what} (not shown), then press Enter: ");
-                let _ = std::io::stdout().flush();
-                let value = read_hidden(input, tty)?;
+                let value = read_hidden_on(input, tty, 0, what)?;
                 if value.is_empty() {
                     return Err(SecretError::NothingEntered);
                 }
@@ -548,12 +621,13 @@ mod tests {
         // The Jira fields are a table per site, as spec §3 names them.
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("[jira.\"acme.atlassian.net\"]"), "{text}");
-        // No temporary file is left beside it.
-        let names: Vec<String> = std::fs::read_dir(dir.path())
+        // No temporary file is left beside it, only the lock that orders writers.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec![FILE_NAME.to_string()]);
+        names.sort();
+        assert_eq!(names, vec![LOCK_NAME.to_string(), FILE_NAME.to_string()]);
     }
 
     #[tokio::test]
@@ -826,5 +900,98 @@ esac"#;
             panic!("expected the file backend")
         };
         assert_eq!(path, PathBuf::from("/h/.provefab/credentials.toml"));
+    }
+
+    /// C1 review: the mode is checked on the handle that is read, and only a
+    /// regular file is read (a FIFO would block, a directory cannot hold one).
+    #[test]
+    fn only_a_regular_file_is_read() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C path; mkfifo has no other precondition.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let want = SecretError::NotAFile {
+            path: path.display().to_string(),
+        };
+        let home = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(Secrets::file(&home).preflight()));
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reading a FIFO must not block");
+        assert_eq!(got, Err(want.clone()));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(Secrets::file(dir.path()).preflight(), Err(want));
+    }
+
+    /// C1 review: a home Provefab creates for the file is its owner's only;
+    /// an existing directory keeps its mode.
+    #[test]
+    fn a_missing_home_is_created_for_its_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("new/.provefab");
+        Secrets::file(&home)
+            .set_values(&[(Name::Linear, "x")])
+            .unwrap();
+        assert_eq!(mode(&home), 0o700);
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Secrets::file(&existing)
+            .set_values(&[(Name::Linear, "x")])
+            .unwrap();
+        assert_eq!(mode(&existing), 0o755);
+    }
+
+    /// C1 review: writers in parallel (two logins, a login and a service
+    /// install) each keep the others' entries.
+    #[tokio::test]
+    async fn concurrent_writes_keep_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let home = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    Secrets::file(&home)
+                        .set_values(&[(Name::JiraToken(format!("s{i}.atlassian.net")), "t")])
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap().unwrap();
+        }
+        let s = Secrets::file(dir.path());
+        for i in 0..8 {
+            let site = format!("s{i}.atlassian.net");
+            assert_eq!(
+                s.get(&Name::JiraToken(site)).await.unwrap().as_deref(),
+                Some("t"),
+                "{i}"
+            );
+        }
+    }
+
+    /// C1 review: when echo cannot be turned off, nothing is read and the
+    /// value is never shown under "(not shown)".
+    #[test]
+    fn a_terminal_without_echo_control_reads_nothing() {
+        use std::os::fd::AsRawFd;
+        let not_a_tty = std::fs::File::open("/dev/null").unwrap();
+        let fd = not_a_tty.as_raw_fd();
+        let mut input = Cursor::new(b"sk-typed\n".to_vec());
+        assert_eq!(
+            read_hidden_on(&mut input, true, fd, "a key"),
+            Err(SecretError::EchoUnavailable)
+        );
+        assert_eq!(input.position(), 0, "nothing was read");
+        let mut piped = Cursor::new(b"  sk-piped \n".to_vec());
+        assert_eq!(
+            read_hidden_on(&mut piped, false, fd, "a key").as_deref(),
+            Ok("sk-piped")
+        );
     }
 }

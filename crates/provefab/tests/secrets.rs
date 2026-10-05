@@ -169,3 +169,16 @@ fn run_and_doctor_refuse_a_file_open_to_others() {
     );
     assert!(!text.contains("SENTINEL"), "{text}");
 }
+
+/// Linux final review (C1): a command that creates Provefab's home creates
+/// it for its owner only, whatever the umask.
+#[test]
+fn the_home_a_command_creates_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let (home, bin) = (t.path().join("home"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    let _ = provefab(&home, &bin, &["status"], "");
+    let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
