@@ -1,5 +1,6 @@
 //! Where Provefab keeps its state: `~/.provefab` unless `PROVEFAB_HOME` is set.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// `dir` and any missing parent, created 0700; nothing changes when `dir`
@@ -21,12 +22,21 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// `PROVEFAB_HOME`, else `$HOME/.provefab`.
+    /// `PROVEFAB_HOME`, else `$HOME/.provefab`, made absolute.
     pub fn from_env() -> Self {
-        let home = std::env::var_os("PROVEFAB_HOME")
+        Self::from_vars(std::env::var_os("PROVEFAB_HOME"), std::env::var_os("HOME"))
+    }
+
+    /// `from_env` with the two variables given. The home is made absolute
+    /// against the current directory once, here: the key helper, the
+    /// systemd unit and the launchd agent keep it, and a relative path there
+    /// would point elsewhere (Linux final review).
+    pub fn from_vars(provefab_home: Option<OsString>, home: Option<OsString>) -> Self {
+        let home = provefab_home
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".provefab")))
+            .or_else(|| home.map(|h| PathBuf::from(h).join(".provefab")))
             .unwrap_or_else(|| PathBuf::from(".provefab"));
+        let home = std::path::absolute(&home).unwrap_or(home);
         Self { home }
     }
 
@@ -97,6 +107,21 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux final review: a relative `PROVEFAB_HOME` becomes absolute once,
+    /// so the key helper and the service file never hold a relative path.
+    #[test]
+    fn the_home_is_always_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let rel = Paths::from_vars(Some("rel/home".into()), None);
+        assert_eq!(rel.home, cwd.join("rel/home"));
+        let nothing = Paths::from_vars(None, None);
+        assert_eq!(nothing.home, cwd.join(".provefab"));
+        let abs = Paths::from_vars(Some("/srv/pf".into()), Some("/home/a".into()));
+        assert_eq!(abs.home, PathBuf::from("/srv/pf"));
+        let user = Paths::from_vars(None, Some("/home/a".into()));
+        assert_eq!(user.home, PathBuf::from("/home/a/.provefab"));
+    }
 
     /// Linux final review (C1): a home Provefab creates is its owner's only;
     /// an existing one keeps its mode.
