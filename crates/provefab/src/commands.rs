@@ -879,6 +879,17 @@ pub fn lock(path: &Path) -> std::io::Result<Option<File>> {
 /// What `apiKeyHelper` runs after the binary (Linux spec §3, decision 5).
 pub const HELPER_COMMAND: &str = "secrets get anthropic";
 
+/// The `apiKeyHelper` command: this binary prints the stored key, with the
+/// home fixed so the stage's environment never changes where it looks
+/// (plan decision 9). Claude Code runs it with /bin/sh.
+pub fn api_key_helper(exe: &Path, home: &Path) -> String {
+    format!(
+        "PROVEFAB_HOME={} {} {HELPER_COMMAND}",
+        shell_words::quote(&home.display().to_string()),
+        shell_words::quote(&exe.display().to_string())
+    )
+}
+
 /// Writes `apiKeyHelper` into the API-key config dir's `settings.json`, keeping
 /// any other setting: Claude Code then asks Provefab for the key at each
 /// refresh, and the key never enters the agent's environment.
@@ -1477,34 +1488,53 @@ fn gate_shares_build_dir(gate: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// BYOK: Claude Code reads the key from the Keychain through `apiKeyHelper`,
-    /// so the key never sits in the agent's environment; other settings stay.
+    /// BYOK: Claude Code asks Provefab for the key through `apiKeyHelper`, so
+    /// the key never sits in the agent's environment; other settings stay.
     #[test]
-    fn claude_api_settings_point_at_the_keychain_and_keep_other_settings() {
+    fn claude_api_settings_run_provefab_and_keep_other_settings() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
-        claude_api_settings(
-            dir.path(),
-            "security find-generic-password -s provefab-anthropic -a provefab -w",
-        )
-        .unwrap();
+        let helper = api_key_helper(
+            Path::new("/opt/provefab/bin/provefab"),
+            Path::new("/h/.provefab"),
+        );
+        assert_eq!(
+            helper,
+            "PROVEFAB_HOME=/h/.provefab /opt/provefab/bin/provefab secrets get anthropic"
+        );
+        claude_api_settings(dir.path(), &helper).unwrap();
         let v: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(v["theme"], "dark");
-        assert_eq!(
-            v["apiKeyHelper"],
-            "security find-generic-password -s provefab-anthropic -a provefab -w"
-        );
-        // A fresh dir gets the file too.
+        assert_eq!(v["apiKeyHelper"], helper);
         let fresh = tempfile::tempdir().unwrap();
-        claude_api_settings(
-            &fresh.path().join("claude-api"),
-            "security find-generic-password -s provefab-anthropic -a provefab -w",
-        )
-        .unwrap();
+        claude_api_settings(&fresh.path().join("claude-api"), &helper).unwrap();
         assert!(fresh.path().join("claude-api/settings.json").exists());
+    }
+
+    /// Claude Code runs the helper with /bin/sh: paths with spaces and quotes
+    /// reach the binary intact.
+    #[test]
+    fn the_helper_survives_odd_paths_in_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().join("my tools 'x'");
+        std::fs::create_dir_all(&odd).unwrap();
+        let exe = fake(
+            &odd,
+            "provefab",
+            r#"printf '%s|%s\n' "$PROVEFAB_HOME" "$*""#,
+        );
+        let home = odd.join("home $HOME");
+        let out = std::process::Command::new("sh")
+            .args(["-c", &api_key_helper(&exe, &home)])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("{}|secrets get anthropic\n", home.display())
+        );
     }
 
     #[test]

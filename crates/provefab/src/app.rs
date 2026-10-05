@@ -1,7 +1,7 @@
 //! The `provefab` command line, as a library entry point: the free binary and
 //! Provefab Pro both call `run` with their own `Extensions` (spec §3, D59).
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -94,13 +94,15 @@ enum Cmd {
         #[command(subcommand)]
         action: ReposAction,
     },
-    /// Run `provefab run` as a launchd agent (start at login, restart on exit).
+    /// Run `provefab run` as a background service: a launchd agent on macOS,
+    /// a systemd user service on Linux (starts by itself, restarts on exit).
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// One-time sign-in for a worker, in Provefab's own config directory, or the
-    /// credentials of a Jira site or a Linear workspace (stored in the Keychain).
+    /// One-time sign-in for a worker, in Provefab's own config directory, or
+    /// the Jev key or the credentials of a Jira site or a Linear workspace
+    /// (stored in the macOS Keychain, or on Linux in credentials.toml).
     Login {
         #[arg(value_enum)]
         worker: LoginWorker,
@@ -111,6 +113,12 @@ enum Cmd {
         /// Jira only: the site host name, such as acme.atlassian.net.
         #[arg(long)]
         site: Option<String>,
+    },
+    /// Internal: print one stored secret for a worker's key helper.
+    #[command(hide = true)]
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
     },
     /// Internal: check one agent tool call (JSON on stdin) against the guard policy.
     Guard {
@@ -143,6 +151,21 @@ enum ServiceAction {
     Uninstall,
     /// Whether the agent is loaded and running.
     Status,
+}
+
+#[derive(Subcommand)]
+enum SecretsAction {
+    /// Print the stored secret to stdout, and nothing else.
+    Get {
+        #[arg(value_enum)]
+        name: SecretArg,
+    },
+}
+
+/// The only secret a worker asks Provefab for (plan decision 10).
+#[derive(Clone, Copy, ValueEnum)]
+enum SecretArg {
+    Anthropic,
 }
 
 #[derive(Subcommand)]
@@ -181,6 +204,8 @@ fn setup_exit(r: Result<String, SetupError>) -> ExitCode {
 enum LoginWorker {
     Claude,
     Codex,
+    /// The TypeSafe (Jev) key.
+    Jev,
     /// Jira Cloud: account e-mail and API token, per site.
     Jira,
     /// Linear: a personal API key.
@@ -325,14 +350,19 @@ async fn routed(config: &Config, secrets: &Secrets) -> anyhow::Result<crate::tra
         .map_err(anyhow::Error::msg)
 }
 
-/// `provefab login jira --site <site>` and `provefab login linear` (spec §5):
-/// the token is typed at the Keychain's own prompt, so it never passes through
-/// Provefab or a command line. The Jira e-mail is kept as the item's comment.
-fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()> {
-    use crate::secrets::{JIRA_ITEM, LINEAR_ITEM};
+/// `provefab login jev|jira|linear` (spec §5, Linux spec §3): the secret is
+/// typed at the Keychain's prompt on macOS, or read with echo off into
+/// credentials.toml on Linux; it never passes on a command line.
+fn secret_login(
+    secrets: &Secrets,
+    worker: LoginWorker,
+    site: Option<String>,
+) -> anyhow::Result<()> {
+    use crate::secrets::Entry;
     use crate::tracker::is_host;
-    let mut args: Vec<String> = vec!["add-generic-password".into(), "-U".into(), "-s".into()];
-    let done = match worker {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let (entry, what, done) = match worker {
         LoginWorker::Jira => {
             let Some(site) = site.map(|s| s.trim().to_lowercase()).filter(|s| is_host(s)) else {
                 bail!(
@@ -342,47 +372,50 @@ fn tracker_login(worker: LoginWorker, site: Option<String>) -> anyhow::Result<()
             print!("Atlassian account e-mail for {site}: ");
             std::io::stdout().flush()?;
             let mut email = String::new();
-            std::io::stdin().read_line(&mut email)?;
+            input.read_line(&mut email)?;
             let email = email.trim().to_string();
             if !email.contains('@') {
                 bail!("an account e-mail address is required");
             }
-            args.extend([
-                JIRA_ITEM.into(),
-                "-a".into(),
-                site.clone(),
-                "-j".into(),
-                email,
-            ]);
-            println!(
-                "Enter your Jira API token at the Keychain prompt (create one at https://id.atlassian.com/manage-profile/security/api-tokens)."
-            );
-            format!("stored; repositories with kind = \"jira\" and site = \"{site}\" use it")
+            let done = format!("stored; repositories with kind = \"jira\" and site = \"{site}\" use it");
+            (
+                Entry::Jira { site, email },
+                "your Jira API token (create one at https://id.atlassian.com/manage-profile/security/api-tokens)",
+                done,
+            )
         }
-        LoginWorker::Linear => {
-            if site.is_some() {
-                bail!("--site is for `provefab login jira` only");
-            }
-            args.extend([LINEAR_ITEM.into(), "-a".into(), "provefab".into()]);
-            println!(
-                "Enter a Linear personal API key (from Linear's settings) at the Keychain prompt."
-            );
-            "stored; repositories with kind = \"linear\" use it".to_string()
+        LoginWorker::Linear | LoginWorker::Jev if site.is_some() => {
+            bail!("--site is for `provefab login jira` only")
         }
+        LoginWorker::Linear => (
+            Entry::Linear,
+            "a Linear personal API key (from Linear's settings)",
+            "stored; repositories with kind = \"linear\" use it".to_string(),
+        ),
+        LoginWorker::Jev => (
+            Entry::Typesafe,
+            "your TypeSafe (Jev) API key",
+            "stored; Provefab reads it at its next start (`provefab service install` restarts the service)".to_string(),
+        ),
         LoginWorker::Claude | LoginWorker::Codex => {
             unreachable!("worker logins are handled in dispatch")
         }
     };
-    args.push("-w".into());
-    let status = std::process::Command::new("security")
-        .args(&args)
-        .status()
-        .context("running security")?;
-    if !status.success() {
-        bail!("could not store the credential in the Keychain");
-    }
+    secrets.store(&entry, what, &mut input, crate::secrets::stdin_is_tty())?;
     println!("{done}");
     Ok(())
+}
+
+/// The worker's sign-in command (Linux spec §5, plan decision 11).
+fn login_args(worker: LoginWorker, device_code: bool) -> &'static [&'static str] {
+    match worker {
+        LoginWorker::Claude => &["auth", "login"],
+        LoginWorker::Codex if device_code => &["login", "--device-auth"],
+        LoginWorker::Codex => &["login"],
+        LoginWorker::Jev | LoginWorker::Jira | LoginWorker::Linear => {
+            unreachable!("secret logins are handled in secret_login")
+        }
+    }
 }
 
 /// The pipeline `provefab run` drives; Provefab Pro's commands build the same
@@ -676,17 +709,29 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Secrets {
+            action: SecretsAction::Get {
+                name: SecretArg::Anthropic,
+            },
+        } => match Secrets::system(&paths.home)
+            .get(&crate::secrets::Name::Anthropic)
+            .await?
+        {
+            Some(key) => {
+                println!("{key}");
+                Ok(ExitCode::SUCCESS)
+            }
+            None => bail!("no Anthropic API key is stored: run `provefab login claude --api-key`"),
+        },
         Cmd::Login {
-            worker: worker @ (LoginWorker::Jira | LoginWorker::Linear),
+            worker: worker @ (LoginWorker::Jira | LoginWorker::Linear | LoginWorker::Jev),
             api_key,
             site,
         } => {
             if api_key {
-                bail!(
-                    "--api-key is for claude and codex; tracker logins always store an API token"
-                );
+                bail!("--api-key is for claude and codex; jev, jira and linear always store a key");
             }
-            tracker_login(worker, site)?;
+            secret_login(&Secrets::system(&paths.home), worker, site)?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Login { site: Some(_), .. } => bail!("--site is for `provefab login jira` only"),
@@ -697,30 +742,18 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
         } => {
             match worker {
                 LoginWorker::Claude => {
-                    // The key goes to the Keychain (prompted without echo);
-                    // Claude Code reads it there through `apiKeyHelper`.
-                    println!("Enter your Anthropic API key at the Keychain prompt.");
-                    let status = std::process::Command::new("security")
-                        .args([
-                            "add-generic-password",
-                            "-U",
-                            "-s",
-                            crate::secrets::ANTHROPIC_ITEM,
-                            "-a",
-                            "provefab",
-                            "-w",
-                        ])
-                        .status()
-                        .context("running security")?;
-                    if !status.success() {
-                        bail!("could not store the key in the Keychain");
-                    }
+                    let secrets = Secrets::system(&paths.home);
+                    let stdin = std::io::stdin();
+                    secrets.store(
+                        &crate::secrets::Entry::Anthropic,
+                        "your Anthropic API key",
+                        &mut stdin.lock(),
+                        crate::secrets::stdin_is_tty(),
+                    )?;
+                    let exe = std::env::current_exe().context("locating Provefab binary")?;
                     commands::claude_api_settings(
                         &paths.claude_config_api(),
-                        &format!(
-                            "security find-generic-password -s {} -a provefab -w",
-                            crate::secrets::ANTHROPIC_ITEM
-                        ),
+                        &commands::api_key_helper(&exe, &paths.home),
                     )?;
                     println!(
                         "stored; Claude Code models with auth = \"api_key\" use it (config dir {})",
@@ -745,8 +778,8 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
                         dir.display()
                     );
                 }
-                LoginWorker::Jira | LoginWorker::Linear => {
-                    unreachable!("tracker logins are handled above")
+                LoginWorker::Jev | LoginWorker::Jira | LoginWorker::Linear => {
+                    unreachable!("secret logins are handled above")
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -755,18 +788,12 @@ async fn dispatch(cmd: Cmd, ext: &Extensions) -> anyhow::Result<ExitCode> {
             let (program, var, dir) = match worker {
                 LoginWorker::Claude => ("claude", "CLAUDE_CONFIG_DIR", paths.claude_config()),
                 LoginWorker::Codex => ("codex", "CODEX_HOME", paths.codex_home()),
-                LoginWorker::Jira | LoginWorker::Linear => {
-                    unreachable!("tracker logins are handled above")
+                LoginWorker::Jev | LoginWorker::Jira | LoginWorker::Linear => {
+                    unreachable!("secret logins are handled above")
                 }
             };
             std::fs::create_dir_all(&dir)?;
-            let args: &[&str] = match worker {
-                LoginWorker::Claude => &["auth", "login"],
-                LoginWorker::Codex => &["login"],
-                LoginWorker::Jira | LoginWorker::Linear => {
-                    unreachable!("tracker logins are handled above")
-                }
-            };
+            let args = login_args(worker, !cfg!(target_os = "macos"));
             let status = std::process::Command::new(program)
                 .args(args)
                 .env(var, &dir)
@@ -800,5 +827,44 @@ pub fn shutdown_signal() -> impl std::future::Future<Output = ()> {
             return;
         }
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux spec §5: Codex on a server signs in with a device code.
+    #[test]
+    fn codex_uses_a_device_code_where_there_is_no_browser() {
+        assert_eq!(
+            login_args(LoginWorker::Codex, true),
+            ["login", "--device-auth"]
+        );
+        assert_eq!(login_args(LoginWorker::Codex, false), ["login"]);
+        assert_eq!(login_args(LoginWorker::Claude, true), ["auth", "login"]);
+        assert_eq!(login_args(LoginWorker::Claude, false), ["auth", "login"]);
+    }
+
+    #[test]
+    fn jev_is_a_login_target_and_secrets_is_hidden() {
+        let cmd = cli_command(&Extensions::default());
+        assert!(
+            cmd.clone()
+                .try_get_matches_from(["provefab", "login", "jev"])
+                .is_ok()
+        );
+        assert!(
+            cmd.clone()
+                .try_get_matches_from(["provefab", "secrets", "get", "anthropic"])
+                .is_ok()
+        );
+        assert!(
+            cmd.clone()
+                .try_get_matches_from(["provefab", "secrets", "get", "linear"])
+                .is_err()
+        );
+        let help = cmd.clone().render_long_help().to_string();
+        assert!(!help.contains("secrets"), "{help}");
     }
 }
