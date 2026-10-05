@@ -387,19 +387,16 @@ mod tests {
             .respond_with(ResponseTemplate::new(529))
             .mount(&server)
             .await;
-        let started = std::time::Instant::now();
         let err = classify(&client(&server), &issue(), Duration::from_millis(150))
             .await
             .unwrap_err();
+        // The 150 ms deadline is shorter than the client's 100 ms + 300 ms
+        // retry backoff, so `Timeout` instead of a 529 status shows the
+        // deadline ended the retries.
         assert!(matches!(err, JevError::Timeout), "{err:?}");
-        // `Timeout` (not a 529 status) proves retries were not exhausted; the
-        // bound only has to stay under the 5 s per-request timeout of
-        // `client()`. 1 s flaked under a loaded full suite (1.094 s seen).
-        assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "{:?}",
-            started.elapsed()
-        );
+        // Three attempts would mean the retries ran to exhaustion.
+        let attempts = server.received_requests().await.unwrap().len();
+        assert!(attempts < 3, "{attempts}");
     }
 
     fn noul(id: &str, p: f64) -> Value {
