@@ -17,9 +17,9 @@ permissions:
   contents: read
 
 # A newer push to the same branch or pull request cancels the older run; a
-# tag run is never cancelled.
+# tag run is never cancelled, and a manual run and a push never cancel each other.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
