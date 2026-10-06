@@ -310,7 +310,7 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
             "{:>4}  {}  {:<12} {}{}",
             t.id,
             t.repo_reference(),
-            t.state.as_str(),
+            state_label(&t),
             why,
             t.pr_url.map(|u| format!("  {u}")).unwrap_or_default(),
         );
@@ -345,6 +345,21 @@ pub async fn status(store: &Store) -> Result<String, CommandError> {
         );
     }
     Ok(out)
+}
+
+/// The state column of `provefab status` for an issue task. While the pull
+/// request is open the stored state is shown; after that the task keeps
+/// `pr_open` in the store, so the pull request's outcome is shown instead.
+fn state_label(t: &crate::store::TaskRow) -> &'static str {
+    if t.state != TaskState::PrOpen {
+        return t.state.as_str();
+    }
+    match t.pr_state.as_deref() {
+        Some("merged" | "done") => "merged",
+        Some("archived") => "archived",
+        Some("closed") => "closed",
+        _ => t.state.as_str(),
+    }
 }
 
 /// `provefab stats`: per repository, how many issues became pull requests,

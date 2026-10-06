@@ -276,3 +276,44 @@ async fn add_matches_the_ticket_label_case_insensitively() {
     let t = p.store.task_by_url(JIRA).await.unwrap().unwrap();
     assert_eq!(t.repo, "o/s");
 }
+
+#[tokio::test]
+async fn status_shows_pr_outcome_for_an_issue_task_in_pr_open() {
+    use provefab::commands::{add, status};
+    let f = fixture(&["true"]);
+    let mut p = pipeline(
+        &f,
+        Box::new(happy),
+        FakeOracle::default(),
+        FakeHub::new("x"),
+    )
+    .await;
+    let cases = [
+        ("open", "pr_open"),
+        ("merged", "merged"),
+        ("done", "merged"),
+        ("archived", "archived"),
+        ("closed", "closed"),
+    ];
+    for (n, (pr_state, _)) in cases.iter().enumerate() {
+        let url = format!("https://github.com/o/r/issues/{}", n + 10);
+        p.hub.issue.number = n as u64 + 10;
+        p.hub.issue.url = url.clone();
+        add(&p.store, &f.config, &p.hub, &p.git, &p.paths, &url)
+            .await
+            .unwrap();
+        let id = p.store.task_by_url(&url).await.unwrap().unwrap().id;
+        let pr = format!("https://github.com/o/r/pull/{}", n + 10);
+        p.store.set_pr(id, &pr, pr_state).await.unwrap();
+        p.store.transition(id, PrOpen, "opened").await.unwrap();
+    }
+    let out = status(&p.store).await.unwrap();
+    for (n, (_, word)) in cases.iter().enumerate() {
+        let url = format!("https://github.com/o/r/pull/{}", n + 10);
+        let line = out.lines().find(|l| l.ends_with(&url)).unwrap();
+        assert!(line.contains(&format!("  {word:<12} ")), "{line}");
+        if *word != "pr_open" {
+            assert!(!line.contains("pr_open"), "{line}");
+        }
+    }
+}
