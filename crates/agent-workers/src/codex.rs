@@ -46,16 +46,16 @@ impl CodexWorker {
         let mut push = |s: &str| a.push(s.into());
         push("-m");
         push(&req.model);
-        // Codex's own sandbox is a second layer behind the guard: read-only for
-        // plan and review, writes confined to the worktree (no network) for implement.
-        push("--sandbox");
-        push(match req.tools {
-            // Codex always has a shell: without tools the guard refuses it.
-            ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly | ToolProfile::NoTools => {
-                "read-only"
-            }
-            ToolProfile::Full => "workspace-write",
-        });
+        for setting in [
+            "approval_policy=\"never\"".to_string(),
+            "default_permissions=\"provefab\"".to_string(),
+            "permissions.provefab.network.enabled=false".to_string(),
+            req.sandbox.codex_filesystem(req, &self.codex_home),
+            crate::sandbox::codex_shell_environment(req),
+        ] {
+            push("-c");
+            push(&setting);
+        }
         // Execpolicy `.rules` files from the user or the repo must not widen what runs.
         push("--ignore-rules");
         // Without tools, Codex's built-in web search and image viewer stay
@@ -86,9 +86,10 @@ impl CodexWorker {
     }
 
     /// The full command, environment included, for one stage.
-    pub fn command(&self, req: &StageRequest, prompt: &str) -> Command {
+    fn command(&self, req: &StageRequest, prompt: &str) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(self.args(req, prompt)).current_dir(&req.cwd);
+        crate::sanitize_environment(&mut cmd);
         apply_worker_env(
             &mut cmd,
             &req.cwd,
@@ -105,6 +106,21 @@ impl CodexWorker {
         cmd.env("PROVEFAB_BIN", &self.provefab_bin);
         cmd
     }
+    pub fn prepare_command(&self, req: &StageRequest, prompt: &str) -> std::io::Result<Command> {
+        let mut req = crate::sandbox::prepare_request(
+            req,
+            std::slice::from_ref(&self.provefab_bin),
+            std::slice::from_ref(&self.codex_home),
+        )?;
+        let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
+        crate::sandbox::check_version(&program, [0, 162, 1])?;
+        req.sandbox.deny_write.push(program.clone());
+        let policy = crate::sandbox::write_policy(&req, false)?;
+        let mut cmd = self.command(&req, prompt);
+        crate::sandbox::apply_temporary_env(&mut cmd, &req);
+        cmd.env(crate::SANDBOX_POLICY_ENV, policy);
+        Ok(cmd)
+    }
 }
 
 impl Worker for CodexWorker {
@@ -114,7 +130,13 @@ impl Worker for CodexWorker {
         events: UnboundedSender<WorkerEvent>,
     ) -> Result<StageResult, WorkerError> {
         let io = |e: std::io::Error| WorkerError::Io(e.to_string());
-        std::fs::create_dir_all(&req.session_dir).map_err(io)?;
+        let normalized = crate::sandbox::prepare_request(
+            req,
+            std::slice::from_ref(&self.provefab_bin),
+            std::slice::from_ref(&self.codex_home),
+        )
+        .map_err(io)?;
+        let req = &normalized;
         if let Some(schema) = &req.output_schema {
             std::fs::write(
                 req.session_dir.join("output-schema.json"),
@@ -131,7 +153,7 @@ impl Worker for CodexWorker {
             None => req.prompt.clone(),
         };
         prepare_git_hooks(&req.session_dir).map_err(io)?;
-        let cmd = self.command(req, &prompt);
+        let cmd = self.prepare_command(req, &prompt).map_err(io)?;
         let mut transcript = Transcript::open(&req.session_dir)?;
         let mut state = CodexState {
             wants_output: req.output_schema.is_some(),
@@ -309,6 +331,7 @@ mod tests {
 
     fn req(tools: ToolProfile, schema: bool) -> StageRequest {
         StageRequest {
+            sandbox: Default::default(),
             cwd: "/w".into(),
             prompt: "Fix it".into(),
             model: "gpt-5.5".into(),
@@ -330,18 +353,27 @@ mod tests {
     }
 
     #[test]
+    fn native_permissions_never_offer_an_unsandboxed_approval() {
+        let args = worker().args(&req(ToolProfile::Full, false), "Fix it");
+        assert!(!args.iter().any(|s| s == "--sandbox"));
+        assert!(args.iter().any(|s| s == "approval_policy=\"never\""));
+        assert!(
+            args.iter()
+                .any(|s| s == "permissions.provefab.network.enabled=false")
+        );
+    }
+
+    #[test]
     fn args_pick_the_sandbox_from_the_tool_profile_and_never_bypass_hook_trust() {
         let full = joined(worker().args(&req(ToolProfile::Full, false), "Fix it"));
         assert!(
-            full.starts_with(
-                "exec --json -C /w -m gpt-5.5 --sandbox workspace-write --ignore-rules"
-            ),
+            full.starts_with("exec --json -C /w -m gpt-5.5 -c approval_policy="),
             "{full}"
         );
         assert!(full.ends_with(" Fix it"), "{full}");
         assert!(!full.contains("--output-schema"), "{full}");
         let review = joined(worker().args(&req(ToolProfile::ReadOnly, true), "Review"));
-        assert!(review.contains("--sandbox read-only"), "{review}");
+        assert!(!review.contains("\"/w\"=\"write\""), "{review}");
         assert!(
             review.contains("--output-schema /w/.s/output-schema.json"),
             "{review}"
@@ -361,7 +393,7 @@ mod tests {
     fn no_tools_is_read_only_and_tells_the_guard() {
         let none = req(ToolProfile::NoTools, true);
         let args = joined(worker().args(&none, "Answer"));
-        assert!(args.contains("--sandbox read-only"), "{args}");
+        assert!(!args.contains("\"/w\"=\"write\""), "{args}");
         // Final review: Codex's own web search and image viewer stay off too.
         assert!(
             args.contains("-c web_search=\"disabled\" -c features.view_image=false"),
@@ -391,7 +423,7 @@ mod tests {
     fn an_untrusted_review_is_read_only_and_tells_the_guard() {
         let review = req(ToolProfile::UntrustedReadOnly, true);
         let args = joined(worker().args(&review, "Review"));
-        assert!(args.contains("--sandbox read-only"), "{args}");
+        assert!(!args.contains("\"/w\"=\"write\""), "{args}");
         // No web search or image viewer either: nothing read leaves through them.
         assert!(
             args.contains("-c web_search=\"disabled\" -c features.view_image=false"),

@@ -2229,6 +2229,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
         session: PathBuf,
     ) -> StageRequest {
         StageRequest {
+            sandbox: Default::default(),
             cwd: wt.to_path_buf(),
             prompt,
             model: String::new(),

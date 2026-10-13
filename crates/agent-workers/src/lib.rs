@@ -8,7 +8,11 @@ mod codex;
 mod jsonl;
 mod pi;
 mod process;
+mod sandbox;
 mod types;
+pub use sandbox::{
+    SANDBOX_POLICY_ENV, SANDBOX_RUNTIME_ENV, SandboxPolicy, gate_command, sanitize_environment,
+};
 
 pub use claude::ClaudeCodeWorker;
 pub use codex::CodexWorker;

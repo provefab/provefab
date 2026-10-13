@@ -87,6 +87,7 @@ fn request(
     tools: ToolProfile,
 ) -> StageRequest {
     StageRequest {
+        sandbox: Default::default(),
         cwd: work.to_path_buf(),
         prompt: prompt.into(),
         model: model.into(),

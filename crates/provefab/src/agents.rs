@@ -174,6 +174,7 @@ mod tests {
 
     fn req() -> StageRequest {
         StageRequest {
+            sandbox: Default::default(),
             cwd: "/w".into(),
             prompt: "p".into(),
             model: String::new(),

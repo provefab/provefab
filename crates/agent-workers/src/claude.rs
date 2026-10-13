@@ -46,6 +46,12 @@ impl ClaudeCodeWorker {
         push("--setting-sources");
         push("user");
         push("--strict-mcp-config");
+        push("--settings");
+        push(
+            &req.sandbox
+                .claude_settings(req, &self.config_dir)
+                .to_string(),
+        );
         push("--tools");
         push(match req.tools {
             // No shell: nothing the worktree holds can run (final review I1).
@@ -83,9 +89,10 @@ impl ClaudeCodeWorker {
 
 impl ClaudeCodeWorker {
     /// The full command, environment included, for one stage.
-    pub fn command(&self, req: &StageRequest) -> Command {
+    fn command(&self, req: &StageRequest) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(self.args(req)).current_dir(&req.cwd);
+        crate::sanitize_environment(&mut cmd);
         apply_worker_env(
             &mut cmd,
             &req.cwd,
@@ -95,9 +102,26 @@ impl ClaudeCodeWorker {
         for key in API_KEY_ENV {
             cmd.env_remove(key);
         }
+        cmd.env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1");
         cmd.env("CLAUDE_CONFIG_DIR", &self.config_dir);
         cmd.env("PROVEFAB_BIN", &self.provefab_bin);
         cmd
+    }
+    pub fn prepare_command(&self, req: &StageRequest) -> std::io::Result<Command> {
+        let mut req = crate::sandbox::prepare_request(
+            req,
+            &[self.plugin_dir.clone(), self.provefab_bin.clone()],
+            std::slice::from_ref(&self.config_dir),
+        )?;
+        crate::sandbox::check_claude_settings(&self.config_dir)?;
+        let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
+        crate::sandbox::check_version(&program, [2, 1, 296])?;
+        req.sandbox.deny_write.push(program);
+        let policy = crate::sandbox::write_policy(&req, false)?;
+        let mut cmd = self.command(&req);
+        crate::sandbox::apply_temporary_env(&mut cmd, &req);
+        cmd.env(crate::SANDBOX_POLICY_ENV, policy);
+        Ok(cmd)
     }
 }
 
@@ -107,7 +131,9 @@ impl Worker for ClaudeCodeWorker {
         req: &StageRequest,
         events: UnboundedSender<WorkerEvent>,
     ) -> Result<StageResult, WorkerError> {
-        let cmd = self.command(req);
+        let cmd = self
+            .prepare_command(req)
+            .map_err(|e| WorkerError::Io(e.to_string()))?;
         prepare_git_hooks(&req.session_dir).map_err(|e| WorkerError::Io(e.to_string()))?;
         let mut transcript = Transcript::open(&req.session_dir)?;
         let mut state = ClaudeState::default();
@@ -273,6 +299,7 @@ mod tests {
 
     fn req() -> StageRequest {
         StageRequest {
+            sandbox: Default::default(),
             cwd: "/w".into(),
             prompt: "Review the diff".into(),
             model: "opus".into(),
@@ -284,6 +311,27 @@ mod tests {
             timeout: Duration::from_secs(60),
             session_dir: "/w/.s".into(),
         }
+    }
+
+    #[test]
+    fn native_claude_settings_require_enforcement_without_escape_commands() {
+        let args = worker().args(&req());
+        let i = args
+            .iter()
+            .position(|s| s == "--settings")
+            .expect("native settings");
+        let settings: Value = serde_json::from_str(args[i + 1].to_str().unwrap()).unwrap();
+        assert_eq!(settings["sandbox"]["enabled"], true);
+        assert_eq!(settings["sandbox"]["failIfUnavailable"], true);
+        assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
+        assert_eq!(settings["sandbox"]["excludedCommands"], json!([]));
+        assert_eq!(settings["sandbox"]["network"]["allowedDomains"], json!([]));
+        assert_eq!(settings["sandbox"]["network"]["allowLocalBinding"], false);
+        assert_eq!(settings["sandbox"]["network"]["strictAllowlist"], true);
+        assert_eq!(
+            settings["sandbox"]["network"]["deniedDomains"],
+            json!(["*"])
+        );
     }
 
     #[test]

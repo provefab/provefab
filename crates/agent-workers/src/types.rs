@@ -8,6 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 /// One stage for one worker: everything needed to start the subprocess.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageRequest {
+    pub sandbox: crate::SandboxPolicy,
     /// The task's worktree. The agent runs here and the guard confines writes to it.
     pub cwd: PathBuf,
     pub prompt: String,

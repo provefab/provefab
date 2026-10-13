@@ -66,11 +66,45 @@ impl PiWorker {
     }
 }
 
+impl PiWorker {
+    pub fn prepare_command(&self, req: &StageRequest) -> std::io::Result<Command> {
+        let mut req = crate::sandbox::prepare_request(
+            req,
+            &[self.package.clone(), self.provefab_bin.clone()],
+            &[],
+        )?;
+        let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
+        req.sandbox.deny_write.push(program.clone());
+        let runtime = crate::sandbox::executable(&req.sandbox.runtime, &req.cwd, &req.session_dir)?;
+        crate::sandbox::check_version(&runtime, [0, 0, 79])?;
+        req.sandbox.deny_write.push(runtime.clone());
+        let policy = crate::sandbox::write_policy(&req, false)?;
+        let mut cmd = Command::new(program);
+        cmd.args(self.args(&req)).current_dir(&req.cwd);
+        crate::sanitize_environment(&mut cmd);
+        apply_worker_env(
+            &mut cmd,
+            &req.cwd,
+            &req.session_dir.join("git-hooks"),
+            req.tools,
+        );
+        crate::sandbox::apply_temporary_env(&mut cmd, &req);
+        cmd.env("PROVEFAB_BIN", &self.provefab_bin)
+            .env(crate::SANDBOX_POLICY_ENV, policy)
+            .env(crate::SANDBOX_RUNTIME_ENV, runtime);
+        Ok(cmd)
+    }
+}
+
 fn tools_arg(profile: ToolProfile, submit: bool) -> String {
     let base = match profile {
         // No `bash`: Pi's read tools never run a program.
-        ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly => "read,grep,find,ls",
-        ToolProfile::Full => "read,bash,edit,write,grep,find,ls",
+        ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly => {
+            "provefab_read,provefab_grep,provefab_find,provefab_ls"
+        }
+        ToolProfile::Full => {
+            "provefab_read,provefab_bash,provefab_edit,provefab_write,provefab_grep,provefab_find,provefab_ls"
+        }
         ToolProfile::NoTools => "",
     };
     if submit && base.is_empty() {
@@ -88,16 +122,16 @@ impl Worker for PiWorker {
         req: &StageRequest,
         events: UnboundedSender<WorkerEvent>,
     ) -> Result<StageResult, WorkerError> {
-        std::fs::create_dir_all(&req.session_dir).map_err(|e| WorkerError::Io(e.to_string()))?;
-        let mut cmd = Command::new(&self.program);
-        cmd.args(self.args(req)).current_dir(&req.cwd);
-        apply_worker_env(
-            &mut cmd,
-            &req.cwd,
-            &req.session_dir.join("git-hooks"),
-            req.tools,
-        );
-        cmd.env("PROVEFAB_BIN", &self.provefab_bin);
+        let normalized = crate::sandbox::prepare_request(
+            req,
+            &[self.package.clone(), self.provefab_bin.clone()],
+            &[],
+        )
+        .map_err(|e| WorkerError::Io(e.to_string()))?;
+        let req = &normalized;
+        let mut cmd = self
+            .prepare_command(req)
+            .map_err(|e| WorkerError::Io(e.to_string()))?;
         cmd.env_remove("PROVEFAB_OUTPUT_SCHEMA");
         if let Some(schema) = &req.output_schema {
             let path = req.session_dir.join("output-schema.json");
@@ -185,11 +219,13 @@ impl PiState {
         };
         match v.get("type").and_then(Value::as_str).unwrap_or_default() {
             "tool_execution_start" => emit(WorkerEvent::ToolStart {
-                name: str_at("toolName"),
+                name: str_at("toolName").trim_start_matches("provefab_").into(),
                 input: digest(v.get("args").unwrap_or(&Value::Null)),
             }),
             "tool_execution_end" => {
-                let name = str_at("toolName");
+                let name = str_at("toolName")
+                    .trim_start_matches("provefab_")
+                    .to_string();
                 let is_error = v.get("isError").and_then(Value::as_bool).unwrap_or(false);
                 if name == SUBMIT_TOOL && !is_error {
                     self.output = v.pointer("/result/details").cloned();
@@ -273,6 +309,7 @@ mod tests {
 
     fn req(dir: &std::path::Path) -> StageRequest {
         StageRequest {
+            sandbox: Default::default(),
             cwd: dir.to_path_buf(),
             prompt: "Fix the bug".into(),
             model: "gpt-5.5".into(),
@@ -305,7 +342,9 @@ mod tests {
             "{joined}"
         );
         assert!(
-            joined.contains("--tools read,grep,find,ls,submit_result"),
+            joined.contains(
+                "--tools provefab_read,provefab_grep,provefab_find,provefab_ls,submit_result"
+            ),
             "{joined}"
         );
         assert!(
@@ -358,7 +397,7 @@ mod tests {
     fn an_untrusted_review_has_no_shell() {
         assert_eq!(
             tools_arg(ToolProfile::UntrustedReadOnly, true),
-            format!("read,grep,find,ls,{SUBMIT_TOOL}")
+            format!("provefab_read,provefab_grep,provefab_find,provefab_ls,{SUBMIT_TOOL}")
         );
     }
 
@@ -366,7 +405,7 @@ mod tests {
     fn full_profile_without_schema_has_no_submit_tool() {
         assert_eq!(
             tools_arg(ToolProfile::Full, false),
-            "read,bash,edit,write,grep,find,ls"
+            "provefab_read,provefab_bash,provefab_edit,provefab_write,provefab_grep,provefab_find,provefab_ls"
         );
     }
 

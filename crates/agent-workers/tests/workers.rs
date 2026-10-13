@@ -21,7 +21,7 @@ impl Fake {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("out.jsonl"), stream).unwrap();
         let script = format!(
-            "#!/bin/sh\n\
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 9.9.9; exit 0; fi\n\
              {{ for a in \"$@\"; do echo \"ARG $a\"; done\n\
                echo \"ENV PROVEFAB_WORKTREE=$PROVEFAB_WORKTREE\"\n\
                echo \"ENV PROVEFAB_BIN=$PROVEFAB_BIN\"\n\
@@ -52,8 +52,16 @@ impl Fake {
 }
 
 fn request(worktree: &Path, schema: bool) -> StageRequest {
+    std::fs::create_dir_all(worktree.join("work")).unwrap();
+    let runtime = worktree.join("fake-srt");
+    std::fs::write(&runtime, "#!/bin/sh\necho 0.0.79\n").unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
     StageRequest {
-        cwd: worktree.to_path_buf(),
+        sandbox: agent_workers::SandboxPolicy {
+            runtime,
+            ..Default::default()
+        },
+        cwd: worktree.join("work"),
         prompt: "Review the change".into(),
         model: "m".into(),
         provider: Some("openai-codex".into()),
@@ -106,7 +114,8 @@ async fn pi_worker_end_to_end() {
         package: "/ext/index.ts".into(),
         provefab_bin: "/bin/provefab".into(),
     };
-    let req = request(wt.path(), true);
+    let mut req = request(wt.path(), true);
+    req.sandbox.runtime = fake.bin();
     let (result, events) = run(&w, &req).await;
 
     assert_eq!(result.exit, ExitReason::Completed);
@@ -126,29 +135,23 @@ async fn pi_worker_end_to_end() {
     assert!(
         log.contains(&format!(
             "ENV PROVEFAB_OUTPUT_SCHEMA={}",
-            schema_path.display()
+            schema_path.canonicalize().unwrap().display()
         )),
         "{log}"
     );
     assert!(
-        log.contains(&format!("ENV PROVEFAB_WORKTREE={}", wt.path().display())),
+        log.contains(&format!(
+            "ENV PROVEFAB_WORKTREE={}",
+            req.cwd.canonicalize().unwrap().display()
+        )),
         "{log}"
     );
     assert!(log.contains("ENV PROVEFAB_BIN=/bin/provefab"), "{log}");
-    // Three entries appended after any the test itself inherited (Provefab's
-    // gates run this suite with their own three).
-    let inherited: usize = std::env::var("GIT_CONFIG_COUNT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    assert!(
-        log.contains(&format!("ENV GIT_CONFIG_COUNT={}", inherited + 3)),
-        "{log}"
-    );
+    assert!(log.contains("ENV GIT_CONFIG_COUNT=3"), "{log}");
     assert!(
         log.contains(&format!(
             "PWD {}",
-            wt.path().canonicalize().unwrap().display()
+            req.cwd.canonicalize().unwrap().display()
         )),
         "{log}"
     );
@@ -186,6 +189,7 @@ async fn pi_worker_reports_crash_timeout_and_missing_binary() {
         provefab_bin: "/f".into(),
     };
     let mut req = request(wt.path(), false);
+    req.sandbox.runtime = hang.bin();
     req.timeout = Duration::from_millis(500);
     let (result, _) = run(&w, &req).await;
     assert_eq!(result.exit, ExitReason::Timeout);
@@ -264,7 +268,8 @@ async fn claude_worker_end_to_end() {
         config_dir: "/cfg/claude".into(),
         provefab_bin: "/bin/provefab".into(),
     };
-    let req = request(wt.path(), true);
+    let mut req = request(wt.path(), true);
+    req.sandbox.runtime = fake.bin();
     let (result, events) = run(&w, &req).await;
     assert_eq!(result.exit, ExitReason::Completed);
     assert_eq!(
@@ -380,4 +385,38 @@ async fn review_5_codex_retried_error_then_completed_turn_is_completed() {
     let wt = tempfile::tempdir().unwrap();
     let (result, _) = run(&codex(&fake), &request(wt.path(), false)).await;
     assert_eq!(result.exit, ExitReason::Completed);
+}
+
+#[tokio::test]
+async fn native_preparation_rejects_session_inside_worktree_before_launch() {
+    let fake = Fake::new(CODEX_STREAM, 0, 0);
+    let wt = tempfile::tempdir().unwrap();
+    let mut r = request(wt.path(), false);
+    r.session_dir = r.cwd.join("session");
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    assert!(codex(&fake).run(&r, tx).await.is_err());
+    assert!(!fake.dir.path().join("log.txt").exists());
+}
+
+#[tokio::test]
+async fn native_preparation_rejects_claude_user_sandbox_override_before_launch() {
+    let fake = Fake::new(CLAUDE_STREAM, 0, 0);
+    let wt = tempfile::tempdir().unwrap();
+    let session = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fake.dir.path().join("settings.json"),
+        r#"{"sandbox":{"excludedCommands":["python"]}}"#,
+    )
+    .unwrap();
+    let w = ClaudeCodeWorker {
+        program: fake.bin(),
+        plugin_dir: fake.dir.path().into(),
+        config_dir: fake.dir.path().into(),
+        provefab_bin: fake.bin(),
+    };
+    let mut r = request(wt.path(), false);
+    r.session_dir = session.path().into();
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    assert!(w.run(&r, tx).await.is_err());
+    assert!(!fake.dir.path().join("log.txt").exists());
 }
