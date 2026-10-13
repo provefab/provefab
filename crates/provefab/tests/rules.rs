@@ -822,10 +822,20 @@ fn guard_answer(req: &StageRequest, tool: &str, input: Value) -> String {
 #[tokio::test]
 async fn ask_model_runs_a_standard_model_without_tools_and_records_its_cost() {
     type Seen = std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, usize, Option<Value>, [String; 3])>>>;
-    let f = fixture(&["true"]);
+    let mut f = fixture(&["true"]);
+    f.config.repos[0].sandbox.protected_paths = vec!["README.md".into()];
+    let protected = f.config.repos[0]
+        .path_in(&f.home)
+        .join("README.md")
+        .canonicalize()
+        .unwrap();
     let seen: Seen = Default::default();
     let log = seen.clone();
     let script = move |_: &ModelEntry, req: &StageRequest, _: &UnboundedSender<WorkerEvent>| {
+        assert!(
+            req.sandbox.deny_write.contains(&protected),
+            "NoTools resolved validators against empty cwd"
+        );
         let entries = std::fs::read_dir(&req.cwd).unwrap().count();
         // Tool calls the model could try while it runs, through the real guard.
         let answers = [

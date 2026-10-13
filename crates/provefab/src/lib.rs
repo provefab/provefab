@@ -29,6 +29,7 @@ pub mod risk;
 pub mod router;
 pub mod routing;
 pub mod rules;
+pub mod sandbox;
 pub mod scheduler;
 pub mod secrets;
 pub mod service;

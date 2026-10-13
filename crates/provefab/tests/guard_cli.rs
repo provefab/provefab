@@ -3,6 +3,18 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+fn native_policy(
+    root: &std::path::Path,
+    deny_read: &[std::path::PathBuf],
+    deny_write: &[std::path::PathBuf],
+) -> serde_json::Value {
+    serde_json::json!({
+        "network": {"allowedDomains": [], "deniedDomains": ["*"], "strictAllowedDomains": true, "allowLocalBinding": false, "allowAllUnixSockets": false},
+        "filesystem": {"denyRead": deny_read, "denyWrite": deny_write, "allowWrite": [root]},
+        "enableWeakerNestedSandbox": false, "enableWeakerNetworkIsolation": false
+    })
+}
+
 fn guard(format: &str, root: Option<&std::path::Path>, stdin: &str) -> std::process::Output {
     guard_with(format, root, stdin, &[])
 }
@@ -17,6 +29,8 @@ fn guard_with(
     cmd.args(["guard", "--format", format])
         .env_remove("PROVEFAB_WORKTREE")
         .env_remove("PROVEFAB_UNTRUSTED_REVIEW")
+        .env_remove("PROVEFAB_NO_TOOLS")
+        .env_remove("PROVEFAB_SANDBOX_POLICY")
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -143,4 +157,142 @@ fn a_stage_cannot_read_the_secrets_in_the_provefab_home() {
         root.join("src").display()
     );
     assert_eq!(decide(own), "");
+}
+
+#[test]
+fn native_policy_denies_direct_validation_writes_and_secret_searches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let session = dir.path().join("session");
+    std::fs::create_dir_all(root.join("checks")).unwrap();
+    std::fs::create_dir(&session).unwrap();
+    let protected = root.join("checks/validate");
+    let secret = root.join("hidden-secret");
+    std::fs::write(&protected, "validator").unwrap();
+    std::fs::write(&secret, "secret").unwrap();
+    std::os::unix::fs::symlink(&protected, root.join("alias")).unwrap();
+    let policy = session.join("sandbox-policy.json");
+    std::fs::write(
+        &policy,
+        native_policy(&root, &[secret], &[protected, session]).to_string(),
+    )
+    .unwrap();
+    let env = [("PROVEFAB_SANDBOX_POLICY", policy.to_str().unwrap())];
+    for (tool, field, path) in [
+        ("Write", "file_path", "checks/validate"),
+        ("Edit", "file_path", "checks"),
+        ("Write", "file_path", "alias"),
+        ("Edit", "file_path", "."),
+        ("Read", "file_path", "hidden-secret"),
+        ("Grep", "path", "."),
+        ("Glob", "path", "."),
+    ] {
+        let input =
+            serde_json::json!({"tool_name": tool, "tool_input": {field: path, "pattern": "*"}})
+                .to_string();
+        let out = guard_with("claude-code", Some(&root), &input, &env);
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            stdout.contains("\"permissionDecision\":\"deny\""),
+            "{tool} {path}: {stdout}"
+        );
+    }
+    for patch in [
+        "*** Begin Patch\n*** Update File: checks/validate\n@@\n-validator\n+changed\n*** End Patch",
+        "*** Begin Patch\n*** Delete File: checks\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alias\n@@\n-validator\n+changed\n*** End Patch",
+    ] {
+        let input =
+            serde_json::json!({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+                .to_string();
+        let out = guard_with("codex", Some(&root), &input, &env);
+        assert!(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .contains("\"permissionDecision\":\"deny\"")
+        );
+    }
+    let input = r#"{"tool":"read","args":{"path":"checks/validate"}}"#;
+    let out = guard_with("pi", Some(&root), input, &env);
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("\"decision\":\"allow\"")
+    );
+}
+
+#[test]
+fn native_named_policy_errors_deny_even_review_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let policy = root.path().join("absent.json");
+    let env = [
+        ("PROVEFAB_SANDBOX_POLICY", policy.to_str().unwrap()),
+        ("PROVEFAB_UNTRUSTED_REVIEW", "1"),
+    ];
+    let out = guard_with(
+        "claude-code",
+        Some(root.path()),
+        r#"{"tool_name":"Read","tool_input":{"file_path":"README.md"}}"#,
+        &env,
+    );
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("\"permissionDecision\":\"deny\"")
+    );
+}
+
+#[test]
+fn native_parent_search_cannot_follow_a_nested_alias_to_a_denied_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    let secret = dir.path().join("external-secret");
+    std::fs::write(&secret, "secret").unwrap();
+    std::os::unix::fs::symlink(&secret, root.join("nested/leak")).unwrap();
+    let policy = dir.path().join("policy.json");
+    std::fs::write(&policy, native_policy(&root, &[secret], &[]).to_string()).unwrap();
+    let env = [("PROVEFAB_SANDBOX_POLICY", policy.to_str().unwrap())];
+    let input = r#"{"tool_name":"Glob","tool_input":{"path":".","pattern":"**/*"}}"#;
+    let out = guard_with("claude-code", Some(&root), input, &env);
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("\"permissionDecision\":\"deny\"")
+    );
+}
+
+#[test]
+fn native_named_policy_rejects_malformed_and_widened_security_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("README.md"), "safe").unwrap();
+    let path = dir.path().join("policy.json");
+    let fs = serde_json::json!({"denyRead": [], "denyWrite": [], "allowWrite": [root]});
+    for policy in [
+        serde_json::json!({"filesystem": fs}),
+        serde_json::json!({
+            "filesystem": fs,
+            "network": {"allowedDomains": ["example.com"], "deniedDomains": ["*"], "strictAllowedDomains": true, "allowLocalBinding": false, "allowAllUnixSockets": false},
+            "enableWeakerNestedSandbox": false, "enableWeakerNetworkIsolation": false
+        }),
+    ] {
+        std::fs::write(&path, policy.to_string()).unwrap();
+        let env = [
+            ("PROVEFAB_SANDBOX_POLICY", path.to_str().unwrap()),
+            ("PROVEFAB_UNTRUSTED_REVIEW", "1"),
+        ];
+        let out = guard_with(
+            "claude-code",
+            Some(&root),
+            r#"{"tool_name":"Read","tool_input":{"file_path":"README.md"}}"#,
+            &env,
+        );
+        assert!(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .contains("\"permissionDecision\":\"deny\"")
+        );
+    }
 }

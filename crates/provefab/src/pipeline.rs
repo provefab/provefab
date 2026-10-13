@@ -49,6 +49,8 @@ pub enum PipelineError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Forge(#[from] ForgeError),
+    #[error("pipeline sandbox: {0}")]
+    Sandbox(#[from] std::io::Error),
     #[error("pipeline: no task {0}")]
     UnknownTask(i64),
 }
@@ -2219,17 +2221,20 @@ Please reply with what should happen, what happens instead, and how to reproduce
         }
     }
 
+    // Keep the existing stage request arguments together with their mandatory repository policy.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request(
         &self,
+        repo: &RepoConfig,
         wt: &Path,
         prompt: String,
         tools: ToolProfile,
         schema: Option<Value>,
         max_turns: u32,
         session: PathBuf,
-    ) -> StageRequest {
-        StageRequest {
-            sandbox: Default::default(),
+    ) -> Result<StageRequest, PipelineError> {
+        Ok(StageRequest {
+            sandbox: crate::sandbox::derive(repo, &self.paths, wt, &session)?,
             cwd: wt.to_path_buf(),
             prompt,
             model: String::new(),
@@ -2240,7 +2245,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             max_turns,
             timeout: self.config.limits.stage_timeout,
             session_dir: session,
-        }
+        })
     }
 
     async fn issue_text(&self, id: i64) -> Result<(String, String), PipelineError> {
@@ -2366,6 +2371,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             ],
         );
         let req = self.request(
+            repo,
             &wt,
             prompt,
             ToolProfile::ReadOnly,
@@ -2373,7 +2379,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             self.config.limits.max_turns.plan,
             self.paths
                 .session(task.id, "plan", self.next_run_seq(task.id).await?),
-        );
+        )?;
         let Some(outcome) = self
             .run_stage(task, &model, "plan", req, false, slot)
             .await?
@@ -2500,7 +2506,27 @@ Please reply with what should happen, what happens instead, and how to reproduce
         let scratch = self.paths.session(task.id, stage, n);
         let _ = std::fs::create_dir_all(&scratch);
         let started = now();
-        let report = run_gates(wt, commands, self.config.limits.gate_timeout, &scratch).await;
+        let repo = self
+            .config
+            .repos
+            .iter()
+            .find(|r| r.slug == task.repo)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "task repository not configured",
+                )
+            })?;
+        let mut policy = crate::sandbox::derive(repo, &self.paths, wt, &scratch)?;
+        policy.allow_local_network = repo.sandbox.allow_local_network;
+        let report = run_gates(
+            wt,
+            commands,
+            self.config.limits.gate_timeout,
+            &scratch,
+            &policy,
+        )
+        .await;
         if matches!(stage, "post-merge" | "post-merge-base" | "revert-check") {
             let results: Vec<Value> = report
                 .results
@@ -2663,13 +2689,14 @@ Please reply with what should happen, what happens instead, and how to reproduce
             self.next_run_seq(task.id).await?,
         );
         let req = self.request(
+            repo,
             &wt,
             prompt,
             ToolProfile::Full,
             None,
             self.config.limits.max_turns.implement,
             session,
-        );
+        )?;
         let Some(outcome) = self
             .run_stage(task, &model, "implement", req, true, slot)
             .await?
@@ -3162,6 +3189,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
             ],
         );
         let req = self.request(
+            repo,
             &wt,
             prompt,
             ToolProfile::ReadOnly,
@@ -3172,7 +3200,7 @@ Please reply with what should happen, what happens instead, and how to reproduce
                 &format!("review-r{}", task.review_rounds),
                 self.next_run_seq(task.id).await?,
             ),
-        );
+        )?;
         let Some(outcome) = self
             .run_stage(task, &model, "review", req, false, slot)
             .await?

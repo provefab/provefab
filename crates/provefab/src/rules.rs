@@ -910,14 +910,18 @@ where
         let (dir, session) = self.scratch()?;
         // No tools (pre-flight S2): the prompt carries what anyone wrote on
         // the repository, and even read-only tools open any absolute path.
-        let req = p.request(
-            &dir,
-            prompt.to_string(),
-            ToolProfile::NoTools,
-            Some(schema.clone()),
-            p.config.limits.max_turns.plan,
-            session,
-        );
+        let mut req = p
+            .request(
+                self.repo,
+                &self.repo.path_in(&p.paths.home),
+                prompt.to_string(),
+                ToolProfile::NoTools,
+                Some(schema.clone()),
+                p.config.limits.max_turns.plan,
+                session,
+            )
+            .map_err(|e| failed("could not prepare rules sandbox".into(), e))?;
+        req.cwd = dir.clone();
         let started = SystemTime::now();
         let outcome = p.watched(&model, req, false).await;
         let _ = std::fs::remove_dir_all(&dir);

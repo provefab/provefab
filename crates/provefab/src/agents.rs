@@ -97,12 +97,58 @@ impl StageRunner for AgentRunner {
         req: StageRequest,
         events: UnboundedSender<WorkerEvent>,
     ) -> Result<StageResult, WorkerError> {
-        let req = apply_model(model, req);
+        let mut req = apply_model(model, req);
+        // Custom runner profiles are dependencies too, even when Paths.home differs.
+        for auth in [
+            &self.claude.config_dir,
+            &self.claude_api.config_dir,
+            &self.codex.codex_home,
+            &self.codex_api.codex_home,
+        ] {
+            req.sandbox
+                .deny_read
+                .push(std::path::absolute(auth).map_err(|e| WorkerError::Io(e.to_string()))?);
+        }
         match model.worker {
             WorkerKind::Pi => self.pi.run(&req, events).await,
             WorkerKind::ClaudeCode => self.claude_for(model.auth).run(&req, events).await,
             WorkerKind::Codex => {
-                let codex = self.codex_for(model.auth);
+                let configured = self.codex_for(model.auth);
+                let io = |e: std::io::Error| WorkerError::Io(e.to_string());
+                // App-server runs on the host before Worker::prepare_command. Pin before any probe.
+                let codex = CodexWorker {
+                    program: agent_workers::resolve_trusted_executable(
+                        &configured.program,
+                        &req.cwd,
+                        &req.session_dir,
+                    )
+                    .map_err(io)?,
+                    codex_home: agent_workers::trusted_path_target(
+                        &configured.codex_home,
+                        &req.cwd.canonicalize().map_err(io)?,
+                        &crate::sandbox::resolve(&req.session_dir.join("sandbox-tmp"))
+                            .map_err(io)?,
+                    )
+                    .ok_or_else(|| {
+                        WorkerError::Io(
+                            "Codex host auth profile is absent or traverses a writable root".into(),
+                        )
+                    })?,
+                    provefab_bin: configured.provefab_bin.clone(),
+                };
+                let cwd = req.cwd.canonicalize().map_err(io)?;
+                let auth = crate::sandbox::resolve(&codex.codex_home).map_err(io)?;
+                let scratch =
+                    crate::sandbox::resolve(&req.session_dir.join("sandbox-tmp")).map_err(io)?;
+                if auth.starts_with(&cwd)
+                    || cwd.starts_with(&auth)
+                    || auth.starts_with(&scratch)
+                    || scratch.starts_with(&auth)
+                {
+                    return Err(WorkerError::Io(
+                        "Codex host preflight auth home overlaps a writable root".into(),
+                    ));
+                }
                 // Spec D28, D31: pin the worktree untrusted, then refuse to run
                 // unless our guard hook is trusted and no project is.
                 let setup = |e: codex_setup::CodexSetupError| WorkerError::Io(e.to_string());
@@ -186,6 +232,40 @@ mod tests {
             timeout: Duration::from_secs(60),
             session_dir: "/s".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn codex_preflight_never_launches_a_worktree_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let marker = dir.path().join("launched");
+        let program = work.join("codex");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths::new(&dir.path().join("home"));
+        let plugins = InstalledPlugins {
+            pi_package: dir.path().join("pi"),
+            cc_plugin: dir.path().join("claude"),
+        };
+        let mut runner = AgentRunner::new(&paths, &plugins, "/bin/false".into());
+        runner.codex.program = program;
+        let mut request = req();
+        request.cwd = work;
+        request.session_dir = dir.path().join("session");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            runner
+                .run(&entry(WorkerKind::Codex, "gpt", ""), request, tx)
+                .await
+                .is_err()
+        );
+        assert!(!marker.exists(), "host preflight ran mutable Codex");
     }
 
     #[test]

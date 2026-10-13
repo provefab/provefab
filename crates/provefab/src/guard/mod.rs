@@ -3,6 +3,7 @@
 //! when in doubt it denies.
 
 pub mod adapters;
+pub(crate) mod native;
 mod paths;
 mod protected;
 mod shell;
@@ -54,6 +55,10 @@ pub enum Decision {
 
 /// `cwd` resolves relative paths; `root` is the task's worktree.
 pub fn check(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
+    let native = native::check(call, cwd, root);
+    if native != Decision::Allow {
+        return native;
+    }
     check_with(call, cwd, root, &protected::Protected::from_env(root))
 }
 
@@ -100,6 +105,10 @@ fn check_with(
 /// programs, so nothing the pull request wrote runs during its review, and
 /// every read stays inside the worktree.
 pub fn check_review(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
+    let native = native::check(call, cwd, root);
+    if native != Decision::Allow {
+        return native;
+    }
     match call {
         ToolCall::Shell { command } => {
             shell::check_review_command(command, Some(cwd.to_path_buf()), root)

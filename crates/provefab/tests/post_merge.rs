@@ -1168,3 +1168,36 @@ async fn a_merge_made_on_the_server_is_fetched_before_it_is_verified() {
     p.watch_pr(id).await.unwrap();
     assert_eq!(drive(&p, id).await.state, CheckState::Passed);
 }
+
+#[tokio::test]
+async fn sandbox_policy_reaches_merge_base_and_revert_checks() {
+    let command = "grep -q README.md \"$PROVEFAB_SANDBOX_POLICY\" && grep -q hello README.md";
+    let (f, mut p, id, _) = setup(&[command], "broken\n").await;
+    commit_and_push(
+        &f.config.repos[0].path_in(&f.home),
+        "later.txt",
+        "unrelated\n",
+        "Later base commit",
+    );
+    p.config.repos[0].sandbox.protected_paths = vec!["README.md".into()];
+    let row = drive(&p, id).await;
+    assert_eq!(row.state, CheckState::RevertOpen);
+    let runs = p.store.stage_runs(id).await.unwrap();
+    for stage in ["post-merge", "post-merge-base", "revert-check"] {
+        let run = runs
+            .iter()
+            .find(|r| r.stage == stage)
+            .unwrap_or_else(|| panic!("missing {stage}"));
+        let policy: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run.session_dir.join("sandbox-policy.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            policy["filesystem"]["denyWrite"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.as_str().is_some_and(|p| p.ends_with("README.md")))
+        );
+    }
+}

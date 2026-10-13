@@ -197,6 +197,11 @@ async fn only_a_pull_request_review_runs_under_the_read_only_marker() {
     let script = {
         let seen = seen.clone();
         move |m: &ModelEntry, req: &StageRequest, tx: &UnboundedSender<WorkerEvent>| {
+            assert!(
+                req.sandbox
+                    .deny_write
+                    .contains(&req.cwd.join("README.md").canonicalize().unwrap())
+            );
             seen.lock()
                 .unwrap()
                 .push((stage_of(&req.prompt).to_string(), req.tools));
@@ -208,7 +213,8 @@ async fn only_a_pull_request_review_runs_under_the_read_only_marker() {
             }
         }
     };
-    let f = fixture(&["true"]);
+    let mut f = fixture(&["true"]);
+    f.config.repos[0].sandbox.protected_paths = vec!["README.md".into()];
     push_head(&f, 12, &[("src/a.rs", "fn a() {}\n")]);
     let p = pipeline(
         &f,

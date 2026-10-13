@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use agent_workers::{SCRUBBED_ENV, ToolProfile, apply_worker_env, prepare_git_hooks};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 
 const TAIL_CHARS: usize = 4000;
 /// A single line longer than this is counted on its first part only.
@@ -97,11 +96,12 @@ pub async fn run_gates(
     commands: &[String],
     timeout: Duration,
     scratch: &Path,
+    policy: &agent_workers::SandboxPolicy,
 ) -> GateReport {
     let mut results = Vec::new();
     let mut score = ProgressScore::default();
     for command in commands {
-        let result = run_gate(worktree, command, timeout, scratch).await;
+        let result = run_gate(worktree, command, timeout, scratch, policy).await;
         if !result.passed {
             score.failing_gates += 1;
         }
@@ -163,7 +163,13 @@ async fn pump(mut reader: impl AsyncRead + Unpin, capture: Arc<Mutex<Capture>>) 
     }
 }
 
-async fn run_gate(worktree: &Path, command: &str, timeout: Duration, scratch: &Path) -> GateResult {
+async fn run_gate(
+    worktree: &Path,
+    command: &str,
+    timeout: Duration,
+    scratch: &Path,
+    policy: &agent_workers::SandboxPolicy,
+) -> GateResult {
     let failed = |tail: String| GateResult {
         command: command.to_string(),
         exit: None,
@@ -180,11 +186,11 @@ async fn run_gate(worktree: &Path, command: &str, timeout: Duration, scratch: &P
         Ok(h) => h,
         Err(e) => return failed(format!("could not prepare the gate environment: {e}")),
     };
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(worktree)
-        .stdin(Stdio::null())
+    let mut cmd = match agent_workers::gate_command(worktree, scratch, policy, command) {
+        Ok(cmd) => cmd,
+        Err(e) => return failed(format!("could not prepare native gate sandbox: {e}")),
+    };
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -321,6 +327,76 @@ fn number_before(line: &str, word: &str) -> u32 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn missing_runtime_never_runs_the_gate_command() {
+        let work = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = work.path().join("executed");
+        let policy = agent_workers::SandboxPolicy {
+            runtime: scratch.path().join("missing-srt"),
+            ..Default::default()
+        };
+        let report = run_gates(
+            work.path(),
+            &["touch executed".into()],
+            Duration::from_secs(5),
+            scratch.path(),
+            &policy,
+        )
+        .await;
+        assert!(!report.passed());
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_command_wiring_preserves_policy_argv_and_environment() {
+        let work = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let protected = work.path().join("check.sh");
+        std::fs::write(&protected, "validator").unwrap();
+        let secret = runtime.path().join("fake-secret");
+        std::fs::write(&secret, "secret").unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            deny_write: vec![protected.clone()],
+            deny_read: vec![secret.clone()],
+            ..Default::default()
+        };
+        let report = run_gates(work.path(), &["test -f \"$PROVEFAB_SANDBOX_POLICY\" && test \"$TMPDIR\" = \"$(dirname \"$PROVEFAB_SANDBOX_POLICY\")/sandbox-tmp\" && test -z \"${BASH_ENV:-}\" && echo command-wiring".into()], Duration::from_secs(5), scratch.path(), &policy).await;
+        assert!(report.passed(), "{:?}", report.results);
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(scratch.path().join("sandbox-policy.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            settings["filesystem"]["denyWrite"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(protected.canonicalize().unwrap()))
+        );
+        assert!(
+            settings["filesystem"]["denyRead"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(secret.canonicalize().unwrap()))
+        );
+        assert_eq!(settings["network"]["strictAllowedDomains"], true);
+        assert_eq!(settings["network"]["allowLocalBinding"], false);
+        let mut local = policy;
+        local.allow_local_network = true;
+        let refused = run_gates(
+            work.path(),
+            &["touch forbidden-marker".into()],
+            Duration::from_secs(5),
+            scratch.path(),
+            &local,
+        )
+        .await;
+        assert!(!refused.passed());
+        assert!(!work.path().join("forbidden-marker").exists());
+    }
+
     #[test]
     fn counts_failures_from_common_runners() {
         let nextest = "     Summary [   1.2s] 42 tests run: 40 passed, 2 failed, 1 skipped";
@@ -373,7 +449,19 @@ mod tests {
             "echo 'error: boom' >&2; exit 1".to_string(),
         ];
         let scratch = tempfile::tempdir().unwrap();
-        let report = run_gates(dir.path(), &gates, Duration::from_secs(10), scratch.path()).await;
+        let runtime = tempfile::tempdir().unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            ..Default::default()
+        };
+        let report = run_gates(
+            dir.path(),
+            &gates,
+            Duration::from_secs(10),
+            scratch.path(),
+            &policy,
+        )
+        .await;
         assert!(!report.passed());
         assert_eq!(
             report.results.iter().map(|r| r.passed).collect::<Vec<_>>(),
@@ -394,11 +482,18 @@ mod tests {
     async fn a_hung_gate_times_out_and_fails() {
         let dir = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            ..Default::default()
+        };
         let report = run_gates(
             dir.path(),
             &["echo partial; sleep 30".to_string()],
             Duration::from_millis(300),
-            dir.path(),
+            scratch.path(),
+            &policy,
         )
         .await;
         assert!(report.results[0].timed_out && !report.passed());
@@ -415,11 +510,18 @@ mod tests {
     async fn gates_do_not_see_push_credentials() {
         let dir = tempfile::tempdir().unwrap();
         // SSH_AUTH_SOCK is normally set in a desktop session; the gate must not see it either way.
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            ..Default::default()
+        };
         let report = run_gates(
             dir.path(),
             &["test -z \"${SSH_AUTH_SOCK:-}\" && test -z \"${GH_TOKEN:-}\"".to_string()],
             Duration::from_secs(5),
-            dir.path(),
+            scratch.path(),
+            &policy,
         )
         .await;
         assert!(report.passed(), "{:?}", report.results);
@@ -430,16 +532,22 @@ mod tests {
     #[tokio::test]
     async fn review_i1_gates_get_no_credential_helper_and_no_gh_config() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
         let check = "test -z \"$(git config --get credential.helper)\" \
              && test -n \"$(git config --get core.hooksPath)\" \
              && test -x \"$(git config --get core.hooksPath)/pre-push\" \
              && test -n \"${GH_CONFIG_DIR:-}\" && test ! -e \"$GH_CONFIG_DIR/hosts.yml\"";
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            ..Default::default()
+        };
         let report = run_gates(
             dir.path(),
             &[check.to_string()],
             Duration::from_secs(10),
             scratch.path(),
+            &policy,
         )
         .await;
         assert!(report.passed(), "{:?}", report.results);
@@ -449,11 +557,18 @@ mod tests {
     #[tokio::test]
     async fn review_i2_huge_output_keeps_a_bounded_tail() {
         let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            ..Default::default()
+        };
         let report = run_gates(
             dir.path(),
             &["yes 'some log line' | head -c 20000000; echo LAST".to_string()],
             Duration::from_secs(30),
-            dir.path(),
+            scratch.path(),
+            &policy,
         )
         .await;
         let tail = &report.results[0].output_tail;
@@ -467,11 +582,18 @@ mod tests {
     async fn review_i3_background_child_does_not_fake_a_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            ..Default::default()
+        };
         let report = run_gates(
             dir.path(),
             &["sleep 30 & echo ok; exit 0".to_string()],
             Duration::from_secs(10),
-            dir.path(),
+            scratch.path(),
+            &policy,
         )
         .await;
         assert!(
@@ -493,11 +615,18 @@ mod tests {
         let noisy = "echo 'test result: FAILED. 1 passed; 5 failed;'; \
              i=0; while [ $i -lt 400 ]; do echo 'warning: something long enough to fill the tail' >&2; i=$((i+1)); done; exit 1";
         let errors = "i=0; while [ $i -lt 60 ]; do echo \"error[E0308]: mismatched types $i\"; i=$((i+1)); done; exit 1";
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let policy = agent_workers::SandboxPolicy {
+            runtime: crate::testkit::fake_srt(runtime.path()),
+            ..Default::default()
+        };
         let report = run_gates(
             dir.path(),
             &[noisy.to_string(), errors.to_string()],
             Duration::from_secs(10),
-            dir.path(),
+            scratch.path(),
+            &policy,
         )
         .await;
         assert_eq!(report.score.failing_tests, 5, "{:?}", report.score);

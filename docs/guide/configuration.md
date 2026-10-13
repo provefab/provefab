@@ -17,7 +17,7 @@ Provefab reads `provefab.toml` from its home directory, `~/.provefab` by default
 | `pyproject.toml`, or `setup.py` or `setup.cfg` with a `tests` directory | `ruff check .` when ruff is configured (`[tool.ruff]` or `ruff.toml`), then `pytest` |
 | `go.mod` | `go vet ./...`, `go test ./...` |
 
-It reads these files through `gh` without cloning, or from your clone with `--path <checkout>`: its `origin` must be that GitHub repository, and the files are read from its committed default branch, not from your working tree. A repository with none of these, with several, or with a `package.json` without any of the three scripts (npm's placeholder `test` script does not count) is refused: write its block by hand. `repos add` never writes `local_path`, so Provefab keeps its own clone; set `local_path` by hand to use yours. It never writes a tracker, a risk policy or post-merge checks either: add them by hand. A task's worktree starts without installed dependencies: for a Python repository whose checks need them, put the install command first in `gates` (`repos add` prints a note, with `--dry-run` too). `--dry-run` prints the block instead of writing it. The commands' exit codes are in [Operations](operations.md#exit-codes).
+It reads these files through `gh` without cloning, or from your clone with `--path <checkout>`: its `origin` must be that GitHub repository, and the files are read from its committed default branch, not from your working tree. A repository with none of these, with several, or with a `package.json` without any of the three scripts (npm's placeholder `test` script does not count) is refused: write its block by hand. `repos add` never writes `local_path`, so Provefab keeps its own clone; set `local_path` by hand to use yours. It never writes a tracker, a risk policy or post-merge checks either: add them by hand. A task's worktree starts without installed dependencies: provision required dependencies in trusted locations before running gates. The native policy denies network downloads during checks; older `repos add` notes suggesting installation inside gates do not grant network access. `--dry-run` prints the block instead of writing it. The commands' exit codes are in [Operations](operations.md#exit-codes).
 
 ## Secrets
 
@@ -118,6 +118,30 @@ For gates that work well:
 - Fast commands speed up every loop.
 - If the repository has slow tests, keep a representative subset and let your GitHub CI do the rest.
 - **Never share a build directory between tasks** (for example one `CARGO_TARGET_DIR` for every worktree). Cargo can then reuse binaries built from another task's code, and the checks pass or fail on the wrong code. Each worktree builds in its own `target/`, which the agent already warmed during implementation. To go faster safely, use a content-addressed cache such as `sccache` (`RUSTC_WRAPPER=sccache`).
+
+## `[repos.sandbox]`: native execution policy
+
+Every stage and gate receives this repository's policy, including reproduction, risk checks, post-merge checks and revert verification. Unknown keys in this table are errors.
+
+| Field | Default | Role |
+|---|---|---|
+| `runtime` | `"srt"` | SRT executable for gates and Pi Bash. Provision it outside the worktree; an absolute path or trusted PATH lookup is accepted. Tested version: 0.0.79, minimum 0.0.79. Missing or unsupported runtime fails before execution. |
+| `allow_local_network` | `false` | Gate-only request. `true` currently refuses on every platform because loopback-only binding is unverified. SRT can allow listening on non-loopback interfaces; no wider permission is inferred. Workers always keep strict network denial. |
+| `protected_paths` | `[]` | Existing literal paths, relative to the validation worktree or absolute externally. These paths cannot be written by native commands or direct Write/Edit/patch tools. Missing paths, wildcards, `..`, mutable symlink aliases and declarations encompassing the worktree root are refused. |
+| `deny_read` | `[]` | Additional literal absolute paths that commands and direct read/search tools must not read. Existing ancestors are resolved even for absent secret leaves. |
+
+```toml
+[repos.sandbox]
+runtime = "/opt/provefab-runtime/srt"
+protected_paths = ["tests", "scripts/check.sh", "Cargo.lock", "/opt/validators/project"]
+deny_read = ["/srv/private/service-token"]
+```
+
+SRT must be separately provisioned in a trusted directory using the [sandbox-runtime installation instructions](https://github.com/anthropics/sandbox-runtime). Its dependencies must also remain outside writable roots. Network is denied during checks, including package downloads; provision dependencies before a run. Native validation has been exercised on macOS; Linux enforcement is unverified and unavailable enforcement must fail closed.
+
+An empty `protected_paths` list provides no immutable-validation guarantee. Declare every script, test configuration, lockfile and dependency defining success, or keep them outside writable roots. Protecting one entrypoint does not protect its dependency closure. Command and interpreter resolution also matters: PATH entries and aliases through writable roots are excluded. A protected file missing from a review or reverted tree causes a validation error. NoTools maintenance resolves relative declarations against the real repository while its model runs in a separate empty directory.
+
+Claude stages currently require exactly 2.1.296, personal first-party claude.ai Pro/Max authentication, empty inherited user settings and absence of managed settings, remote policy caches and state sources. API keys, Team/Enterprise and executable helpers are unsupported by this verified adapter and refuse before launch. Do not delete user authentication or state to make a run proceed. Codex requires at least 0.162.1, a dedicated untrusted project profile and only Provefab's guard hook among effective enabled/trusted hooks. See [Security](security.md).
 
 ## `[repos.risk]`: risk-aware policy
 

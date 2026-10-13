@@ -94,7 +94,13 @@ pub fn run_guard_no_tools(format: GuardFormat, stdin: &str) -> GuardOutput {
         return unreadable(format);
     };
     let decision = if Some(tool) == answer {
-        Decision::Allow
+        match std::env::var_os("PROVEFAB_WORKTREE") {
+            Some(root) => guard::native::validate_named(Path::new(&root)),
+            None if std::env::var_os(agent_workers::SANDBOX_POLICY_ENV).is_some() => {
+                Decision::Deny("native policy requires a worktree".into())
+            }
+            None => Decision::Allow,
+        }
     } else {
         Decision::Deny("this stage has no tools, so every tool call is refused".into())
     };

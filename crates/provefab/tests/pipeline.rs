@@ -251,7 +251,8 @@ async fn bugfix_whose_repro_already_passes_needs_you() {
 
 #[tokio::test]
 async fn bugfix_repro_must_fail_before_and_pass_after() {
-    let f = fixture(&["true"]);
+    let mut f = fixture(&["true"]);
+    f.config.repos[0].sandbox.protected_paths = vec!["README.md".into()];
     let script =
         |_: &ModelEntry, req: &StageRequest, _: &UnboundedSender<WorkerEvent>| match stage_of(
             &req.prompt,
@@ -282,6 +283,17 @@ async fn bugfix_repro_must_fail_before_and_pass_after() {
     let runs = p.store.stage_runs(id).await.unwrap();
     let repro = runs.iter().find(|r| r.stage == "repro").unwrap();
     assert_eq!(repro.exit, "failed");
+    let policy: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repro.session_dir.join("sandbox-policy.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        policy["filesystem"]["denyWrite"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|p| p.ends_with("README.md")))
+    );
 }
 
 #[tokio::test]
@@ -1350,4 +1362,35 @@ async fn a_signed_out_worker_never_posts_or_stores_a_token() {
             .all(|t| !t.reason.contains("SECRETSECRET")),
         "{transitions:?}"
     );
+}
+
+#[tokio::test]
+async fn sandbox_policy_reaches_plan_implement_review_and_gates() {
+    let mut f = fixture(&["test -f \"$PROVEFAB_SANDBOX_POLICY\" && test -f feature.txt"]);
+    f.config.repos[0].sandbox.protected_paths = vec!["README.md".into()];
+    let home = f.home.clone();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let script: Box<Script> = Box::new(move |model, req, tx| {
+        assert!(
+            req.sandbox
+                .deny_write
+                .contains(&req.cwd.join("README.md").canonicalize().unwrap())
+        );
+        assert!(
+            req.sandbox
+                .deny_read
+                .iter()
+                .any(|p| p.ends_with("provefab.db") && p.starts_with(&home))
+        );
+        recorded.lock().unwrap().push(stage_of(&req.prompt));
+        happy(model, req, tx)
+    });
+    let p = pipeline(&f, script, FakeOracle::default(), FakeHub::new("x")).await;
+    let id = queue(&p).await;
+    assert_eq!(p.drive(id).await.unwrap(), PrOpen);
+    let seen = seen.lock().unwrap();
+    for stage in ["plan", "implement", "review"] {
+        assert!(seen.contains(&stage), "{seen:?}");
+    }
 }

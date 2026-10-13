@@ -404,7 +404,9 @@ pub fn resolve_trusted_executable(
 
 // Even an external PATH directory can redirect an env-shebang interpreter through
 // writable aliases. Inspect every entry; any ambiguity drops the whole directory.
-fn trusted_path_target(
+/// Resolve every expanded component, refusing traversal through either writable root.
+/// Returns None for missing paths, loops or inspection errors.
+pub fn trusted_path_target(
     path: &std::path::Path,
     worktree: &std::path::Path,
     temporary: &std::path::Path,

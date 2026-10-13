@@ -596,6 +596,7 @@ where
             ],
         );
         let req = self.request(
+            repo,
             &wt,
             prompt,
             // Final review I1: nothing the pull request wrote may run.
@@ -607,7 +608,7 @@ where
                 &format!("review-r{}", task.review_rounds),
                 self.next_run_seq(task.id).await?,
             ),
-        );
+        )?;
         let Some(outcome) = self
             .run_stage(task, &model, "review", req, false, slot)
             .await?

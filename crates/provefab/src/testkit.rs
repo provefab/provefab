@@ -691,6 +691,15 @@ model = "opus"
 tier = "frontier"
 "#;
 
+/// Command-wiring fake only: this executes the command and supplies no OS isolation.
+pub fn fake_srt(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-srt-command-wiring");
+    std::fs::write(&path, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'srt 0.0.79'; exit 0; fi\n[ \"$1\" = --settings ] || exit 90\n[ -f \"$2\" ] || exit 91\nshift 2\n[ \"$1\" = -- ] || exit 92\nshift\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 pub fn fixture(gates: &[&str]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let origin = dir.path().join("origin.git");
@@ -725,7 +734,8 @@ pub fn fixture(gates: &[&str]) -> Fixture {
         local.display().to_string(),
         gates.join(", ")
     );
-    let config = Config::from_toml_str(&toml).unwrap();
+    let mut config = Config::from_toml_str(&toml).unwrap();
+    config.repos[0].sandbox.runtime = fake_srt(dir.path());
     Fixture {
         _dir: dir,
         origin,

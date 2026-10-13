@@ -140,6 +140,8 @@ pub struct RepoConfig {
     pub poll_interval: Duration,
     #[serde(default)]
     pub trust_pi_project: bool,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     /// Commands run in the worktree after every implement stage. At least one.
     pub gates: Vec<String>,
     /// Explicit commands run against the exact merge commit after this repo's
@@ -152,6 +154,26 @@ pub struct RepoConfig {
     /// `[repos.tracker]`: where issues come from. Absent: GitHub (issue trackers spec §5).
     #[serde(default)]
     pub tracker: Option<crate::tracker::TrackerConfig>,
+}
+
+/// Explicit validation and host-secret declarations. Unknown security keys are errors.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SandboxConfig {
+    pub allow_local_network: bool,
+    pub protected_paths: Vec<PathBuf>,
+    pub deny_read: Vec<PathBuf>,
+    pub runtime: PathBuf,
+}
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            allow_local_network: false,
+            protected_paths: Vec::new(),
+            deny_read: Vec::new(),
+            runtime: "srt".into(),
+        }
+    }
 }
 
 impl RepoConfig {
@@ -363,6 +385,8 @@ impl Config {
         }
         let mut slugs = HashSet::new();
         for r in &self.repos {
+            crate::sandbox::validate_config(&r.sandbox)
+                .map_err(|e| ConfigError::Parse(format!("{}: [repos.sandbox]: {e}", r.slug)))?;
             if r.retired_auto_merge.is_some() {
                 return Err(ConfigError::RetiredKey(r.slug.clone(), "auto_merge"));
             }
@@ -443,6 +467,39 @@ gates = ["cargo fmt -- --check"]
 stage_timeout = "30m"
 review_rounds = 2
 "#;
+
+    #[test]
+    fn sandbox_defaults_are_strict_and_path_declarations_are_literal() {
+        let text = format!("{BASE}[[repos]]\nslug='o/r'\ngates=['true']\n");
+        let repo = Config::from_toml_str(&text).unwrap().repos.remove(0);
+        assert_eq!(repo.sandbox, SandboxConfig::default());
+        for security in [
+            "deny_read=['relative']",
+            "deny_read=['/tmp/secret*']",
+            "protected_paths=['../check']",
+            "protected_paths=['checks/*.sh']",
+            "runtime=''",
+            "allow_network=true",
+        ] {
+            assert!(
+                Config::from_toml_str(&format!("{text}[repos.sandbox]\n{security}\n")).is_err(),
+                "{security}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_unknown_security_keys_fail_closed() {
+        let text = format!(
+            r#"{BASE}[[repos]]
+slug = "o/r"
+gates = ["true"]
+[repos.sandbox]
+allow_unsandboxed = true
+"#
+        );
+        assert!(Config::from_toml_str(&text).is_err());
+    }
 
     #[test]
     fn parses_the_spec_example() {

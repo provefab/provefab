@@ -37,6 +37,10 @@ pub enum CodexSetupError {
         "codex: {0} is marked trusted in Provefab's Codex config, so its own .codex/ config would apply; remove that entry"
     )]
     ProjectTrusted(String),
+    #[error(
+        "codex: additional enabled/trusted hooks exist; disable them in the dedicated Provefab profile before running"
+    )]
+    AdditionalHooks,
     #[error("codex: {0}")]
     ConfigUnreadable(String),
 }
@@ -112,7 +116,7 @@ pub fn resolve_home(codex_home: &Path) -> PathBuf {
 pub async fn setup(codex: &Path, codex_home: &Path, cwd: &Path) -> Result<(), CodexSetupError> {
     write_hooks(codex_home)?;
     let codex_home = &resolve_home(codex_home);
-    let mut server = AppServer::start(codex, codex_home).await?;
+    let mut server = AppServer::start(codex, codex_home, cwd).await?;
     let ours = find_our_hook(&mut server, codex_home, cwd).await?;
     if !is_trusted(&ours) {
         let hash = ours
@@ -150,12 +154,16 @@ pub async fn setup(codex: &Path, codex_home: &Path, cwd: &Path) -> Result<(), Co
 /// Directories Codex may key project trust on for this worktree: the worktree
 /// itself and, for a linked git worktree, its main repository (Codex resolves
 /// trust to the root git project).
-pub fn trust_targets(worktree: &Path) -> Vec<PathBuf> {
+pub fn trust_targets(worktree: &Path) -> Result<Vec<PathBuf>, CodexSetupError> {
     let wt = worktree
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
     let mut targets = vec![wt.clone()];
-    let common = std::process::Command::new("git")
+    let scratch = wt.parent().unwrap_or(&wt).join(".provefab-trust-preflight");
+    // Missing trusted git refuses: silently omitting the main repository could leave it auto-trusted.
+    let git = agent_workers::resolve_trusted_executable(Path::new("git"), &wt, &scratch)?;
+    let common = std::process::Command::new(git)
+        .env("PATH", agent_workers::trusted_path(&wt, &scratch))
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(&wt)
         .output()
@@ -169,7 +177,7 @@ pub fn trust_targets(worktree: &Path) -> Vec<PathBuf> {
     {
         targets.push(main);
     }
-    targets
+    Ok(targets)
 }
 
 /// Before every Codex stage. Codex marks a project trusted by itself (and
@@ -183,7 +191,7 @@ pub async fn pin_untrusted(
     worktree: &Path,
 ) -> Result<(), CodexSetupError> {
     let codex_home = &resolve_home(codex_home);
-    let value: serde_json::Map<String, Value> = trust_targets(worktree)
+    let value: serde_json::Map<String, Value> = trust_targets(worktree)?
         .into_iter()
         .map(|p| {
             (
@@ -192,7 +200,7 @@ pub async fn pin_untrusted(
             )
         })
         .collect();
-    let mut server = AppServer::start(codex, codex_home).await?;
+    let mut server = AppServer::start(codex, codex_home, worktree).await?;
     let written = server
         .request(
             "config/batchWrite",
@@ -225,11 +233,12 @@ pub async fn check(codex: &Path, codex_home: &Path, cwd: &Path) -> Result<(), Co
     if let Some(p) = trusted.into_iter().next() {
         return Err(CodexSetupError::ProjectTrusted(p));
     }
-    let mut server = AppServer::start(codex, codex_home).await?;
+    let mut server = AppServer::start(codex, codex_home, cwd).await?;
     let ours = find_our_hook(&mut server, codex_home, cwd).await;
     server.stop().await;
     match ours {
         Ok(h) if is_trusted(&h) => Ok(()),
+        Err(error) => Err(error),
         _ => Err(CodexSetupError::HookNotTrusted(
             codex_home.join("hooks.json"),
         )),
@@ -252,26 +261,36 @@ async fn find_our_hook(
         .request("hooks/list", json!({ "cwds": [cwd] }))
         .await?;
     let key = hook_key(codex_home);
-    listed
-        .pointer("/data")
+    let data = listed
+        .get("data")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|entry| {
-            entry
-                .get("hooks")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-        })
-        .find(|h| {
-            h.get("key").and_then(Value::as_str) == Some(key.as_str())
-                && h.get("source").and_then(Value::as_str) == Some("user")
-                && h.get("command").and_then(Value::as_str) == Some(HOOK_COMMAND)
-        })
-        .ok_or(CodexSetupError::HookNotTrusted(
-            codex_home.join("hooks.json"),
-        ))
+        .ok_or_else(|| CodexSetupError::Rpc("hooks/list omitted effective hooks".into()))?;
+    let mut ours = None;
+    for entry in data {
+        let hooks = entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CodexSetupError::Rpc("hooks/list entry omitted hooks".into()))?;
+        for hook in hooks {
+            let matches = hook.get("key").and_then(Value::as_str) == Some(key.as_str())
+                && hook.get("source").and_then(Value::as_str) == Some("user")
+                && hook.get("command").and_then(Value::as_str) == Some(HOOK_COMMAND);
+            if matches {
+                if ours.is_some() {
+                    return Err(CodexSetupError::AdditionalHooks);
+                }
+                ours = Some(hook.clone());
+            } else if hook.get("enabled").and_then(Value::as_bool) != Some(false)
+                || hook.get("trustStatus").and_then(Value::as_str) == Some("trusted")
+            {
+                // Unknown enabled state also refuses. Do not delete or silently distrust user hooks.
+                return Err(CodexSetupError::AdditionalHooks);
+            }
+        }
+    }
+    ours.ok_or(CodexSetupError::HookNotTrusted(
+        codex_home.join("hooks.json"),
+    ))
 }
 
 /// Minimal JSON-RPC client for `codex app-server` over stdio.
@@ -283,8 +302,12 @@ struct AppServer {
 }
 
 impl AppServer {
-    async fn start(codex: &Path, codex_home: &Path) -> Result<Self, CodexSetupError> {
-        let mut child = Command::new(codex)
+    async fn start(codex: &Path, codex_home: &Path, cwd: &Path) -> Result<Self, CodexSetupError> {
+        let codex = agent_workers::resolve_trusted_executable(codex, cwd, codex_home)?;
+        let mut command = Command::new(codex);
+        agent_workers::sanitize_environment(&mut command);
+        command.env("PATH", agent_workers::trusted_path(cwd, codex_home));
+        let mut child = command
             .arg("app-server")
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
@@ -361,6 +384,61 @@ impl AppServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn per_run_check_refuses_other_enabled_trusted_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let work = dir.path().join("work");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let program = dir.path().join("fake-app-server.py");
+        let hooks = json!({"data": [{"hooks": [
+            {"key": hook_key(&home.canonicalize().unwrap()), "source": "user", "command": HOOK_COMMAND, "trustStatus": "trusted", "enabled": true},
+            {"key": "extra", "source": "user", "command": "./editable-helper", "trustStatus": "trusted", "enabled": true}
+        ]}]});
+        std::fs::write(&program, format!("#!/usr/bin/python3\nimport json,sys\nhooks=json.loads({:?})\nfor line in sys.stdin:\n m=json.loads(line)\n if 'id' in m:\n  result=hooks if m.get('method')=='hooks/list' else {{}}\n  print(json.dumps({{'id':m['id'],'result':result}}),flush=True)\n", hooks.to_string())).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = check(&program, &home, &work)
+            .await
+            .expect_err("extra hook accepted");
+        assert!(error.to_string().contains("additional"), "{error}");
+    }
+
+    #[test]
+    fn trust_targets_never_launches_worktree_git_from_relative_path() {
+        if std::env::var_os("PROVEFAB_TEST_MUTABLE_GIT").is_some() {
+            let work = PathBuf::from(std::env::var_os("PROVEFAB_TEST_MUTABLE_GIT").unwrap());
+            let _ = trust_targets(&work);
+            assert!(
+                !work.join("executed").exists(),
+                "mutable git preflight executed"
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        let git = dir.path().join("bin/git");
+        std::fs::write(&git, "#!/bin/sh\ntouch executed\nexit 1\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "codex_setup::tests::trust_targets_never_launches_worktree_git_from_relative_path",
+                "--nocapture",
+            ])
+            .env("PROVEFAB_TEST_MUTABLE_GIT", dir.path())
+            .env("PATH", "bin:/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     #[test]
     fn hooks_json_runs_the_guard_on_every_tool_and_fails_closed() {
@@ -472,7 +550,7 @@ mod tests {
         );
         let linked = dir.path().join("linked");
         run(&["worktree", "add", "-q", linked.to_str().unwrap()], &main);
-        let targets = trust_targets(&linked);
+        let targets = trust_targets(&linked).unwrap();
         assert!(
             targets.contains(&linked.canonicalize().unwrap()),
             "{targets:?}"
@@ -481,7 +559,7 @@ mod tests {
             targets.contains(&main.canonicalize().unwrap()),
             "{targets:?}"
         );
-        let plain = trust_targets(&main);
+        let plain = trust_targets(&main).unwrap();
         assert_eq!(plain, vec![main.canonicalize().unwrap()]);
     }
 }
