@@ -76,7 +76,7 @@ impl PiWorker {
         let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
         req.sandbox.deny_write.push(program.clone());
         let runtime = crate::sandbox::executable(&req.sandbox.runtime, &req.cwd, &req.session_dir)?;
-        crate::sandbox::check_version(&runtime, [0, 0, 79])?;
+        crate::sandbox::check_version(&runtime, [0, 0, 79], &req)?;
         req.sandbox.deny_write.push(runtime.clone());
         let policy = crate::sandbox::write_policy(&req, false)?;
         let mut cmd = Command::new(program);

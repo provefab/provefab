@@ -89,8 +89,8 @@ impl ClaudeCodeWorker {
 
 impl ClaudeCodeWorker {
     /// The full command, environment included, for one stage.
-    fn command(&self, req: &StageRequest) -> Command {
-        let mut cmd = Command::new(&self.program);
+    fn command(&self, program: &std::path::Path, req: &StageRequest) -> Command {
+        let mut cmd = Command::new(program);
         cmd.args(self.args(req)).current_dir(&req.cwd);
         crate::sanitize_environment(&mut cmd);
         apply_worker_env(
@@ -113,12 +113,19 @@ impl ClaudeCodeWorker {
             &[self.plugin_dir.clone(), self.provefab_bin.clone()],
             std::slice::from_ref(&self.config_dir),
         )?;
+        crate::sandbox::check_claude_host_policy()?;
         crate::sandbox::check_claude_settings(&self.config_dir)?;
         let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
-        crate::sandbox::check_version(&program, [2, 1, 296])?;
-        req.sandbox.deny_write.push(program);
+        let version = crate::sandbox::check_version(&program, [2, 1, 296], &req)?;
+        if version != [2, 1, 296] {
+            return Err(std::io::Error::other(
+                "Claude sandbox policy inspection supports exactly 2.1.296; other versions require policy-source revalidation",
+            ));
+        }
+        crate::sandbox::check_claude_account(&program, &self.config_dir, &req)?;
+        req.sandbox.deny_write.push(program.clone());
         let policy = crate::sandbox::write_policy(&req, false)?;
-        let mut cmd = self.command(&req);
+        let mut cmd = self.command(&program, &req);
         crate::sandbox::apply_temporary_env(&mut cmd, &req);
         cmd.env(crate::SANDBOX_POLICY_ENV, policy);
         Ok(cmd)
@@ -407,7 +414,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--json-schema"), "{args:?}");
         let no_tools = |r: &StageRequest| {
             worker()
-                .command(r)
+                .command(&worker().program, r)
                 .as_std()
                 .get_envs()
                 .find(|(k, _)| *k == NO_TOOLS_ENV)
@@ -432,7 +439,7 @@ mod tests {
         assert_eq!(args[at + 1], "Read,Grep,Glob", "{args:?}");
         assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
         let marker = worker()
-            .command(&review)
+            .command(&worker().program, &review)
             .as_std()
             .get_envs()
             .find(|(k, _)| *k == crate::UNTRUSTED_REVIEW_ENV)
@@ -443,7 +450,7 @@ mod tests {
     /// Final review M6: other switches that move Claude Code off the subscription are removed too.
     #[test]
     fn review_m6_provider_switches_are_removed() {
-        let cmd = worker().command(&req());
+        let cmd = worker().command(&worker().program, &req());
         let removed: Vec<String> = cmd
             .as_std()
             .get_envs()
@@ -474,7 +481,7 @@ mod tests {
 
     #[test]
     fn command_removes_api_keys_and_sets_the_provefab_config_dir() {
-        let cmd = worker().command(&req());
+        let cmd = worker().command(&worker().program, &req());
         let envs: Vec<(String, Option<String>)> = cmd
             .as_std()
             .get_envs()

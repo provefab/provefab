@@ -48,6 +48,7 @@ impl CodexWorker {
         push(&req.model);
         for setting in [
             "approval_policy=\"never\"".to_string(),
+            "web_search=\"disabled\"".to_string(),
             "default_permissions=\"provefab\"".to_string(),
             "permissions.provefab.network.enabled=false".to_string(),
             req.sandbox.codex_filesystem(req, &self.codex_home),
@@ -72,10 +73,8 @@ impl CodexWorker {
             req.tools,
             ToolProfile::NoTools | ToolProfile::UntrustedReadOnly
         ) {
-            for setting in ["web_search=\"disabled\"", "features.view_image=false"] {
-                push("-c");
-                push(setting);
-            }
+            push("-c");
+            push("features.view_image=false");
         }
         if req.output_schema.is_some() {
             a.push("--output-schema".into());
@@ -86,8 +85,8 @@ impl CodexWorker {
     }
 
     /// The full command, environment included, for one stage.
-    fn command(&self, req: &StageRequest, prompt: &str) -> Command {
-        let mut cmd = Command::new(&self.program);
+    fn command(&self, program: &std::path::Path, req: &StageRequest, prompt: &str) -> Command {
+        let mut cmd = Command::new(program);
         cmd.args(self.args(req, prompt)).current_dir(&req.cwd);
         crate::sanitize_environment(&mut cmd);
         apply_worker_env(
@@ -113,10 +112,10 @@ impl CodexWorker {
             std::slice::from_ref(&self.codex_home),
         )?;
         let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
-        crate::sandbox::check_version(&program, [0, 162, 1])?;
+        crate::sandbox::check_version(&program, [0, 162, 1], &req)?;
         req.sandbox.deny_write.push(program.clone());
         let policy = crate::sandbox::write_policy(&req, false)?;
-        let mut cmd = self.command(&req, prompt);
+        let mut cmd = self.command(&program, &req, prompt);
         crate::sandbox::apply_temporary_env(&mut cmd, &req);
         cmd.env(crate::SANDBOX_POLICY_ENV, policy);
         Ok(cmd)
@@ -396,19 +395,21 @@ mod tests {
         assert!(!args.contains("\"/w\"=\"write\""), "{args}");
         // Final review: Codex's own web search and image viewer stay off too.
         assert!(
-            args.contains("-c web_search=\"disabled\" -c features.view_image=false"),
+            args.contains("-c web_search=\"disabled\"")
+                && args.contains("-c features.view_image=false"),
             "{args}"
         );
         let review = joined(worker().args(&req(ToolProfile::ReadOnly, true), "R"));
-        assert!(!review.contains("web_search"), "{review}");
+        assert!(review.contains("web_search=\"disabled\""), "{review}");
         // The scratch directory is no git repository: Codex refuses it
         // without this flag. Stages run in git worktrees and never pass it.
         assert!(args.contains("--skip-git-repo-check"), "{args}");
         let full = joined(worker().args(&req(ToolProfile::Full, false), "F"));
         for a in [&review, &full] {
+            assert!(a.contains("web_search=\"disabled\""), "{a}");
             assert!(!a.contains("--skip-git-repo-check"), "{a}");
         }
-        let cmd = worker().command(&none, "Answer");
+        let cmd = worker().command(&worker().program, &none, "Answer");
         let set = cmd
             .as_std()
             .get_envs()
@@ -426,12 +427,13 @@ mod tests {
         assert!(!args.contains("\"/w\"=\"write\""), "{args}");
         // No web search or image viewer either: nothing read leaves through them.
         assert!(
-            args.contains("-c web_search=\"disabled\" -c features.view_image=false"),
+            args.contains("-c web_search=\"disabled\"")
+                && args.contains("-c features.view_image=false"),
             "{args}"
         );
         assert!(!args.contains("--skip-git-repo-check"), "{args}");
         let marker = worker()
-            .command(&review, "Review")
+            .command(&worker().program, &review, "Review")
             .as_std()
             .get_envs()
             .find(|(k, _)| *k == crate::UNTRUSTED_REVIEW_ENV)
@@ -441,7 +443,7 @@ mod tests {
 
     #[test]
     fn command_uses_the_provefab_codex_home_and_drops_api_keys() {
-        let cmd = worker().command(&req(ToolProfile::Full, false), "Fix it");
+        let cmd = worker().command(&worker().program, &req(ToolProfile::Full, false), "Fix it");
         let envs: Vec<(String, Option<String>)> = cmd
             .as_std()
             .get_envs()

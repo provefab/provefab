@@ -11,6 +11,22 @@ use agent_workers::{
 };
 use serde_json::json;
 
+// HOME isolation belongs to the test subprocess, never global mutation in parallel tests.
+fn with_clean_home(test: &str) -> bool {
+    if std::env::var_os("PROVEFAB_CLEAN_TEST_HOME").is_some() {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("HOME", home.path())
+        .env("PROVEFAB_CLEAN_TEST_HOME", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    true
+}
+
 struct Fake {
     dir: tempfile::TempDir,
 }
@@ -21,7 +37,8 @@ impl Fake {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("out.jsonl"), stream).unwrap();
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 9.9.9; exit 0; fi\n\
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2.1.296; exit 0; fi\n\
+             if [ \"$1\" = --setting-sources ]; then echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"subscriptionType\":\"max\"}}'; exit 0; fi\n\
              {{ for a in \"$@\"; do echo \"ARG $a\"; done\n\
                echo \"ENV PROVEFAB_WORKTREE=$PROVEFAB_WORKTREE\"\n\
                echo \"ENV PROVEFAB_BIN=$PROVEFAB_BIN\"\n\
@@ -260,6 +277,9 @@ const CLAUDE_STREAM: &str = concat!(
 
 #[tokio::test]
 async fn claude_worker_end_to_end() {
+    if with_clean_home("claude_worker_end_to_end") {
+        return;
+    }
     let fake = Fake::new(CLAUDE_STREAM, 0, 0);
     let wt = tempfile::tempdir().unwrap();
     let w = ClaudeCodeWorker {
@@ -295,6 +315,9 @@ async fn claude_worker_end_to_end() {
 
 #[tokio::test]
 async fn claude_worker_without_result_record_is_a_crash() {
+    if with_clean_home("claude_worker_without_result_record_is_a_crash") {
+        return;
+    }
     let fake = Fake::new(r#"{"type":"system","subtype":"init"}"#, 0, 1);
     let wt = tempfile::tempdir().unwrap();
     let w = ClaudeCodeWorker {
@@ -400,6 +423,9 @@ async fn native_preparation_rejects_session_inside_worktree_before_launch() {
 
 #[tokio::test]
 async fn native_preparation_rejects_claude_user_sandbox_override_before_launch() {
+    if with_clean_home("native_preparation_rejects_claude_user_sandbox_override_before_launch") {
+        return;
+    }
     let fake = Fake::new(CLAUDE_STREAM, 0, 0);
     let wt = tempfile::tempdir().unwrap();
     let session = tempfile::tempdir().unwrap();
@@ -419,4 +445,131 @@ async fn native_preparation_rejects_claude_user_sandbox_override_before_launch()
     let (tx, _) = tokio::sync::mpsc::unbounded_channel();
     assert!(w.run(&r, tx).await.is_err());
     assert!(!fake.dir.path().join("log.txt").exists());
+}
+
+#[tokio::test]
+async fn prepared_native_workers_pin_the_executable_before_changing_cwd() {
+    if with_clean_home("prepared_native_workers_pin_the_executable_before_changing_cwd") {
+        return;
+    }
+    const ROOT: &str = "PROVEFAB_TEST_EXECUTABLE_ROOT";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = PathBuf::from(root);
+        let req = request(&root, false);
+        let codex = CodexWorker {
+            program: "agent".into(),
+            codex_home: root.join("auth"),
+            provefab_bin: root.join("guard"),
+        };
+        let claude = ClaudeCodeWorker {
+            program: "agent".into(),
+            config_dir: root.join("auth"),
+            plugin_dir: root.join("plugin"),
+            provefab_bin: root.join("guard"),
+        };
+        for mut command in [
+            codex.prepare_command(&req, "test").unwrap(),
+            claude.prepare_command(&req).unwrap(),
+        ] {
+            assert_eq!(
+                command.as_std().get_program(),
+                root.join("trusted/agent").canonicalize().unwrap()
+            );
+            let out = command.output().await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "trusted");
+        }
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    for (directory, result) in [("trusted", "trusted"), ("work/trusted", "untrusted")] {
+        let path = root.path().join(directory);
+        std::fs::create_dir_all(&path).unwrap();
+        let bin = path.join("agent");
+        std::fs::write(&bin, format!("#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then echo 2.1.296; elif [ \"$1\" = --setting-sources ]; then echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"subscriptionType\":\"max\"}}'; else echo {result}; fi\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let evil = root.path().join("work/trusted/sh");
+    std::fs::write(
+        &evil,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexit 77\n",
+            root.path().join("interpreter-marker").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "prepared_native_workers_pin_the_executable_before_changing_cwd",
+            "--nocapture",
+        ])
+        .current_dir(root.path())
+        .env(ROOT, root.path())
+        .env(
+            "PATH",
+            format!(
+                "./trusted:./work/trusted::{}",
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!root.path().join("interpreter-marker").exists());
+}
+
+#[tokio::test]
+async fn claude_host_state_refuses_before_agent_start() {
+    if with_clean_home("claude_host_state_refuses_before_agent_start") {
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    std::fs::create_dir_all(home.join(".claude/state")).unwrap();
+    let fake = Fake::new("", 0, 0);
+    let root = tempfile::tempdir().unwrap();
+    let worker = ClaudeCodeWorker {
+        program: fake.bin(),
+        config_dir: fake.dir.path().join("auth"),
+        plugin_dir: fake.dir.path().join("plugin"),
+        provefab_bin: fake.bin(),
+    };
+    let error = worker
+        .prepare_command(&request(root.path(), false))
+        .unwrap_err();
+    assert!(error.to_string().contains("state"), "{error}");
+    assert!(!fake.dir.path().join("log.txt").exists());
+}
+
+#[tokio::test]
+async fn claude_preflight_refuses_unknown_versions_and_nonpersonal_auth() {
+    if with_clean_home("claude_preflight_refuses_unknown_versions_and_nonpersonal_auth") {
+        return;
+    }
+    for (version, status) in [
+        ("2.1.297", "max"),
+        ("2.1.296", "team"),
+        ("2.1.296", "enterprise"),
+    ] {
+        let fake = Fake::new("", 0, 0);
+        let path = fake.bin();
+        let script = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("2.1.296", version)
+            .replace("max", status);
+        std::fs::write(&path, script).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let worker = ClaudeCodeWorker {
+            program: path,
+            config_dir: fake.dir.path().join("auth"),
+            plugin_dir: fake.dir.path().join("plugin"),
+            provefab_bin: fake.bin(),
+        };
+        assert!(
+            worker
+                .prepare_command(&request(root.path(), false))
+                .is_err()
+        );
+        assert!(!fake.dir.path().join("log.txt").exists());
+    }
 }
