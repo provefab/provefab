@@ -402,7 +402,48 @@ pub fn resolve_trusted_executable(
     Ok(path)
 }
 
-/// Resolve PATH before changing cwd; omit missing, unreadable and writable directories.
+// Even an external PATH directory can redirect an env-shebang interpreter through
+// writable aliases. Inspect every entry; any ambiguity drops the whole directory.
+fn trusted_path_entry(
+    path: &std::path::Path,
+    worktree: &std::path::Path,
+    temporary: &std::path::Path,
+) -> bool {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        if reject_worktree_symlink(&path, worktree).is_err()
+            || reject_worktree_symlink(&path, temporary).is_err()
+        {
+            return false;
+        }
+        let Ok(target) = path.canonicalize() else {
+            return false;
+        };
+        if target.starts_with(worktree) || target.starts_with(temporary) {
+            return false;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if !metadata.file_type().is_symlink() {
+            return true;
+        }
+        let Ok(link) = std::fs::read_link(&path) else {
+            return false;
+        };
+        path = if link.is_absolute() {
+            link
+        } else {
+            let Some(parent) = path.parent() else {
+                return false;
+            };
+            parent.join(link)
+        };
+    }
+    false
+}
+
+/// Resolve PATH before changing cwd; omit directories with writable or uninspectable entries.
 /// An unusable path is explicit, never the empty entry that means current directory.
 pub fn trusted_path(worktree: &std::path::Path, scratch: &std::path::Path) -> std::ffi::OsString {
     let (Ok(worktree), Ok(scratch)) = (canonical_path(worktree), canonical_path(scratch)) else {
@@ -412,7 +453,16 @@ pub fn trusted_path(worktree: &std::path::Path, scratch: &std::path::Path) -> st
         .filter(|p| !p.as_os_str().is_empty())
         .filter_map(|p| p.canonicalize().ok())
         .filter(|p| {
-            p.is_dir() && !p.starts_with(&worktree) && !p.starts_with(scratch.join("sandbox-tmp"))
+            let temporary = scratch.join("sandbox-tmp");
+            if p.starts_with(&worktree) || p.starts_with(&temporary) {
+                return false;
+            }
+            let Ok(mut entries) = std::fs::read_dir(p) else {
+                return false;
+            };
+            entries.all(|entry| {
+                entry.is_ok_and(|entry| trusted_path_entry(&entry.path(), &worktree, &temporary))
+            })
         })
         .collect();
     if paths.is_empty() {

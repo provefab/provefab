@@ -573,3 +573,99 @@ async fn claude_preflight_refuses_unknown_versions_and_nonpersonal_auth() {
         assert!(!fake.dir.path().join("log.txt").exists());
     }
 }
+
+#[tokio::test]
+async fn env_shebang_ignores_external_path_aliases_to_writable_interpreters() {
+    const ROOT: &str = "PROVEFAB_TEST_INTERPRETER_ROOT";
+    const MODE: &str = "PROVEFAB_TEST_INTERPRETER_MODE";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = PathBuf::from(root);
+        let req = request(&root, false);
+        let worker = CodexWorker {
+            program: root.join("runtime"),
+            codex_home: root.join("auth"),
+            provefab_bin: root.join("guard"),
+        };
+        let prepared = worker.prepare_command(&req, "test");
+        assert!(
+            !root.join("marker").exists(),
+            "version probe executed a writable interpreter"
+        );
+        let mut command = prepared.unwrap();
+        if std::env::var(MODE).unwrap() == "dangling"
+            || std::env::var(MODE).unwrap() == "mutable_alias"
+        {
+            if std::env::var(MODE).unwrap() == "mutable_alias" {
+                std::fs::remove_file(root.join("work/sh")).unwrap();
+            }
+            std::fs::write(
+                root.join("work/sh"),
+                format!(
+                    "#!/bin/sh\ntouch '{}'\nexit 77\n",
+                    root.join("marker").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(root.join("work/sh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let output = command.output().await.unwrap();
+        assert!(
+            !root.join("marker").exists(),
+            "stage executed a writable interpreter"
+        );
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "trusted");
+        return;
+    }
+    for mode in [
+        "worktree",
+        "private_tmp",
+        "dangling",
+        "mutable_alias",
+        "safe",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["bin", "work", ".session/sandbox-tmp"] {
+            std::fs::create_dir_all(root.path().join(name)).unwrap();
+        }
+        let target = match mode {
+            "private_tmp" => root.path().join(".session/sandbox-tmp/sh"),
+            "safe" => PathBuf::from("/bin/sh"),
+            _ => root.path().join("work/sh"),
+        };
+        if matches!(mode, "worktree" | "private_tmp") {
+            std::fs::write(
+                &target,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\nexit 77\n",
+                    root.path().join("marker").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        if mode == "mutable_alias" {
+            std::os::unix::fs::symlink("/bin/sh", &target).unwrap();
+        }
+        std::os::unix::fs::symlink(target, root.path().join("bin/sh")).unwrap();
+        let runtime = root.path().join("runtime");
+        std::fs::write(&runtime,"#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then echo 0.162.1; else echo trusted; fi\n").unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "env_shebang_ignores_external_path_aliases_to_writable_interpreters",
+                "--nocapture",
+            ])
+            .env(ROOT, root.path())
+            .env(MODE, mode)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success(), "interpreter alias mode {mode}");
+    }
+}
