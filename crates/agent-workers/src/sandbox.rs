@@ -404,43 +404,60 @@ pub fn resolve_trusted_executable(
 
 // Even an external PATH directory can redirect an env-shebang interpreter through
 // writable aliases. Inspect every entry; any ambiguity drops the whole directory.
-fn trusted_path_entry(
+fn trusted_path_target(
     path: &std::path::Path,
     worktree: &std::path::Path,
     temporary: &std::path::Path,
-) -> bool {
-    let mut path = path.to_path_buf();
-    for _ in 0..40 {
-        if reject_worktree_symlink(&path, worktree).is_err()
-            || reject_worktree_symlink(&path, temporary).is_err()
-        {
-            return false;
+) -> Option<PathBuf> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut pending: VecDeque<OsString> = absolute
+        .components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut prefix = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        if component == "/" {
+            prefix = PathBuf::from("/");
+            continue;
         }
-        let Ok(target) = path.canonicalize() else {
-            return false;
-        };
-        if target.starts_with(worktree) || target.starts_with(temporary) {
-            return false;
+        if component == "." {
+            continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            return false;
-        };
-        if !metadata.file_type().is_symlink() {
-            return true;
+        if component == ".." {
+            prefix.pop();
+            continue;
         }
-        let Ok(link) = std::fs::read_link(&path) else {
-            return false;
-        };
-        path = if link.is_absolute() {
-            link
+        let candidate = prefix.join(component);
+        // Check every expanded prefix BEFORE following a link. Canonicalizing the
+        // whole path first would erase a writable intermediate alias to a safe file.
+        if candidate.starts_with(worktree) || candidate.starts_with(temporary) {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+        if metadata.file_type().is_symlink() {
+            links += 1;
+            if links > 40 {
+                return None;
+            }
+            let target = std::fs::read_link(&candidate).ok()?;
+            for part in target.components().rev() {
+                pending.push_front(part.as_os_str().to_owned());
+            }
         } else {
-            let Some(parent) = path.parent() else {
-                return false;
-            };
-            parent.join(link)
-        };
+            if !pending.is_empty() && !metadata.is_dir() {
+                return None;
+            }
+            prefix = candidate;
+        }
     }
-    false
+    Some(prefix)
 }
 
 /// Resolve PATH before changing cwd; omit directories with writable or uninspectable entries.
@@ -449,11 +466,11 @@ pub fn trusted_path(worktree: &std::path::Path, scratch: &std::path::Path) -> st
     let (Ok(worktree), Ok(scratch)) = (canonical_path(worktree), canonical_path(scratch)) else {
         return "/dev/null".into();
     };
+    let temporary = scratch.join("sandbox-tmp");
     let paths: Vec<_> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .filter(|p| !p.as_os_str().is_empty())
-        .filter_map(|p| p.canonicalize().ok())
+        .filter_map(|p| trusted_path_target(&p, &worktree, &temporary))
         .filter(|p| {
-            let temporary = scratch.join("sandbox-tmp");
             if p.starts_with(&worktree) || p.starts_with(&temporary) {
                 return false;
             }
@@ -461,7 +478,9 @@ pub fn trusted_path(worktree: &std::path::Path, scratch: &std::path::Path) -> st
                 return false;
             };
             entries.all(|entry| {
-                entry.is_ok_and(|entry| trusted_path_entry(&entry.path(), &worktree, &temporary))
+                entry.is_ok_and(|entry| {
+                    trusted_path_target(&entry.path(), &worktree, &temporary).is_some()
+                })
             })
         })
         .collect();
@@ -1077,5 +1096,37 @@ mod tests {
         let not_directory = root.path().join("file");
         std::fs::write(&not_directory, "").unwrap();
         assert!(reject_policy_source(&not_directory.join("policy")).is_err());
+    }
+    #[test]
+    fn path_walker_resolves_relative_links_and_bounds_expansion() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for name in ["bin", "safe", "work", "tmp"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("safe/tool"), "trusted").unwrap();
+        std::os::unix::fs::symlink("../safe/tool", root.join("bin/tool")).unwrap();
+        let resolve = |p: &Path| trusted_path_target(p, &root.join("work"), &root.join("tmp"));
+        assert_eq!(
+            resolve(&root.join("bin/tool")),
+            Some(root.join("safe/tool"))
+        );
+        std::os::unix::fs::symlink("loop", root.join("bin/loop")).unwrap();
+        assert!(resolve(&root.join("bin/loop")).is_none());
+        std::os::unix::fs::symlink("../work/../safe/tool", root.join("bin/through-work")).unwrap();
+        assert!(resolve(&root.join("bin/through-work")).is_none());
+        for index in 0..41 {
+            let target = if index == 40 {
+                "../safe/tool".into()
+            } else {
+                format!("link{}", index + 1)
+            };
+            std::os::unix::fs::symlink(target, root.join(format!("bin/link{index}"))).unwrap();
+        }
+        assert!(resolve(&root.join("bin/link0")).is_none());
+        assert_eq!(
+            resolve(&root.join("bin/link1")),
+            Some(root.join("safe/tool"))
+        );
     }
 }

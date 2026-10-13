@@ -609,6 +609,26 @@ async fn env_shebang_ignores_external_path_aliases_to_writable_interpreters() {
             std::fs::set_permissions(root.join("work/sh"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
+        if matches!(
+            std::env::var(MODE).unwrap().as_str(),
+            "ancestor_alias" | "directory_alias"
+        ) {
+            std::fs::remove_file(root.join("work/alias")).unwrap();
+            std::fs::create_dir(root.join("work/alias")).unwrap();
+            std::fs::write(
+                root.join("work/alias/sh"),
+                format!(
+                    "#!/bin/sh\ntouch '{}'\nexit 77\n",
+                    root.join("marker").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                root.join("work/alias/sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
         let output = command.output().await.unwrap();
         assert!(
             !root.join("marker").exists(),
@@ -624,12 +644,15 @@ async fn env_shebang_ignores_external_path_aliases_to_writable_interpreters() {
         "dangling",
         "mutable_alias",
         "safe",
+        "ancestor_alias",
+        "directory_alias",
     ] {
         let root = tempfile::tempdir().unwrap();
         for name in ["bin", "work", ".session/sandbox-tmp"] {
             std::fs::create_dir_all(root.path().join(name)).unwrap();
         }
         let target = match mode {
+            "ancestor_alias" | "directory_alias" => root.path().join("outside/redirect/sh"),
             "private_tmp" => root.path().join(".session/sandbox-tmp/sh"),
             "safe" => PathBuf::from("/bin/sh"),
             _ => root.path().join("work/sh"),
@@ -648,6 +671,24 @@ async fn env_shebang_ignores_external_path_aliases_to_writable_interpreters() {
         if mode == "mutable_alias" {
             std::os::unix::fs::symlink("/bin/sh", &target).unwrap();
         }
+        if matches!(mode, "ancestor_alias" | "directory_alias") {
+            for name in ["outside", "safe-dir"] {
+                std::fs::create_dir(root.path().join(name)).unwrap();
+            }
+            let safe = root.path().join("safe-dir/sh");
+            std::fs::write(&safe, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+            std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink(
+                root.path().join("work/alias"),
+                root.path().join("outside/redirect"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                root.path().join("safe-dir"),
+                root.path().join("work/alias"),
+            )
+            .unwrap();
+        }
         std::os::unix::fs::symlink(target, root.path().join("bin/sh")).unwrap();
         let runtime = root.path().join("runtime");
         std::fs::write(&runtime,"#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then echo 0.162.1; else echo trusted; fi\n").unwrap();
@@ -662,7 +703,16 @@ async fn env_shebang_ignores_external_path_aliases_to_writable_interpreters() {
             .env(MODE, mode)
             .env(
                 "PATH",
-                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+                format!(
+                    "{}:/usr/bin:/bin",
+                    root.path()
+                        .join(if mode == "directory_alias" {
+                            "outside/redirect"
+                        } else {
+                            "bin"
+                        })
+                        .display()
+                ),
             )
             .status()
             .unwrap();
