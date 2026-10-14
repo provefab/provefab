@@ -10,13 +10,176 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_workers::{
-    ClaudeCodeWorker, CodexWorker, PiWorker, StageRequest, ToolProfile, Worker, WorkerEvent,
-};
+use agent_workers::{ClaudeCodeWorker, CodexWorker, PiWorker, StageRequest, ToolProfile, Worker};
 use provefab::{config::Config, gates::run_gates, paths::Paths, plugins, sandbox};
 use serde_json::{Value, json};
 
 const VALIDATOR: &str = "#!/bin/sh\nexit 1\n";
+
+fn with_safe_git_environment<T>(
+    keys: impl IntoIterator<Item = std::ffi::OsString>,
+    action: impl FnOnce() -> T,
+) -> Result<T, String> {
+    // Even read-only Git discovery used by pin_untrusted can be redirected.
+    // Refuse every Git override before allocating a fixture or touching profile
+    // trust. Only GIT_PAGER is harmless here: all fixture Git commands capture
+    // output non-interactively and never request a pager. Never print values.
+    let interfering: Vec<_> = keys
+        .into_iter()
+        .filter(|key| key.to_string_lossy().starts_with("GIT_") && key != "GIT_PAGER")
+        .collect();
+    if !interfering.is_empty() {
+        return Err(format!(
+            "remove interfering inherited Git variables: {interfering:?}"
+        ));
+    }
+    Ok(action())
+}
+
+fn successful_codex_tool_events(
+    transcript: &str,
+    probe: &Path,
+    patch: &Path,
+) -> Result<(), String> {
+    let records: Vec<Value> = transcript
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("invalid Codex transcript: {e}"))?;
+    let successful: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "item.completed" && record["item"]["status"] == "completed"
+        })
+        .map(|record| &record["item"])
+        .collect();
+    if !successful.iter().any(|item| {
+        item["type"] == "command_execution"
+            && item["exit_code"].as_i64() == Some(0)
+            && item["command"]
+                .as_str()
+                .is_some_and(|command| command.contains(probe.to_str().unwrap()))
+    }) {
+        return Err("no completed successful command event for this fixture probe".into());
+    }
+    if !successful.iter().any(|item| {
+        item["type"] == "file_change"
+            && item["changes"].as_array().is_some_and(|changes| {
+                changes.iter().any(|change| {
+                    change["kind"] == "update" && change["path"].as_str() == patch.to_str()
+                })
+            })
+    }) {
+        return Err(
+            "no completed successful file_change update for this fixture patch target".into(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_evidence_requires_successful_completed_tool_events() {
+    let probe = Path::new("/fixture/trusted/probe.py");
+    let patch = Path::new("/fixture/work/patch-target.txt");
+    let command = json!({"type":"item.completed", "item":{"type":"command_execution", "command": "/usr/bin/python3 /fixture/trusted/probe.py", "status":"completed", "exit_code":0}});
+    let change = json!({"type":"item.completed", "item":{"type":"file_change", "status":"completed", "changes":[{"kind":"update", "path":patch}]}});
+    let serialize = |records: &[Value]| {
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        successful_codex_tool_events(&serialize(&[command.clone(), change.clone()]), probe, patch)
+            .is_ok()
+    );
+    for (field, value) in [
+        ("status", json!("failed")),
+        ("status", json!("in_progress")),
+        ("exit_code", json!(1)),
+        ("exit_code", Value::Null),
+    ] {
+        let mut bad = command.clone();
+        bad["item"][field] = value;
+        assert!(
+            successful_codex_tool_events(&serialize(&[bad, change.clone()]), probe, patch).is_err(),
+            "failed/unfinished command accepted"
+        );
+    }
+    let mut started = command.clone();
+    started["type"] = json!("item.started");
+    assert!(
+        successful_codex_tool_events(&serialize(&[started, change.clone()]), probe, patch).is_err(),
+        "started-only command accepted"
+    );
+    for status in ["failed", "in_progress"] {
+        let mut bad = change.clone();
+        bad["item"]["status"] = json!(status);
+        assert!(
+            successful_codex_tool_events(&serialize(&[command.clone(), bad]), probe, patch)
+                .is_err(),
+            "failed/unfinished patch accepted"
+        );
+    }
+    let narration = json!({"type":"item.completed", "item":{"type":"agent_message", "text":"file_change patch-target.txt command_execution probe.py completed"}});
+    assert!(
+        successful_codex_tool_events(&serialize(&[narration]), probe, patch).is_err(),
+        "narration accepted as tool evidence"
+    );
+    let mut wrong_command = command.clone();
+    wrong_command["item"]["command"] = json!("echo probe.py");
+    assert!(
+        successful_codex_tool_events(&serialize(&[wrong_command, change.clone()]), probe, patch)
+            .is_err()
+    );
+    let mut wrong_patch = change.clone();
+    wrong_patch["item"]["changes"][0]["path"] = json!("/other/patch-target.txt");
+    assert!(
+        successful_codex_tool_events(&serialize(&[command.clone(), wrong_patch]), probe, patch)
+            .is_err()
+    );
+    let mut started_patch = change;
+    started_patch["type"] = json!("item.started");
+    assert!(
+        successful_codex_tool_events(&serialize(&[command, started_patch]), probe, patch).is_err()
+    );
+}
+
+#[test]
+fn interfering_git_environment_refuses_before_fixture_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("fixture-created");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_UNKNOWN_FUTURE_SETTING",
+    ] {
+        let result = with_safe_git_environment([key.into()], || {
+            std::fs::write(&marker, "fixture mutation").unwrap()
+        });
+        assert!(result.is_err(), "interfering Git key {key} accepted");
+        assert!(!marker.exists(), "fixture mutated before rejecting {key}");
+    }
+    with_safe_git_environment(["GIT_PAGER".into(), "PATH".into()], || {
+        std::fs::write(&marker, "allowed environment").unwrap()
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        "allowed environment"
+    );
+}
 
 fn prerequisite(name: &str) -> PathBuf {
     let path = PathBuf::from(
@@ -111,6 +274,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
+        with_safe_git_environment(std::env::vars_os().map(|(key, _)| key), || {
+            Self::create(label)
+        })
+        .unwrap_or_else(|reason| panic!("native fixture prerequisite: {reason}"))
+    }
+
+    fn create(label: &str) -> Self {
         // Native evidence deliberately survives the test for independent inspection.
         // SRT uses a Unix socket below sandbox-tmp; macOS default temp roots
         // exceed sockaddr_un's path budget. Use the short shared temp parent,
@@ -506,17 +676,18 @@ async fn native_codex_worker_executes_probe_and_apply_patch() {
         format!("{result:#?}\n{events:#?}"),
     )
     .unwrap();
-    assert!(events.iter().any(|e| matches!(e, WorkerEvent::ToolStart { name, input } if name == "Bash" && input.contains("probe.py"))), "no actual probe tool event: {result:?} {events:?}");
+    let transcript = std::fs::read_to_string(f.session.join("events.jsonl")).unwrap();
+    successful_codex_tool_events(
+        &transcript,
+        &f.root.join("trusted/probe.py"),
+        &f.work.join("patch-target.txt"),
+    )
+    .unwrap_or_else(|reason| panic!("{reason}: {result:?} {events:?}"));
     f.assert_native();
     assert_eq!(witness.requests.load(Ordering::SeqCst), 0);
     assert_eq!(
         std::fs::read_to_string(f.work.join("patch-target.txt")).unwrap(),
         "after\n"
-    );
-    let transcript = std::fs::read_to_string(f.session.join("events.jsonl")).unwrap();
-    assert!(
-        transcript.contains("file_change") && transcript.contains("patch-target.txt"),
-        "no native patch event"
     );
     let protected_patch = codex_protected_patch_evidence(&worker.codex_home, &transcript);
     let config = std::fs::read_to_string(worker.codex_home.join("config.toml"))
