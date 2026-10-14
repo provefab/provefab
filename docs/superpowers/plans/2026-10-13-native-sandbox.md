@@ -35,12 +35,12 @@
 **Files:** integration tests/probe harness and docs/superpowers/native-sandbox-ledger.md.
 - [x] Reuse the audit's fake-secret/local-remote probes against the actual integrated code, with an unsandboxed positive control. Test missing runtime/config before marker execution, HTTP through Python/curl, child and symlink reads, validation edits and normal allowed work.
 - [x] Run native strict gates and verify local-option refusal, plus actual Codex worker launch and Claude launch or fail-closed refusal according to verified support. Exercise Pi's wrapped tool directly without a model if possible. Record unsupported surfaces honestly.
-- [ ] Run cargo fmt -- --check, cargo clippy -- -D warnings, cargo nextest run. Reopen edited files. Run an independent whole-branch security review naming child escape, mutable config/harness, environment leaks, fallback and lifecycle risks; fix important findings and rerun covering checks.
-- [ ] Leave a reviewable branch and concise French results. No merge/push/deployment requested.
+- [x] Run cargo fmt -- --check, cargo clippy -- -D warnings, cargo nextest run. Reopen edited files. Run an independent whole-branch security review naming child escape, mutable config/harness, environment leaks, fallback and lifecycle risks; fix important findings and rerun covering checks. Final I1/I2 fixes approved; independent804 tests and3 native pass, intermittent Nextest LEAK documented with clean isolated rerun.
+- [x] Leave a reviewable branch and concise French results. No merge/push/deployment requested.
 
 ### Task 4: Documentation, landing and final build (user added)
 **Scope budget:** documentation and existing landing feature/security copy only. No redesign, deployment, release publishing or pricing changes. Preserve existing layout, palette and typography.
 - [x] Align documentation and landing claims with actual verified support and limitations. Core documentation remains the source of generated site docs; update the landing submodule to the reviewed local core commit.
 - [x] Use a separate clean landing worktree; do not touch original untracked docs/distribution.
-- [x] Run site tests/build/link/content checks and inspect rendered pages in the browser. Run final release build of core CLI. Desktop checked; mobile navigation remains an explicit pre-publication follow-up after CUA interruption. No dark theme exists.
+- [x] Run site tests/build/link/content checks and inspect rendered pages in the browser. Run final release build of core CLI. Desktop checked; mobile navigation subsequently verified in separate headless Chrome without user-profile interaction. No dark theme exists.
 - [x] Record build artifacts and unresolved platform/runtime limitations; leave reviewable local branches.
