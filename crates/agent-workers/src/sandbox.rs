@@ -77,6 +77,10 @@ pub const SANDBOX_RUNTIME_ENV: &str = "PROVEFAB_SANDBOX_RUNTIME";
 /// Keep unsupported host tool/helper routes disabled before app-server and stage startup.
 /// Keys verified in Codex 0.162.1's feature registry; hooks remain enabled for Provefab.
 pub const CODEX_TOOL_BOUNDARY_OVERRIDES: &[&str] = &[
+    "project_doc_max_bytes=0",
+    "project_root_markers=[]",
+    "skills.bundled.enabled=false",
+    "cloud.skills.enabled=false",
     "cli_auth_credentials_store=\"file\"",
     "features.view_image=false",
     "features.plugins=false",
@@ -99,6 +103,120 @@ pub const CODEX_TOOL_BOUNDARY_OVERRIDES: &[&str] = &[
     "features.shell_snapshot_v2=false",
     "features.daemon_auto_start=false",
 ];
+
+/// Refuse implicit host-loaded context and return boundaries that must stay unwritable.
+/// With project_root_markers=[] the project skill roots are exactly the checked cwd.
+pub fn check_codex_context_sources(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    scratch: &std::path::Path,
+) -> std::io::Result<Vec<PathBuf>> {
+    let user_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("Codex context preflight requires an explicit HOME"))?;
+    codex_context_sources(
+        home,
+        cwd,
+        scratch,
+        &user_home,
+        std::path::Path::new("/etc/codex"),
+    )
+}
+
+fn codex_context_sources(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    scratch: &std::path::Path,
+    user_home: &std::path::Path,
+    system: &std::path::Path,
+) -> std::io::Result<Vec<PathBuf>> {
+    let project_paths = [cwd.join(".codex"), cwd.join(".agents")];
+    let cwd = canonical_path(cwd)?;
+    let temporary = canonical_path(scratch)?.join("sandbox-tmp");
+    let mut protected = Vec::new();
+    // Deny whole project metadata directories so absent skills cannot be introduced
+    // via creation or parent replacement. External boundaries retain aliases too.
+    for (path, project) in [
+        (home.to_path_buf(), false),
+        (user_home.join(".agents"), false),
+        (system.to_path_buf(), false),
+        (project_paths[0].clone(), true),
+        (project_paths[1].clone(), true),
+    ] {
+        reject_worktree_symlink(&path, &cwd)?;
+        reject_worktree_symlink(&path, &temporary)?;
+        if !project {
+            // Resolve every existing prefix before adding absent suffixes. Final
+            // canonicalization alone would erase a mutable intermediate alias.
+            let mut ancestor = path.as_path();
+            loop {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        ancestor = ancestor.parent().ok_or(e)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if trusted_path_target(ancestor, &cwd, &temporary).is_none() {
+                return Err(invalid(format!(
+                    "Codex context boundary traverses a mutable or uninspectable root: {}",
+                    path.display()
+                )));
+            }
+        }
+        protected.extend([path.clone(), canonical_path(&path)?]);
+    }
+    for path in [
+        home.join("AGENTS.md"),
+        home.join("AGENTS.override.md"),
+        user_home.join(".agents/skills"),
+        system.join("skills"),
+        cwd.join(".codex/skills"),
+        cwd.join(".agents/skills"),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "unsupported implicit Codex context source {}; use explicit trusted stage prompts, no source is deleted automatically",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let skills = home.join("skills");
+    match std::fs::symlink_metadata(&skills) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(invalid(
+                    "dedicated Codex skills cache must be a real directory",
+                ));
+            }
+            for entry in std::fs::read_dir(&skills)? {
+                let entry = entry?;
+                let metadata = std::fs::symlink_metadata(entry.path())?;
+                // User discovery prunes hidden descendants before parsing. Bundled
+                // false removes the separate System root. Never inspect .system contents.
+                if entry.file_name() != ".system"
+                    || metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                {
+                    return Err(invalid(
+                        "custom or aliased dedicated Codex skills are unsupported; only the stock real .system directory is permitted",
+                    ));
+                }
+            }
+        }
+    }
+    protected.extend([skills.clone(), canonical_path(&skills)?]);
+    protected.sort();
+    protected.dedup();
+    Ok(protected)
+}
 /// Dedicated profiles never inherit host helpers. Codex 0.162.1's loader applies
 /// managed policy after CLI overrides, so absence is required rather than a merge.
 pub fn check_codex_host_settings(home: &std::path::Path) -> std::io::Result<()> {
@@ -1125,6 +1243,127 @@ mod tests {
         std::fs::write(&regular, "").unwrap();
         let inaccessible = regular.join("nested");
         assert!(check_codex_sources(&[inaccessible]).is_err());
+    }
+
+    #[test]
+    fn codex_context_accepts_absent_roots_and_only_stock_real_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        let home = root.path().join("auth");
+        let user = root.path().join("user");
+        let system = root.path().join("system");
+        let scratch = root.path().join("session");
+        std::fs::create_dir(&work).unwrap();
+        let check = || codex_context_sources(&home, &work, &scratch, &user, &system);
+        assert!(check().is_ok());
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        assert!(check().is_ok());
+        std::fs::create_dir(home.join("skills/.system")).unwrap();
+        // Hidden stock descendants are not inspected, even if inaccessible/broken.
+        std::os::unix::fs::symlink(
+            root.path().join("absent"),
+            home.join("skills/.system/ignored"),
+        )
+        .unwrap();
+        assert!(check().is_ok());
+        // project_root_markers=[] excludes unrelated ancestors and HOME/.codex.
+        std::fs::create_dir_all(user.join(".codex/skills/custom")).unwrap();
+        std::fs::create_dir_all(root.path().join(".agents/skills/custom")).unwrap();
+        assert!(check().is_ok());
+        std::fs::create_dir(home.join("skills/custom")).unwrap();
+        assert!(check().is_err());
+        std::fs::remove_dir_all(home.join("skills")).unwrap();
+        let target = root.path().join("stock");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, home.join("skills")).unwrap();
+        assert!(check().is_err());
+        std::fs::remove_file(home.join("skills")).unwrap();
+        std::fs::create_dir(home.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&target, home.join("skills/.system")).unwrap();
+        assert!(check().is_err());
+    }
+
+    #[test]
+    fn codex_context_refuses_all_global_project_and_broken_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        let home = root.path().join("auth");
+        let user = root.path().join("user");
+        let system = root.path().join("system");
+        let scratch = root.path().join("session");
+        std::fs::create_dir(&work).unwrap();
+        let check = || codex_context_sources(&home, &work, &scratch, &user, &system);
+        for source in [
+            home.join("AGENTS.md"),
+            home.join("AGENTS.override.md"),
+            user.join(".agents/skills"),
+            system.join("skills"),
+            work.join(".codex/skills"),
+            work.join(".agents/skills"),
+        ] {
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, "dummy").unwrap();
+            assert!(check().is_err(), "{}", source.display());
+            std::fs::remove_file(&source).unwrap();
+            std::os::unix::fs::symlink(root.path().join("missing"), &source).unwrap();
+            assert!(check().is_err(), "broken {}", source.display());
+            std::fs::remove_file(&source).unwrap();
+            assert!(check().is_ok());
+        }
+    }
+
+    #[test]
+    fn codex_context_protects_missing_roots_aliases_and_rejects_mutable_components() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        let home = root.path().join("auth");
+        let user = root.path().join("user");
+        let system = root.path().join("system");
+        let scratch = root.path().join("session");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&user).unwrap();
+        let stable = root.path().join("stable");
+        std::fs::create_dir(&stable).unwrap();
+        std::os::unix::fs::symlink(&stable, user.join(".agents")).unwrap();
+        let mut req = request(root.path());
+        req.cwd = work.canonicalize().unwrap();
+        req.session_dir = canonical_path(&scratch).unwrap();
+        req.sandbox.deny_write =
+            codex_context_sources(&home, &work, &scratch, &user, &system).unwrap();
+        for path in [
+            work.join(".agents"),
+            work.join(".codex"),
+            home.join("skills"),
+            user.join(".agents"),
+            stable.canonicalize().unwrap(),
+            system.clone(),
+        ] {
+            assert!(req.sandbox.deny_write.contains(&path), "{}", path.display());
+            assert!(
+                req.sandbox
+                    .deny_write
+                    .contains(&canonical_path(&path).unwrap())
+            );
+        }
+        let policy: toml::Table = req.sandbox.codex_filesystem(&req, &home).parse().unwrap();
+        let fs = &policy["permissions"]["provefab"]["filesystem"];
+        assert_eq!(
+            fs[req.cwd.join(".agents").to_str().unwrap()].as_str(),
+            Some("read")
+        );
+        assert_eq!(
+            fs[req.cwd.join(".codex").to_str().unwrap()].as_str(),
+            Some("read")
+        );
+        assert_eq!(fs[req.cwd.to_str().unwrap()].as_str(), Some("write"));
+        std::fs::remove_file(user.join(".agents")).unwrap();
+        // External -> mutable worktree -> external must be rejected component-wise.
+        std::os::unix::fs::symlink(&stable, work.join("bridge")).unwrap();
+        std::os::unix::fs::symlink(work.join("bridge"), user.join(".agents")).unwrap();
+        assert!(codex_context_sources(&home, &work, &scratch, &user, &system).is_err());
+        std::fs::remove_file(user.join(".agents")).unwrap();
+        std::os::unix::fs::symlink(&stable, work.join(".agents")).unwrap();
+        assert!(codex_context_sources(&home, &work, &scratch, &user, &system).is_err());
     }
 
     #[test]

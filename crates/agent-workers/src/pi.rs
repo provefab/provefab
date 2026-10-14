@@ -37,6 +37,12 @@ impl PiWorker {
         push("--no-extensions");
         push("--no-skills");
         push("--no-prompt-templates");
+        // Disable host context discovery while retaining the explicit trusted stage file.
+        push("--no-context-files");
+        push("--system-prompt");
+        push("");
+        push("--append-system-prompt");
+        push("");
         if let Some(p) = &req.provider {
             push("--provider");
             push(p);
@@ -333,6 +339,44 @@ mod tests {
     }
 
     #[test]
+    fn implicit_context_is_disabled_for_every_profile_with_explicit_prompt_kept() {
+        let worker = PiWorker {
+            program: "pi".into(),
+            package: "/x/pi-provefab".into(),
+            provefab_bin: "/x/provefab".into(),
+        };
+        for tools in [
+            ToolProfile::Full,
+            ToolProfile::ReadOnly,
+            ToolProfile::UntrustedReadOnly,
+            ToolProfile::NoTools,
+        ] {
+            let mut request = req(std::path::Path::new("/w"));
+            request.tools = tools;
+            for explicit in [None, Some(PathBuf::from("/trusted/stage.md"))] {
+                request.system_prompt_file = explicit.clone();
+                let args = worker.args(&request);
+                assert!(args.iter().any(|v| v == "--no-context-files"));
+                assert!(
+                    args.windows(2)
+                        .any(|v| v[0] == "--system-prompt" && v[1].is_empty())
+                );
+                let appended: Vec<_> = args
+                    .windows(2)
+                    .filter(|v| v[0] == "--append-system-prompt")
+                    .map(|v| v[1].clone())
+                    .collect();
+                let mut expected = vec![OsString::new()];
+                if let Some(explicit) = explicit {
+                    expected.push(explicit.into_os_string());
+                }
+                assert_eq!(appended, expected);
+                assert_eq!(args.last(), Some(&OsString::from("Fix the bug")));
+            }
+        }
+    }
+
+    #[test]
     fn args_select_json_mode_no_trust_and_submit_tool() {
         let w = PiWorker {
             program: "pi".into(),
@@ -347,7 +391,7 @@ mod tests {
             .collect();
         let joined = args.join(" ");
         assert!(
-            joined.starts_with("--mode json --no-approve --no-extensions --no-skills --no-prompt-templates --provider openai-codex --model gpt-5.5"),
+            joined.starts_with("--mode json --no-approve --no-extensions --no-skills --no-prompt-templates --no-context-files --system-prompt  --append-system-prompt  --provider openai-codex --model gpt-5.5"),
             "{joined}"
         );
         assert!(

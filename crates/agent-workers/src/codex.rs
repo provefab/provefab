@@ -107,6 +107,13 @@ impl CodexWorker {
             std::slice::from_ref(&self.codex_home),
         )?;
         crate::check_codex_host_settings(&self.codex_home)?;
+        req.sandbox
+            .deny_write
+            .extend(crate::check_codex_context_sources(
+                &self.codex_home,
+                &req.cwd,
+                &req.session_dir,
+            )?);
         let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
         crate::check_codex_version(&program, &req.cwd, &req.session_dir)?;
         req.sandbox.deny_write.push(program.clone());
@@ -412,24 +419,128 @@ mod tests {
 
     #[test]
     fn every_native_profile_disables_external_tool_routes() {
-        let args = worker().args(&req(ToolProfile::Full, false), "prompt");
-        for setting in [
-            "cli_auth_credentials_store=\"file\"",
-            "features.plugins=false",
-            "features.apps=false",
-            "features.remote_plugin=false",
-            "features.multi_agent=false",
-            "features.computer_use=false",
-            "features.browser_use=false",
-            "features.code_mode_host=false",
-            "features.shell_snapshot=false",
-            "features.shell_snapshot_v2=false",
+        for tools in [
+            ToolProfile::Full,
+            ToolProfile::ReadOnly,
+            ToolProfile::UntrustedReadOnly,
+            ToolProfile::NoTools,
+        ] {
+            let args = worker().args(&req(tools, false), "prompt");
+            for setting in [
+                "project_doc_max_bytes=0",
+                "project_root_markers=[]",
+                "skills.bundled.enabled=false",
+                "cloud.skills.enabled=false",
+                "cli_auth_credentials_store=\"file\"",
+                "features.plugins=false",
+                "features.apps=false",
+                "features.remote_plugin=false",
+                "features.multi_agent=false",
+                "features.computer_use=false",
+                "features.browser_use=false",
+                "features.code_mode_host=false",
+                "features.shell_snapshot=false",
+                "features.shell_snapshot_v2=false",
+            ] {
+                assert!(
+                    args.iter().any(|a| a == setting),
+                    "unsafe inherited route: {setting}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_codex_context_refuses_before_executable_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        let home = root.path().join("home");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let marker = root.path().join("started");
+        let program = root.path().join("codex");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho 'codex-cli 0.162.1'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = CodexWorker {
+            program,
+            codex_home: home.clone(),
+            provefab_bin: "/bin/false".into(),
+        };
+        let mut request = req(ToolProfile::Full, false);
+        request.cwd = work.clone();
+        request.session_dir = root.path().join("session");
+        for path in [
+            home.join("AGENTS.md"),
+            home.join("AGENTS.override.md"),
+            home.join("skills/custom/SKILL.md"),
+            work.join(".agents/skills/custom/SKILL.md"),
+            work.join(".codex/skills/custom/SKILL.md"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "dummy context").unwrap();
+            assert!(
+                worker.prepare_command(&request, "trusted prompt").is_err(),
+                "{} accepted",
+                path.display()
+            );
+            assert!(!marker.exists(), "context inspected after executable probe");
+            std::fs::remove_file(&path).unwrap();
+            if path.file_name().unwrap() == "SKILL.md" {
+                std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+            }
+        }
+        std::fs::create_dir_all(home.join("skills/.system")).unwrap();
+        let command = worker.prepare_command(&request, "trusted prompt").unwrap();
+        assert!(
+            marker.exists(),
+            "supported stock cache prevented the normal version probe"
+        );
+        let policy_file = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == crate::SANDBOX_POLICY_ENV)
+            .unwrap()
+            .1
+            .unwrap();
+        let policy: Value = serde_json::from_slice(&std::fs::read(policy_file).unwrap()).unwrap();
+        for path in [
+            work.canonicalize().unwrap().join(".agents"),
+            work.canonicalize().unwrap().join(".codex"),
         ] {
             assert!(
-                args.iter().any(|a| a == setting),
-                "unsafe inherited route: {setting}"
+                policy["filesystem"]["denyWrite"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(path))
             );
         }
+        let permissions = command
+            .as_std()
+            .get_args()
+            .find(|arg| {
+                arg.to_string_lossy()
+                    .starts_with("permissions.provefab.filesystem=")
+            })
+            .unwrap();
+        let permissions: toml::Table = permissions.to_str().unwrap().parse().unwrap();
+        assert_eq!(
+            permissions["permissions"]["provefab"]["filesystem"][work
+                .canonicalize()
+                .unwrap()
+                .join(".agents")
+                .to_str()
+                .unwrap()]
+            .as_str(),
+            Some("read")
+        );
     }
 
     #[test]

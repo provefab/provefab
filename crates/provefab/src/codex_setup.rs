@@ -303,10 +303,13 @@ struct AppServer {
 
 impl AppServer {
     async fn start(codex: &Path, codex_home: &Path, cwd: &Path) -> Result<Self, CodexSetupError> {
+        let cwd = &cwd.canonicalize()?;
         agent_workers::check_codex_host_settings(codex_home)?;
+        agent_workers::check_codex_context_sources(codex_home, cwd, codex_home)?;
         let codex = agent_workers::resolve_trusted_executable(codex, cwd, codex_home)?;
         agent_workers::check_codex_version(&codex, cwd, codex_home)?;
         let mut command = Command::new(codex);
+        command.current_dir(cwd);
         agent_workers::sanitize_environment(&mut command);
         command.env("PATH", agent_workers::trusted_path(cwd, codex_home));
         command.arg("app-server");
@@ -389,6 +392,66 @@ impl AppServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn implicit_context_refuses_before_app_server_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let work = root.path().join("work");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "dummy context").unwrap();
+        let marker = root.path().join("started");
+        let program = root.path().join("codex");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check(&program, &home, &work).await.is_err());
+        assert!(
+            !marker.exists(),
+            "global context inspected after host startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_server_uses_checked_cwd_and_disables_implicit_context() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let work = root.path().join("work");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let record = root.path().join("startup.json");
+        let program = root.path().join("codex.py");
+        std::fs::write(&program, format!("#!/usr/bin/python3\nimport os,json,sys\nif sys.argv[1:]==['--version']: print('codex-cli 0.162.1'); sys.exit(0)\nwith open({:?},'w') as f: json.dump({{'cwd':os.getcwd(),'args':sys.argv[1:]}},f)\nfor line in sys.stdin:\n m=json.loads(line)\n if 'id' in m: print(json.dumps({{'id':m['id'],'result':{{}}}}),flush=True)\n", record.to_string_lossy())).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server = AppServer::start(&program, &home, &work).await.unwrap();
+        server.stop().await;
+        let record: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+        assert_eq!(
+            record["cwd"].as_str().unwrap(),
+            work.canonicalize().unwrap().to_str().unwrap()
+        );
+        for setting in [
+            "project_doc_max_bytes=0",
+            "project_root_markers=[]",
+            "skills.bundled.enabled=false",
+            "cloud.skills.enabled=false",
+        ] {
+            assert!(
+                record["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v.as_str() == Some(setting)),
+                "{setting}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn inherited_codex_host_helpers_refuse_before_app_server_start() {
