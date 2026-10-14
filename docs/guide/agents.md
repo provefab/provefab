@@ -26,7 +26,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
 2. **Write the configuration:** run `provefab init`.
    - Exit code 0: the file is written (`~/.provefab/provefab.toml`, or `provefab.toml` in `$PROVEFAB_HOME` when that variable is set). The output names the file and the models of the worker CLIs found on `PATH`. Keep both for the summary.
    - Exit code 3: a configuration already exists. Keep it: never delete or replace it. Go to step 3.
-   - Exit code 4: no worker CLI is on `PATH`. Ask the person to install a supported worker, Codex (`codex`) or Pi (`pi`), and stop.
+   - Exit code 4: no worker CLI is on `PATH`. Ask the person to install Codex (`codex`), and stop. This init workflow detects only Claude/Codex CLIs; a Pi-only setup requires a manually written model catalog.
    - Exit code 1: report the error, and stop.
 
 3. **Add the repository the person is in.**
