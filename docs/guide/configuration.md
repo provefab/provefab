@@ -2,7 +2,7 @@
 
 Provefab reads `provefab.toml` from its home directory, `~/.provefab` by default. The `PROVEFAB_HOME` variable moves that directory. A commented example sits at the repository root: [`provefab.example.toml`](../../provefab.example.toml).
 
-`provefab doctor` checks the file and everything it depends on. Run it after every change.
+`provefab doctor` checks configuration, tools and logins. Run it after every change. A successful check does not establish native sandbox compatibility; stages also verify the runtime, profile and policy before launch (see [native execution policy](#repossandbox-native-execution-policy)).
 
 ## Writing the file with commands
 
@@ -34,7 +34,7 @@ No secret goes in `provefab.toml`. On macOS, Provefab keeps its secrets in the K
 | Jira Cloud | `provefab login jira --site <site>`: e-mail and API token in the Keychain (`provefab-jira`) or under `[jira."<site>"]` in `credentials.toml`; or `PROVEFAB_JIRA_EMAIL` and `PROVEFAB_JIRA_TOKEN` |
 | Linear | `provefab login linear`: personal API key in the Keychain (`provefab-linear`) or as `linear` in `credentials.toml`; or `PROVEFAB_LINEAR_KEY` |
 
-**Plans for work.** Provefab runs the official CLIs with whatever login you give them. For professional use, prefer a business plan (Claude Team or Enterprise, ChatGPT Business) or API keys: consumer plans can restrict commercial use (for example, Anthropic's consumer terms for EEA and Swiss residents say "Non-commercial use only"). Check your plan's terms; this is not legal advice.
+**Supported logins.** Native execution accepts only the verified authentication modes below. Claude Team/Enterprise and API-key profiles, and Codex workspace/managed plans, currently refuse before a stage. A successful login does not make an unsupported mode usable. Check your provider's terms for your intended use separately.
 
 ## `[jev]`
 
@@ -62,7 +62,7 @@ Provefab still works without a Jev key: every stage runs on the `standard` tier.
 | `price_cache_read`, `price_cache_write` | the input price | USD per million cached tokens read and written, with `price_in` and `price_out`. |
 | `quota_weight` | relative price | Subscription models only: how much of your plan one token uses, compared with the cheapest model of the same vendor in the catalog (1.0). It orders that vendor's models only. |
 
-**Subscription or API key, per model.** Each model signs in its own way, so you can switch one line and run `provefab service install`. You can also list the same model twice in the same tier, once per sign-in mode: when the subscription hits its usage limit, that entry pauses and the API-key entry takes the next stages. Both still count as the same model family for cross-review. The daily budget (`max_stage_runs_per_day`) caps API spend too.
+**Subscription or API key, per model.** For a worker that supports both modes, currently Codex, you can switch one line and run `provefab service install`. You can also list the same model twice in the same tier, once per supported sign-in mode: when the subscription hits its usage limit, that entry pauses and the API-key entry takes the next stages. Both still count as the same model family for cross-review. Claude's API-key adapter currently refuses native execution. The daily budget (`max_stage_runs_per_day`) caps API spend too.
 
 ### How Provefab picks a model
 
@@ -115,6 +115,8 @@ Provefab Pro reads an optional `[repos.merge]` table for guarded auto-merge: `au
 
 For gates that work well:
 - Put in what your CI requires: format, lint, tests.
+- Provision dependencies before the task and use offline commands, such as `cargo test --offline` or a test script with its dependencies already available. Detected install commands are suggestions, not permission for downloads. Do not use shared writable caches to work around refusal.
+- Declare validation scripts, test configuration, fixtures, lockfiles and supporting dependencies in `protected_paths`. This may prevent a task from changing those tests; choose the protected validation harness deliberately.
 - Fast commands speed up every loop.
 - If the repository has slow tests, keep a representative subset and let your GitHub CI do the rest.
 - **Never share a build directory between tasks** (for example one `CARGO_TARGET_DIR` for every worktree). Cargo can then reuse binaries built from another task's code, and the checks pass or fail on the wrong code. Each worktree builds in its own `target/`, which the agent already warmed during implementation. To go faster safely, use a content-addressed cache such as `sccache` (`RUSTC_WRAPPER=sccache`).
@@ -137,11 +139,13 @@ protected_paths = ["tests", "scripts/check.sh", "Cargo.lock", "/opt/validators/p
 deny_read = ["/srv/private/service-token"]
 ```
 
-SRT must be separately provisioned in a trusted directory using the [sandbox-runtime installation instructions](https://github.com/anthropics/sandbox-runtime). Its dependencies must also remain outside writable roots. Network is denied during checks, including package downloads; provision dependencies before a run. Native validation has been exercised on macOS; Linux enforcement is unverified and unavailable enforcement must fail closed.
+SRT must be separately provisioned in a trusted directory using the [sandbox-runtime installation instructions](https://github.com/anthropics/sandbox-runtime). Its dependencies must also remain outside writable roots. Network is denied during checks, including package downloads and local listeners; provision dependencies before a run. The core gates and real Codex commands have been exercised on macOS 26.6.2 (Apple Silicon) with Codex 0.162.1 and SRT 0.0.79. Pi 1.0.3's installed Bash tool factory was exercised through the actual extension and SRT without a Pi model call. Linux enforcement is unverified; unavailable enforcement fails closed. Keep `PROVEFAB_HOME` short on macOS: SRT's private temporary socket path can exceed the OS limit with long home or session paths and refuse execution.
 
 An empty `protected_paths` list provides no immutable-validation guarantee. Declare every script, test configuration, lockfile and dependency defining success, or keep them outside writable roots. Protecting one entrypoint does not protect its dependency closure. Command and interpreter resolution also matters: PATH entries and aliases through writable roots are excluded. A protected file missing from a review or reverted tree causes a validation error. NoTools maintenance resolves relative declarations against the real repository while its model runs in a separate empty directory.
 
 Claude stages currently require exactly 2.1.296, personal first-party claude.ai Pro/Max authentication, empty inherited user settings and absence of managed settings, remote policy caches and state sources. API keys, Team/Enterprise and executable helpers are unsupported by this verified adapter and refuse before launch. Do not delete user authentication or state to make a run proceed. Codex requires exactly 0.162.1, a dedicated untrusted project profile and only Provefab's guard hook among effective enabled/trusted hooks. The dedicated config supports basic model/auth fields, projects, hooks and notices only; nonempty mcp_servers, notify, custom providers, profiles and unsupported keys refuse before host startup. Native plugins and external tool routes are disabled by CLI overrides. Claude/Pi expose only sandboxed Bash for file operations, plus structured answers when needed; their direct file/search tools are disabled because pre-operation guards cannot prevent symlink races. Read-only profiles keep no worktree write permission and PR reviews keep their read-only shell allowlist. Codex image viewing is disabled pending boundary verification. See [Security](security.md).
+
+The current validation host has Claude 2.1.299 and `~/.claude/state`. It refuses that state source before probing the version or launching Claude. This demonstrates refusal, not a successful run of the narrow 2.1.296 adapter. Other versions require policy-source review before support.
 
 Codex authentication must use `cli_auth_credentials_store = "file"`, which Provefab also pins at launch. Supported subscription plan claims are `free`, `go`, `plus`, `pro`, `prolite` and `promax`; file API-key logins are supported too. Workspace/managed, unknown or malformed authentication and keyring/auto/ephemeral stores refuse before startup. Provefab also refuses any `/etc/codex/config.toml`, `/etc/codex/managed_config.toml`, `/etc/codex/requirements.toml`, dedicated-profile `cloud-config-bundle-cache.json` or forced `com.openai.codex` managed config/requirements preference. Even empty or broken policy files refuse. Keep account membership and host policy stable during a run; preflight cannot seal later administrator or account changes. No source or login data is removed automatically. Newer Codex configuration loaders require review before support.
 

@@ -34,6 +34,8 @@ Agents do not have push credentials either:
 
 The checks (`gates`) always run through SRT, including reproduction, risk and post-merge/revert checks. Network and local binding are denied by default. The configured `allow_local_network = true` request currently fails closed on every platform: the tested runtime's binding option can allow non-loopback listeners, while loopback-only enforcement is unverified.
 
+Native evidence is bounded: real core gates and Codex 0.162.1 commands, plus Pi 1.0.3's installed Bash tool factory with SRT 0.0.79, were exercised on macOS 26.6.2 (Apple Silicon). Dummy-secret reads, child commands, direct HTTP, local Git pushes and validator replacement attempts were checked against independent witnesses. Claude 2.1.299 on that host refused its state source before launch. Linux enforcement remains unverified. An ordinary Codex patch completed and a protected patch was refused by the hook; its OS filesystem-helper boundary was reviewed in the exact 0.162.1 source. No dedicated patch race experiment or multi-file transaction atomicity is claimed.
+
 **Repository rules** (`.provefab/rules.md`, see [Repository rules](rules.md)) are instructions to the agents, read from the base branch, and stay under the guard: a rule cannot allow a tool call the guard refuses. On a public repository, review pull requests that change that file closely.
 
 **Only Provefab commits and pushes**, with your permissions. Its own git calls never run the repository's hooks: an agent could have written them.

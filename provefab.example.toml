@@ -36,6 +36,8 @@ id = "codex-gpt"
 worker = "codex"
 model = "gpt-5.5"
 tier = "standard"
+# Codex requires exactly 0.162.1, personal/API file authentication and no
+# system/managed/cloud policy sources; see the native policy configuration guide.
 
 [[models]]
 id = "claude-opus"
@@ -50,7 +52,8 @@ slug = "your-account/your-repo"
 label = "provefab"
 base = "main"
 poll_interval = "3m"
-gates = ["cargo fmt -- --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
+gates = ["cargo fmt -- --check", "cargo clippy --offline --all-targets -- -D warnings", "cargo test --offline"]
+# Provision dependencies before tasks start. Network downloads and binding are denied.
 # Optional: checks run against the exact merge commit after this repo's
 # Provefab-created PR merges. If they fail and still fail on the current base,
 # Provefab opens a human-reviewed revert PR, only when the reverted tree passes.
@@ -67,7 +70,11 @@ runtime = "srt"                  # trusted PATH lookup, or an absolute external 
 allow_local_network = false      # true currently refuses: loopback-only binding is unverified
 protected_paths = []              # explicit validators; empty makes no immutability guarantee
 # protected_paths = ["tests", "scripts/check.sh", "Cargo.lock", "/opt/checks/check.sh"]
+# Include the scripts, config, fixtures and dependencies that define success.
+# No automatic dependency closure: protecting an entrypoint alone is insufficient.
 deny_read = []                    # extra literal absolute host-secret paths
+# Native gates/Codex/Pi tools exercised on macOS with SRT 0.0.79, Codex 0.162.1,
+# Pi 1.0.3. Linux enforcement is unverified; unavailable enforcement refuses.
 
 # Risk-aware policy (optional): changed paths in ci, dependencies, migrations,
 # infrastructure or secrets-config get a frontier reviewer (when one from another

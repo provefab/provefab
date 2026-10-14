@@ -4,6 +4,8 @@
 
 Provefab runs as a background service: a launchd agent on macOS, a systemd user service on Linux. It starts by itself and restarts if it stops.
 
+Before starting it, provision the native runtime and offline dependencies and declare the validation harness (see [native execution policy](configuration.md#repossandbox-native-execution-policy)). Native enforcement is verified on macOS only; Linux remains unverified. Login and `doctor` success do not bypass runtime, authentication or host-policy refusal at stage startup.
+
 ```bash
 provefab service install --workers 1   # install or update, then (re)start
 provefab service status                # running (pid N), loaded, not installed
@@ -97,9 +99,12 @@ Always start with `provefab doctor`. Each `FAIL` line says what to do. `provefab
 | `service install` fails with `Failed to connect to bus` (Linux) | no user systemd session in this shell (for example after `su`) | log in over SSH as that user, or set `XDG_RUNTIME_DIR=/run/user/$(id -u)` |
 | `claude login FAIL` | Claude session missing or expired | `provefab login claude` |
 | `codex guard hook FAIL` | the Codex guard hook is not trusted | `provefab login codex` |
-| `claude api key FAIL` | a model has `auth = "api_key"` but no key is stored, or the API-key config dir does not read it | `provefab login claude --api-key` |
+| `claude api key FAIL` | the configured API-key profile is missing its key or helper | `provefab login claude --api-key` configures the profile, but Claude API-key native stages currently refuse; use a supported worker mode instead |
 | `codex api login FAIL` or `codex api guard hook FAIL` | Codex is not signed in with an API key in `~/.provefab/codex-api` | `provefab login codex --api-key` |
-| a model's plan keeps hitting its usage limit | the subscription is paused until the limit resets | add the same model with `auth = "api_key"` in the same tier: it takes over while the plan is paused |
+| a model's plan keeps hitting its usage limit | the subscription is paused until the limit resets | for Codex, add the same model with `auth = "api_key"` in the same tier; Claude API-key stages currently refuse |
+| native runtime or policy refuses a stage or gate | missing SRT, unsupported worker version/login, host policy or invalid protected path | follow [native execution policy](configuration.md#repossandbox-native-execution-policy); do not disable enforcement or delete user state |
+| a gate needs a download or local listener | gates deny network and binding; `allow_local_network = true` currently refuses | provision dependencies before the task and select offline checks; no verified localhost-only exception is available |
+| SRT reports `listen EINVAL` on macOS | the private temporary socket path is too long | use a shorter `PROVEFAB_HOME` and restart; no unsandboxed fallback is available |
 | `model ... removed: its worker is not ready` in the log | its worker is not installed or not signed in; Provefab dropped it from the catalog at startup | fix the matching `doctor` line, then `provefab service install` |
 | every task in `waiting` | every model of the tier is paused, or the daily budget is reached | `provefab status` gives the reason; wait, or widen the catalog or the budget |
 | the service cannot find `claude` or `cargo` | `PATH` frozen at install time | run `provefab service install` again from a terminal where the tool is found |
