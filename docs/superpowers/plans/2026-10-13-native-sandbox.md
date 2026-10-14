@@ -40,7 +40,7 @@
 
 ### Task 4: Documentation, landing and final build (user added)
 **Scope budget:** documentation and existing landing feature/security copy only. No redesign, deployment, release publishing or pricing changes. Preserve existing layout, palette and typography.
-- [ ] Align documentation and landing claims with actual verified support and limitations. Core documentation remains the source of generated site docs; update the landing submodule to the reviewed local core commit.
-- [ ] Use a separate clean landing worktree; do not touch original untracked docs/distribution.
-- [ ] Run site tests/build/link/content checks and inspect rendered pages in the browser. Run final release build of core CLI.
-- [ ] Record build artifacts and unresolved platform/runtime limitations; leave reviewable local branches.
+- [x] Align documentation and landing claims with actual verified support and limitations. Core documentation remains the source of generated site docs; update the landing submodule to the reviewed local core commit.
+- [x] Use a separate clean landing worktree; do not touch original untracked docs/distribution.
+- [x] Run site tests/build/link/content checks and inspect rendered pages in the browser. Run final release build of core CLI. Desktop checked; mobile navigation remains an explicit pre-publication follow-up after CUA interruption. No dark theme exists.
+- [x] Record build artifacts and unresolved platform/runtime limitations; leave reviewable local branches.
