@@ -11,8 +11,9 @@ mod process;
 mod sandbox;
 mod types;
 pub use sandbox::{
-    SANDBOX_POLICY_ENV, SANDBOX_RUNTIME_ENV, SandboxPolicy, gate_command,
-    resolve_trusted_executable, sanitize_environment, trusted_path, trusted_path_target,
+    CODEX_TOOL_BOUNDARY_OVERRIDES, SANDBOX_POLICY_ENV, SANDBOX_RUNTIME_ENV, SandboxPolicy,
+    check_codex_host_settings, gate_command, resolve_trusted_executable, sanitize_environment,
+    trusted_path, trusted_path_target,
 };
 
 pub use claude::ClaudeCodeWorker;

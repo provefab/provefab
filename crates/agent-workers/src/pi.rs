@@ -98,12 +98,9 @@ impl PiWorker {
 
 fn tools_arg(profile: ToolProfile, submit: bool) -> String {
     let base = match profile {
-        // No `bash`: Pi's read tools never run a program.
-        ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly => {
-            "provefab_read,provefab_grep,provefab_find,provefab_ls"
-        }
-        ToolProfile::Full => {
-            "provefab_read,provefab_bash,provefab_edit,provefab_write,provefab_grep,provefab_find,provefab_ls"
+        // File operations must execute inside SRT, not an unsandboxed native factory.
+        ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly | ToolProfile::Full => {
+            "provefab_bash"
         }
         ToolProfile::NoTools => "",
     };
@@ -324,6 +321,18 @@ mod tests {
     }
 
     #[test]
+    fn native_file_operations_use_only_sandboxed_bash() {
+        for tools in [
+            ToolProfile::Full,
+            ToolProfile::ReadOnly,
+            ToolProfile::UntrustedReadOnly,
+        ] {
+            assert_eq!(tools_arg(tools, false), "provefab_bash");
+            assert_eq!(tools_arg(tools, true), "provefab_bash,submit_result");
+        }
+    }
+
+    #[test]
     fn args_select_json_mode_no_trust_and_submit_tool() {
         let w = PiWorker {
             program: "pi".into(),
@@ -342,9 +351,7 @@ mod tests {
             "{joined}"
         );
         assert!(
-            joined.contains(
-                "--tools provefab_read,provefab_grep,provefab_find,provefab_ls,submit_result"
-            ),
+            joined.contains("--tools provefab_bash,submit_result"),
             "{joined}"
         );
         assert!(
@@ -392,21 +399,18 @@ mod tests {
     }
 
     /// Final review I1 (pull request reviews): Pi reviews a person's pull
-    /// request without `bash`.
+    /// request using sandboxed Bash; the guard restricts commands to read-only.
     #[test]
-    fn an_untrusted_review_has_no_shell() {
+    fn an_untrusted_review_uses_only_sandboxed_bash() {
         assert_eq!(
             tools_arg(ToolProfile::UntrustedReadOnly, true),
-            format!("provefab_read,provefab_grep,provefab_find,provefab_ls,{SUBMIT_TOOL}")
+            format!("provefab_bash,{SUBMIT_TOOL}")
         );
     }
 
     #[test]
     fn full_profile_without_schema_has_no_submit_tool() {
-        assert_eq!(
-            tools_arg(ToolProfile::Full, false),
-            "provefab_read,provefab_bash,provefab_edit,provefab_write,provefab_grep,provefab_find,provefab_ls"
-        );
+        assert_eq!(tools_arg(ToolProfile::Full, false), "provefab_bash");
     }
 
     fn feed(state: &mut PiState, records: &[Value]) -> Vec<WorkerEvent> {

@@ -23,11 +23,9 @@ function load() {
   module.namespace.default({ registerTool: t => tools.set(t.name,t), on: (name,handler) => handlers.set(name,handler) });
   return {tools,handlers};
 }
-test("all exposed Pi tools require the successfully loaded extension", () => {
+test("only sandboxed Bash is registered, no unsandboxed native file factories", () => {
   const { tools } = load();
-  for (const name of ["read","write","edit","grep","find","ls","bash"]) {
-    assert.ok(tools.has(`provefab_${name}`), `${name} must not fall back to a builtin`);
-  }
+  assert.deepEqual([...tools.keys()], ["provefab_bash"]);
 });
 test("missing policy prevents shell execution", async () => {
   delete process.env.PROVEFAB_SANDBOX_POLICY;
@@ -62,5 +60,19 @@ test("wrapper quotes commands and retains timeout and cancellation", async () =>
     await assert.rejects(bash.execute("2",{command:"sleep 10",timeout:0.05},undefined,undefined,context),/timed out|timeout/i);
     const controller=new AbortController(); setTimeout(()=>controller.abort(),50);
     await assert.rejects(bash.execute("3",{command:"sleep 10"},controller.signal,undefined,context),/abort/i);
+  } finally { rmSync(root,{recursive:true,force:true}); }
+});
+
+test("stale builtin and direct file routes cannot reach native operations even with a permissive guard", async () => {
+  const root=mkdtempSync(join(tmpdir(),"provefab-pi-routes-"));
+  try {
+    const bin=join(root,"allow-guard");
+    writeFileSync(bin, "#!/bin/sh\ncat >/dev/null\nprintf '{\"decision\":\"allow\"}\n'\n"); chmodSync(bin,0o755);
+    process.env.PROVEFAB_BIN=bin;
+    const {handlers}=load();
+    for (const toolName of ["read","write","edit","grep","find","ls","bash","provefab_read","provefab_write","provefab_edit","provefab_grep","provefab_find","provefab_ls"]) {
+      const result=await handlers.get("tool_call")({toolName,input:{path:"ordinary.txt",command:"true"}},{cwd:root});
+      assert.equal(result?.block,true,`${toolName} escaped the restricted registration boundary`);
+    }
   } finally { rmSync(root,{recursive:true,force:true}); }
 });

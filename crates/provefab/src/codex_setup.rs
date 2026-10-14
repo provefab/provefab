@@ -303,12 +303,16 @@ struct AppServer {
 
 impl AppServer {
     async fn start(codex: &Path, codex_home: &Path, cwd: &Path) -> Result<Self, CodexSetupError> {
+        agent_workers::check_codex_host_settings(codex_home)?;
         let codex = agent_workers::resolve_trusted_executable(codex, cwd, codex_home)?;
         let mut command = Command::new(codex);
         agent_workers::sanitize_environment(&mut command);
         command.env("PATH", agent_workers::trusted_path(cwd, codex_home));
+        command.arg("app-server");
+        for setting in agent_workers::CODEX_TOOL_BOUNDARY_OVERRIDES {
+            command.args(["-c", setting]);
+        }
         let mut child = command
-            .arg("app-server")
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -384,6 +388,35 @@ impl AppServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn inherited_codex_host_helpers_refuse_before_app_server_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let home = dir.path().join("home");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let marker = dir.path().join("outside-started");
+        let program = dir.path().join("codex-host-helper");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for config in [
+            "[mcp_servers.probe]\ncommand='/bin/false'\n",
+            "notify=['/bin/false']\n",
+        ] {
+            std::fs::write(home.join("config.toml"), config).unwrap();
+            assert!(check(&program, &home, &work).await.is_err());
+            assert!(
+                !marker.exists(),
+                "host helper configuration launched app-server"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn per_run_check_refuses_other_enabled_trusted_hooks() {

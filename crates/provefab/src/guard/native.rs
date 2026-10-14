@@ -109,26 +109,6 @@ fn candidates(path: &Path, cwd: &Path) -> io::Result<[PathBuf; 2]> {
     let target = resolve_existing_prefix(&joined).ok_or_else(invalid)?;
     Ok([joined, target])
 }
-/// Searches may follow nested links. Inspect real directory entries with a bounded budget;
-/// a broken link or unreadable subtree refuses instead of silently omitting a possible secret.
-fn check_descendants(path: &Path, denied: &[PathBuf]) -> io::Result<()> {
-    let mut pending = vec![path.to_path_buf()];
-    let mut visited = std::collections::HashSet::new();
-    let mut remaining = 100_000usize;
-    while let Some(path) = pending.pop() {
-        remaining = remaining.checked_sub(1).ok_or_else(invalid)?;
-        let target = resolve_existing_prefix(&path).ok_or_else(invalid)?;
-        if denied.iter().any(|p| intersect(&target, p)) {
-            return Err(invalid());
-        }
-        if target.is_dir() && visited.insert(target.clone()) {
-            for entry in std::fs::read_dir(target)? {
-                pending.push(entry?.path());
-            }
-        }
-    }
-    Ok(())
-}
 fn check_path(
     path: &Path,
     cwd: &Path,
@@ -143,15 +123,11 @@ fn check_path(
             return Err(invalid());
         }
     }
-    if !write && candidates[1].is_dir() {
-        check_descendants(&candidates[1], denied)?;
-    }
     if write {
         let root = root.canonicalize()?;
         // Replacing the root replaces protected descendants too, including native policy boundaries.
-        if candidates
-            .iter()
-            .any(|p| p == &root || !p.starts_with(&root))
+        if candidates[1] == root
+            || !candidates[1].starts_with(&root)
             || !fs.allow_write.iter().any(|p| root.starts_with(p))
         {
             return Err(invalid());
@@ -167,17 +143,16 @@ pub(super) fn check(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
     let checked = (|| {
         let fs = load(Path::new(&path), root)?;
         match call {
-            ToolCall::Write { path } => check_path(path, cwd, root, &fs, true)?,
+            // Hooks cannot make host-native file operations race safe. Use sandboxed Bash.
+            ToolCall::Write { .. } | ToolCall::Edit { .. } | ToolCall::Read { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "direct file tools require OS enforcement; use sandboxed Bash",
+                ));
+            }
             ToolCall::Patch { paths } => {
                 for path in paths {
                     check_path(path, cwd, root, &fs, true)?;
-                }
-            }
-            ToolCall::Read { paths, .. } => {
-                if paths.is_empty() {
-                    return Err(invalid());
-                }
-                for path in paths {
                     check_path(path, cwd, root, &fs, false)?;
                 }
             }

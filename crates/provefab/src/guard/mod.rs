@@ -18,6 +18,10 @@ pub enum ToolCall {
     Write {
         path: PathBuf,
     },
+    /// Editing reads old content and may return it in a diff. It needs read and write permission.
+    Edit {
+        path: PathBuf,
+    },
     /// A shell command whose working directory the caller cannot know (Codex
     /// runs it in a `workdir` its hook payload omits): relative writes are refused.
     ShellUnknownCwd {
@@ -33,8 +37,8 @@ pub enum ToolCall {
     },
     /// A read or search tool (Claude Code's Read, Grep, Glob; Pi's read,
     /// grep, find, ls) and the paths it reads, its default directory included.
-    /// Allowed for every stage; a review of a person's pull request keeps it
-    /// inside the worktree.
+    /// Standalone guards allow reads; native policies refuse host-native file tools.
+    /// A standalone review of a person's pull request keeps them inside the worktree.
     Read {
         paths: Vec<PathBuf>,
         /// A search pattern starting with `-`, which Pi passes to `rg` or
@@ -74,6 +78,9 @@ fn check_with(
         ToolCall::ShellUnknownCwd { command } => {
             shell::check_secret_reads(command, None, protected)
         }
+        ToolCall::Edit { path } => protected
+            .check_word(&path.to_string_lossy(), Some(cwd), false)
+            .map_or(Decision::Allow, Decision::Deny),
         ToolCall::Read { paths, .. } => paths
             .iter()
             .find_map(|p| protected.check_word(&p.to_string_lossy(), Some(cwd), true))
@@ -86,7 +93,7 @@ fn check_with(
     match call {
         ToolCall::Shell { command } => shell::check_command(command, cwd, root),
         ToolCall::ShellUnknownCwd { command } => shell::check_command_from(command, None, root),
-        ToolCall::Write { path } => paths::check_write(path, cwd, root),
+        ToolCall::Write { path } | ToolCall::Edit { path } => paths::check_write(path, cwd, root),
         ToolCall::Patch { paths } if paths.is_empty() => {
             Decision::Deny("the patch names no file, so the guard cannot check it".into())
         }
@@ -129,7 +136,7 @@ pub fn check_review(call: &ToolCall, cwd: &Path, root: &Path) -> Decision {
             .map(|p| paths::check_read(p, cwd, root))
             .find(|d| *d != Decision::Allow)
             .unwrap_or(Decision::Allow),
-        ToolCall::Write { .. } | ToolCall::Patch { .. } => {
+        ToolCall::Write { .. } | ToolCall::Edit { .. } | ToolCall::Patch { .. } => {
             Decision::Deny("a pull request review writes no file".into())
         }
         ToolCall::Blocked { reason } => Decision::Deny(reason.clone()),

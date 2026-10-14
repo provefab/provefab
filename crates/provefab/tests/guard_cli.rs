@@ -217,7 +217,7 @@ fn native_policy_denies_direct_validation_writes_and_secret_searches() {
     assert!(
         String::from_utf8(out.stdout)
             .unwrap()
-            .contains("\"decision\":\"allow\"")
+            .contains("\"decision\":\"deny\"")
     );
 }
 
@@ -295,4 +295,77 @@ fn native_named_policy_rejects_malformed_and_widened_security_fields() {
                 .contains("\"permissionDecision\":\"deny\"")
         );
     }
+}
+
+#[test]
+fn native_policy_denies_edit_and_patch_reads_of_an_unprotected_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    std::fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let secret = root.join("ordinary.txt");
+    std::fs::write(&secret, "FAKE_READ_MODIFY_WRITE_SECRET").unwrap();
+    let policy = dir.path().join("policy.json");
+    std::fs::write(&policy, native_policy(&root, &[secret], &[]).to_string()).unwrap();
+    let env = [("PROVEFAB_SANDBOX_POLICY", policy.to_str().unwrap())];
+    for (format, input) in [
+        (
+            "claude-code",
+            serde_json::json!({"tool_name":"Edit","tool_input":{"file_path":"ordinary.txt","old_string":"FAKE","new_string":"changed"}}),
+        ),
+        (
+            "pi",
+            serde_json::json!({"tool":"edit","args":{"path":"ordinary.txt","oldText":"FAKE","newText":"changed"}}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: ordinary.txt\n@@\n-FAKE\n+changed\n*** End Patch"}}),
+        ),
+    ] {
+        let out = guard_with(format, Some(&root), &input.to_string(), &env);
+        assert!(
+            String::from_utf8(out.stdout).unwrap().contains("deny"),
+            "{format} leaked read permission through edit"
+        );
+    }
+}
+
+#[test]
+fn native_policy_refuses_direct_file_operations_even_on_allowed_ordinary_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("ordinary.txt"), "safe").unwrap();
+    let policy = dir.path().join("policy.json");
+    std::fs::write(&policy, native_policy(&root, &[], &[]).to_string()).unwrap();
+    let env = [("PROVEFAB_SANDBOX_POLICY", policy.to_str().unwrap())];
+    for tool in ["Read", "Write", "Edit", "Grep", "Glob"] {
+        let input = serde_json::json!({"tool_name":tool,"tool_input":{"file_path":"ordinary.txt","path":".","pattern":"*"}});
+        assert!(
+            String::from_utf8(
+                guard_with("claude-code", Some(&root), &input.to_string(), &env).stdout
+            )
+            .unwrap()
+            .contains("deny"),
+            "{tool} stayed available without OS file isolation"
+        );
+    }
+}
+
+#[test]
+fn native_policy_keeps_codex_patch_available_for_an_ordinary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("ordinary.txt"), "safe").unwrap();
+    let policy = dir.path().join("policy.json");
+    std::fs::write(&policy, native_policy(&root, &[], &[]).to_string()).unwrap();
+    let env = [("PROVEFAB_SANDBOX_POLICY", policy.to_str().unwrap())];
+    let input = serde_json::json!({"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: ordinary.txt\n@@\n-safe\n+changed\n*** End Patch"}});
+    let output = guard_with("codex", Some(&root), &input.to_string(), &env);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "",
+        "ordinary Codex patch incorrectly disabled"
+    );
 }

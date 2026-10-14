@@ -2,9 +2,7 @@
 // Every tool call goes through `provefab guard`; the policy itself lives in Rust (D15).
 // When the stage has an output schema, a `submit_result` tool ends the run with a typed answer.
 import {
-	createBashToolDefinition, createLocalBashOperations, createReadToolDefinition,
-	createWriteToolDefinition, createEditToolDefinition, createFindToolDefinition,
-	createGrepToolDefinition, createLsToolDefinition, type ExtensionAPI,
+	createBashToolDefinition, createLocalBashOperations, type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { spawnSync } from "node:child_process";
 import { readFileSync, realpathSync, accessSync, constants } from "node:fs";
@@ -58,7 +56,9 @@ export default function (pi: ExtensionAPI) {
 			return {cwd, env: safeEnvironment(env), command: `exec ${quote(runtime)} --settings ${quote(config)} -- /bin/bash --noprofile --norc -c ${quote(command)}`};
 		},
 	});
-	const definitions = [bash, createReadToolDefinition(cwd), createWriteToolDefinition(cwd), createEditToolDefinition(cwd), createFindToolDefinition(cwd), createGrepToolDefinition(cwd), createLsToolDefinition(cwd)];
+	// Native file factories open paths after the guard, outside SRT. Do not register them.
+	const definitions = [bash];
+	const permitted = new Set(["provefab_bash"]);
 	for (const definition of definitions) {
 		const execute = definition.execute;
 		pi.registerTool({
@@ -73,12 +73,14 @@ export default function (pi: ExtensionAPI) {
 	}
 	pi.on("user_bash", async () => ({result: {output: "Use the Provefab guarded Bash tool", exitCode: 1, cancelled: false, truncated: false}}));
 	pi.on("tool_call", async (event, ctx) => {
+		if (!permitted.has(event.toolName)) return {block: true, reason: "Only Provefab sandboxed Bash and the structured answer are available"};
 		try { guard(event.toolName, event.input, ctx.cwd); return undefined; }
 		catch (error) { return {block: true, reason: String(error)}; }
 	});
 
 	const schemaPath = process.env.PROVEFAB_OUTPUT_SCHEMA;
 	if (schemaPath) {
+		permitted.add("submit_result");
 		const parameters = JSON.parse(readFileSync(schemaPath, "utf8"));
 		pi.registerTool({
 			name: "submit_result",

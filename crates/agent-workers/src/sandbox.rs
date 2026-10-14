@@ -74,6 +74,71 @@ impl SandboxPolicy {
 pub const SANDBOX_POLICY_ENV: &str = "PROVEFAB_SANDBOX_POLICY";
 pub const SANDBOX_RUNTIME_ENV: &str = "PROVEFAB_SANDBOX_RUNTIME";
 
+/// Keep unsupported host tool/helper routes disabled before app-server and stage startup.
+/// Keys verified in Codex 0.162.1's feature registry; hooks remain enabled for Provefab.
+pub const CODEX_TOOL_BOUNDARY_OVERRIDES: &[&str] = &[
+    "features.view_image=false",
+    "features.plugins=false",
+    "features.apps=false",
+    "features.remote_plugin=false",
+    "features.multi_agent=false",
+    "features.multi_agent_v2=false",
+    "features.computer_use=false",
+    "features.browser_use=false",
+    "features.browser_use_external=false",
+    "features.browser_use_full_cdp_access=false",
+    "features.code_mode_host=false",
+    "features.code_mode=false",
+    "features.code_mode_prewarm=false",
+    "features.enable_mcp_apps=false",
+    "features.image_generation=false",
+    "features.realtime_conversation=false",
+    "features.in_app_local_automation=false",
+    "features.shell_snapshot=false",
+    "features.shell_snapshot_v2=false",
+    "features.daemon_auto_start=false",
+];
+/// Dedicated profiles may contain model/auth choices and Provefab trust state, never host helpers.
+pub fn check_codex_host_settings(home: &std::path::Path) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let config = text
+        .parse::<toml::Table>()
+        .map_err(|_| invalid("dedicated Codex config does not parse; fix it before running"))?;
+    for (key, value) in &config {
+        if key == "mcp_servers" {
+            if !value.as_table().is_some_and(|table| table.is_empty()) {
+                return Err(invalid(
+                    "dedicated Codex profile has inherited MCP servers; remove mcp_servers from this dedicated profile before running, host startup is not sandboxed",
+                ));
+            }
+        } else if ![
+            "projects",
+            "hooks",
+            "model",
+            "model_reasoning_effort",
+            "model_reasoning_summary",
+            "model_verbosity",
+            "model_context_window",
+            "model_auto_compact_token_limit",
+            "forced_login_method",
+            "cli_auth_credentials_store",
+            "notice",
+        ]
+        .contains(&key.as_str())
+        {
+            // Print the key only, never values that can include account credentials.
+            return Err(invalid(format!(
+                "unsupported dedicated Codex setting `{key}`; remove it from the dedicated profile before running (host helpers/custom providers/plugins are unsupported)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn invalid(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
 }

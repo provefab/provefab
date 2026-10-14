@@ -54,7 +54,12 @@ pub fn from_pi(tool: &str, args: &Value) -> ToolCall {
         "bash" => str_arg(args, "command")
             .map(|command| ToolCall::Shell { command })
             .unwrap_or_else(|| malformed(tool, "command")),
-        "edit" | "write" => str_arg(args, "path")
+        "edit" => str_arg(args, "path")
+            .map(|p| ToolCall::Edit {
+                path: PathBuf::from(p),
+            })
+            .unwrap_or_else(|| malformed(tool, "path")),
+        "write" => str_arg(args, "path")
             .map(|p| ToolCall::Write {
                 path: PathBuf::from(p),
             })
@@ -86,8 +91,17 @@ pub fn from_claude_code(tool: &str, input: &Value) -> ToolCall {
         "Bash" => str_arg(input, "command")
             .map(|command| ToolCall::Shell { command })
             .unwrap_or_else(|| malformed(tool, "command")),
-        "Edit" | "Write" | "MultiEdit" => write("file_path"),
-        "NotebookEdit" => write("notebook_path"),
+        "Edit" | "MultiEdit" => str_arg(input, "file_path")
+            .map(|p| ToolCall::Edit {
+                path: PathBuf::from(p),
+            })
+            .unwrap_or_else(|| malformed(tool, "file_path")),
+        "NotebookEdit" => str_arg(input, "notebook_path")
+            .map(|p| ToolCall::Edit {
+                path: PathBuf::from(p),
+            })
+            .unwrap_or_else(|| malformed(tool, "notebook_path")),
+        "Write" => write("file_path"),
         "Read" => read(input, &["file_path"], false, None),
         "Grep" => read(input, &["path"], true, None),
         "Glob" => {
@@ -122,7 +136,13 @@ pub fn from_codex(tool: &str, input: &Value) -> ToolCall {
             Some(Err(reason)) => ToolCall::Blocked { reason },
             None => malformed(tool, "command"),
         },
-        "Edit" | "Write" => str_arg(input, "file_path")
+        "Edit" => str_arg(input, "file_path")
+            .or_else(|| str_arg(input, "path"))
+            .map(|p| ToolCall::Edit {
+                path: PathBuf::from(p),
+            })
+            .unwrap_or_else(|| malformed(tool, "file_path")),
+        "Write" => str_arg(input, "file_path")
             .or_else(|| str_arg(input, "path"))
             .map(|p| ToolCall::Write {
                 path: PathBuf::from(p),
@@ -219,13 +239,13 @@ mod tests {
     fn claude_code_mapping() {
         assert_eq!(
             from_claude_code("Edit", &json!({"file_path": "/w/a.rs"})),
-            ToolCall::Write {
+            ToolCall::Edit {
                 path: "/w/a.rs".into()
             }
         );
         assert_eq!(
             from_claude_code("NotebookEdit", &json!({"notebook_path": "/w/n.ipynb"})),
-            ToolCall::Write {
+            ToolCall::Edit {
                 path: "/w/n.ipynb".into()
             }
         );

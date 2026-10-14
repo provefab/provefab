@@ -67,14 +67,9 @@ impl CodexWorker {
             // refuses without this flag; stages run in worktrees.
             push("--skip-git-repo-check");
         }
-        // A review of a person's pull request has them off too: nothing it
-        // reads leaves through a search query.
-        if matches!(
-            req.tools,
-            ToolProfile::NoTools | ToolProfile::UntrustedReadOnly
-        ) {
+        for setting in crate::CODEX_TOOL_BOUNDARY_OVERRIDES {
             push("-c");
-            push("features.view_image=false");
+            push(setting);
         }
         if req.output_schema.is_some() {
             a.push("--output-schema".into());
@@ -111,6 +106,7 @@ impl CodexWorker {
             std::slice::from_ref(&self.provefab_bin),
             std::slice::from_ref(&self.codex_home),
         )?;
+        crate::check_codex_host_settings(&self.codex_home)?;
         let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
         crate::sandbox::check_version(&program, [0, 162, 1], &req)?;
         req.sandbox.deny_write.push(program.clone());
@@ -349,6 +345,87 @@ mod tests {
             .map(|s| s.into_string().unwrap())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn inherited_codex_host_helpers_refuse_before_version_or_worker_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let home = dir.path().join("home");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let marker = dir.path().join("outside-started");
+        let program = dir.path().join("codex-host-helper");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho 'codex-cli 0.162.1'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut worker = worker();
+        worker.program = program;
+        worker.codex_home = home.clone();
+        worker.provefab_bin = "/bin/false".into();
+        let mut request = req(ToolProfile::Full, false);
+        request.cwd = work;
+        request.session_dir = dir.path().join("session");
+        for config in [
+            "[mcp_servers.probe]\ncommand='/bin/false'\n",
+            "notify=['/bin/false']\n",
+        ] {
+            std::fs::write(home.join("config.toml"), config).unwrap();
+            assert!(
+                worker.prepare_command(&request, "prompt").is_err(),
+                "host helpers accepted"
+            );
+            assert!(
+                !marker.exists(),
+                "host helper settings were checked after launch"
+            );
+        }
+    }
+
+    #[test]
+    fn every_native_profile_disables_external_tool_routes() {
+        let args = worker().args(&req(ToolProfile::Full, false), "prompt");
+        for setting in [
+            "features.plugins=false",
+            "features.apps=false",
+            "features.remote_plugin=false",
+            "features.multi_agent=false",
+            "features.computer_use=false",
+            "features.browser_use=false",
+            "features.code_mode_host=false",
+            "features.shell_snapshot=false",
+            "features.shell_snapshot_v2=false",
+        ] {
+            assert!(
+                args.iter().any(|a| a == setting),
+                "unsafe inherited route: {setting}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_native_profile_disables_host_image_reads() {
+        for tools in [
+            ToolProfile::Full,
+            ToolProfile::ReadOnly,
+            ToolProfile::UntrustedReadOnly,
+            ToolProfile::NoTools,
+        ] {
+            let request = req(tools, false);
+            assert!(
+                worker()
+                    .args(&request, "prompt")
+                    .iter()
+                    .any(|a| a == "features.view_image=false")
+            );
+        }
     }
 
     #[test]

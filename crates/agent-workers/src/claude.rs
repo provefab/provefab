@@ -54,13 +54,12 @@ impl ClaudeCodeWorker {
         );
         push("--tools");
         push(match req.tools {
-            // No shell: nothing the worktree holds can run (final review I1).
-            ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly => "Read,Grep,Glob",
-            ToolProfile::Full => "Bash,Read,Edit,Write,Glob,Grep",
+            // Native file tools run outside the shell sandbox and permit alias-swap races.
+            ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly | ToolProfile::Full => "Bash",
             // `""` disables every built-in tool; `--json-schema` still answers.
             ToolProfile::NoTools => "",
         });
-        if req.tools == ToolProfile::Full {
+        if req.tools != ToolProfile::NoTools {
             // With --permission-prompts none, shell commands outside Claude Code's
             // read-only set need a pre-approval. The cc-provefab PreToolUse hook
             // (provefab guard) still runs first and can deny any call.
@@ -321,6 +320,27 @@ mod tests {
     }
 
     #[test]
+    fn native_file_operations_use_only_sandboxed_bash() {
+        for tools in [
+            ToolProfile::Full,
+            ToolProfile::ReadOnly,
+            ToolProfile::UntrustedReadOnly,
+        ] {
+            let mut request = req();
+            request.tools = tools;
+            let args = worker().args(&request);
+            let i = args.iter().position(|s| s == "--tools").unwrap();
+            assert_eq!(
+                args[i + 1],
+                "Bash",
+                "unsandboxed file tools exposed: {args:?}"
+            );
+            let allowed = args.iter().position(|s| s == "--allowedTools").unwrap();
+            assert_eq!(args[allowed + 1], "Bash");
+        }
+    }
+
+    #[test]
     fn native_claude_settings_require_enforcement_without_escape_commands() {
         let args = worker().args(&req());
         let i = args
@@ -358,7 +378,7 @@ mod tests {
         for part in [
             "--setting-sources user",
             "--strict-mcp-config",
-            "--tools Read,Grep,Glob",
+            "--tools Bash",
             "--permission-prompts none",
             "--max-turns 40",
             "--plugin-dir /x/cc-provefab",
@@ -392,8 +412,8 @@ mod tests {
             joined(&full)
         );
         assert!(
-            !joined(&req()).contains("--allowedTools"),
-            "read-only must not pre-approve Bash"
+            joined(&req()).contains("--allowedTools Bash"),
+            "read-only Bash is enforced by native policy and the guard"
         );
     }
 
@@ -425,9 +445,9 @@ mod tests {
     }
 
     /// Final review I1 (pull request reviews): Claude Code reviews a person's
-    /// pull request with Read, Grep and Glob only, no shell, and tells the guard.
+    /// pull request through sandboxed Bash only; the guard permits read-only commands.
     #[test]
-    fn an_untrusted_review_has_no_shell_and_tells_the_guard() {
+    fn an_untrusted_review_uses_sandboxed_bash_and_tells_the_guard() {
         let mut review = req();
         review.tools = ToolProfile::UntrustedReadOnly;
         let args: Vec<String> = worker()
@@ -436,8 +456,8 @@ mod tests {
             .map(|s| s.into_string().unwrap())
             .collect();
         let at = args.iter().position(|a| a == "--tools").unwrap();
-        assert_eq!(args[at + 1], "Read,Grep,Glob", "{args:?}");
-        assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
+        assert_eq!(args[at + 1], "Bash", "{args:?}");
+        assert!(args.iter().any(|a| a == "--allowedTools"), "{args:?}");
         let marker = worker()
             .command(&worker().program, &review)
             .as_std()
