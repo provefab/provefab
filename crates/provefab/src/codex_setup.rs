@@ -305,6 +305,7 @@ impl AppServer {
     async fn start(codex: &Path, codex_home: &Path, cwd: &Path) -> Result<Self, CodexSetupError> {
         agent_workers::check_codex_host_settings(codex_home)?;
         let codex = agent_workers::resolve_trusted_executable(codex, cwd, codex_home)?;
+        agent_workers::check_codex_version(&codex, cwd, codex_home)?;
         let mut command = Command::new(codex);
         agent_workers::sanitize_environment(&mut command);
         command.env("PATH", agent_workers::trusted_path(cwd, codex_home));
@@ -405,6 +406,13 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(home.join("cloud-config-bundle-cache.json"), "{}").unwrap();
+        assert!(check(&program, &home, &work).await.is_err());
+        assert!(
+            !marker.exists(),
+            "external cloud policy checked after startup"
+        );
+        std::fs::remove_file(home.join("cloud-config-bundle-cache.json")).unwrap();
         for config in [
             "[mcp_servers.probe]\ncommand='/bin/false'\n",
             "notify=['/bin/false']\n",
@@ -416,6 +424,37 @@ mod tests {
                 "host helper configuration launched app-server"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unreviewed_codex_version_never_starts_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let work = dir.path().join("work");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let marker = dir.path().join("app-server-started");
+        let program = dir.path().join("codex");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.162.2'; else touch '{}'; fi\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = check(&program, &home, &work).await.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("exactly reviewed version 0.162.1")
+        );
+        assert!(
+            !marker.exists(),
+            "version rejected after app-server startup"
+        );
     }
 
     #[tokio::test]
@@ -431,7 +470,7 @@ mod tests {
             {"key": hook_key(&home.canonicalize().unwrap()), "source": "user", "command": HOOK_COMMAND, "trustStatus": "trusted", "enabled": true},
             {"key": "extra", "source": "user", "command": "./editable-helper", "trustStatus": "trusted", "enabled": true}
         ]}]});
-        std::fs::write(&program, format!("#!/usr/bin/python3\nimport json,sys\nhooks=json.loads({:?})\nfor line in sys.stdin:\n m=json.loads(line)\n if 'id' in m:\n  result=hooks if m.get('method')=='hooks/list' else {{}}\n  print(json.dumps({{'id':m['id'],'result':result}}),flush=True)\n", hooks.to_string())).unwrap();
+        std::fs::write(&program, format!("#!/usr/bin/python3\nimport json,sys\nif sys.argv[1:]==[\"--version\"]: print(\"codex-cli 0.162.1\"); sys.exit(0)\nhooks=json.loads({:?})\nfor line in sys.stdin:\n m=json.loads(line)\n if 'id' in m:\n  result=hooks if m.get('method')=='hooks/list' else {{}}\n  print(json.dumps({{'id':m['id'],'result':result}}),flush=True)\n", hooks.to_string())).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = check(&program, &home, &work)
             .await

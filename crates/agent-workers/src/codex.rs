@@ -108,7 +108,7 @@ impl CodexWorker {
         )?;
         crate::check_codex_host_settings(&self.codex_home)?;
         let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
-        crate::sandbox::check_version(&program, [0, 162, 1], &req)?;
+        crate::check_codex_version(&program, &req.cwd, &req.session_dir)?;
         req.sandbox.deny_write.push(program.clone());
         let policy = crate::sandbox::write_policy(&req, false)?;
         let mut cmd = self.command(&program, &req, prompt);
@@ -373,9 +373,19 @@ mod tests {
         let mut request = req(ToolProfile::Full, false);
         request.cwd = work;
         request.session_dir = dir.path().join("session");
+        std::fs::write(home.join("cloud-config-bundle-cache.json"), "{}").unwrap();
+        assert!(worker.prepare_command(&request, "prompt").is_err());
+        assert!(
+            !marker.exists(),
+            "external cloud policy checked after startup"
+        );
+        std::fs::remove_file(home.join("cloud-config-bundle-cache.json")).unwrap();
         for config in [
             "[mcp_servers.probe]\ncommand='/bin/false'\n",
             "notify=['/bin/false']\n",
+            "cli_auth_credentials_store='keyring'\n",
+            "cli_auth_credentials_store='auto'\n",
+            "cli_auth_credentials_store='ephemeral'\n",
         ] {
             std::fs::write(home.join("config.toml"), config).unwrap();
             assert!(
@@ -387,12 +397,24 @@ mod tests {
                 "host helper settings were checked after launch"
             );
         }
+        std::fs::write(
+            home.join("config.toml"),
+            "cli_auth_credentials_store='file'\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("auth.json"), r#"{"auth_mode":"agent_identity"}"#).unwrap();
+        assert!(worker.prepare_command(&request, "prompt").is_err());
+        assert!(
+            !marker.exists(),
+            "uninspectable authentication launched Codex"
+        );
     }
 
     #[test]
     fn every_native_profile_disables_external_tool_routes() {
         let args = worker().args(&req(ToolProfile::Full, false), "prompt");
         for setting in [
+            "cli_auth_credentials_store=\"file\"",
             "features.plugins=false",
             "features.apps=false",
             "features.remote_plugin=false",

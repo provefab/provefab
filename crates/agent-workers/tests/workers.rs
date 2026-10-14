@@ -346,6 +346,10 @@ const CODEX_STREAM: &str = concat!(
 );
 
 fn codex(fake: &Fake) -> CodexWorker {
+    let script = std::fs::read_to_string(fake.bin())
+        .unwrap()
+        .replace("2.1.296", "0.162.1");
+    std::fs::write(fake.bin(), script).unwrap();
     CodexWorker {
         program: fake.bin(),
         codex_home: "/cfg/codex".into(),
@@ -457,7 +461,7 @@ async fn prepared_native_workers_pin_the_executable_before_changing_cwd() {
         let root = PathBuf::from(root);
         let req = request(&root, false);
         let codex = CodexWorker {
-            program: "agent".into(),
+            program: "codex-agent".into(),
             codex_home: root.join("auth"),
             provefab_bin: root.join("guard"),
         };
@@ -473,7 +477,11 @@ async fn prepared_native_workers_pin_the_executable_before_changing_cwd() {
         ] {
             assert_eq!(
                 command.as_std().get_program(),
-                root.join("trusted/agent").canonicalize().unwrap()
+                root.join("trusted").canonicalize().unwrap().join(
+                    std::path::Path::new(command.as_std().get_program())
+                        .file_name()
+                        .unwrap()
+                )
             );
             let out = command.output().await.unwrap();
             assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "trusted");
@@ -487,6 +495,15 @@ async fn prepared_native_workers_pin_the_executable_before_changing_cwd() {
         let bin = path.join("agent");
         std::fs::write(&bin, format!("#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then echo 2.1.296; elif [ \"$1\" = --setting-sources ]; then echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"subscriptionType\":\"max\"}}'; else echo {result}; fi\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let codex_bin = path.join("codex-agent");
+        std::fs::write(
+            &codex_bin,
+            std::fs::read_to_string(&bin)
+                .unwrap()
+                .replace("2.1.296", "0.162.1"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let evil = root.path().join("work/trusted/sh");
     std::fs::write(

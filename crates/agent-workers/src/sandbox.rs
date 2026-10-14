@@ -77,6 +77,7 @@ pub const SANDBOX_RUNTIME_ENV: &str = "PROVEFAB_SANDBOX_RUNTIME";
 /// Keep unsupported host tool/helper routes disabled before app-server and stage startup.
 /// Keys verified in Codex 0.162.1's feature registry; hooks remain enabled for Provefab.
 pub const CODEX_TOOL_BOUNDARY_OVERRIDES: &[&str] = &[
+    "cli_auth_credentials_store=\"file\"",
     "features.view_image=false",
     "features.plugins=false",
     "features.apps=false",
@@ -98,11 +99,19 @@ pub const CODEX_TOOL_BOUNDARY_OVERRIDES: &[&str] = &[
     "features.shell_snapshot_v2=false",
     "features.daemon_auto_start=false",
 ];
-/// Dedicated profiles may contain model/auth choices and Provefab trust state, never host helpers.
+/// Dedicated profiles never inherit host helpers. Codex 0.162.1's loader applies
+/// managed policy after CLI overrides, so absence is required rather than a merge.
 pub fn check_codex_host_settings(home: &std::path::Path) -> std::io::Result<()> {
+    check_codex_sources(&[
+        "/etc/codex/config.toml".into(),
+        "/etc/codex/managed_config.toml".into(),
+        "/etc/codex/requirements.toml".into(),
+        home.join("cloud-config-bundle-cache.json"),
+    ])?;
+    check_codex_managed_preferences()?;
     let text = match std::fs::read_to_string(home.join("config.toml")) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error),
     };
     let config = text
@@ -130,10 +139,153 @@ pub fn check_codex_host_settings(home: &std::path::Path) -> std::io::Result<()> 
         ]
         .contains(&key.as_str())
         {
-            // Print the key only, never values that can include account credentials.
+            // Values can contain credentials. Report only the unsupported key.
             return Err(invalid(format!(
                 "unsupported dedicated Codex setting `{key}`; remove it from the dedicated profile before running (host helpers/custom providers/plugins are unsupported)"
             )));
+        }
+    }
+    if config
+        .get("cli_auth_credentials_store")
+        .is_some_and(|v| v.as_str() != Some("file"))
+    {
+        return Err(invalid(
+            "Codex sandbox requires file credential storage so cloud-policy eligibility can be checked before startup; keyring/auto/ephemeral stores are unsupported",
+        ));
+    }
+    match std::fs::read_to_string(home.join("auth.json")) {
+        Ok(text) => check_codex_auth(&text),
+        // No login means no cloud bundle (service.rs load_startup_bundle).
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn check_codex_sources(paths: &[PathBuf]) -> std::io::Result<()> {
+    for path in paths {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "unsupported external Codex policy source {}; managed/cloud/system configuration cannot be sealed by CLI overrides; use an unmanaged personal profile, no source is deleted automatically",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_codex_auth(text: &str) -> std::io::Result<()> {
+    use base64::Engine;
+    let unsupported = || {
+        invalid(
+            "Codex sandbox supports only inspectable file login for personal free/go/plus/pro/prolite/promax accounts or API keys; workspace, managed, unknown and malformed authentication are unsupported because cloud policy can introduce host helpers",
+        )
+    };
+    let auth: serde_json::Value = serde_json::from_str(text).map_err(|_| unsupported())?;
+    // Match auth/manager.rs resolved_mode precedence; reject alternative material
+    // conservatively instead of guessing a hidden auth provider's account plan.
+    if [
+        "agent_identity",
+        "personal_access_token",
+        "bedrock_api_key",
+        "bedrock_access_keys",
+    ]
+    .iter()
+    .any(|k| !auth[*k].is_null())
+    {
+        return Err(unsupported());
+    }
+    let mode = match &auth["auth_mode"] {
+        serde_json::Value::String(mode) => mode.as_str(),
+        serde_json::Value::Null if auth["OPENAI_API_KEY"].is_string() => "apikey",
+        serde_json::Value::Null => "chatgpt",
+        _ => return Err(unsupported()),
+    };
+    if mode == "apikey"
+        && auth["OPENAI_API_KEY"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    {
+        return Ok(());
+    }
+    if mode != "chatgpt" {
+        return Err(unsupported());
+    }
+    let jwt = auth["tokens"]["id_token"]
+        .as_str()
+        .ok_or_else(unsupported)?;
+    let parts: Vec<_> = jwt.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return Err(unsupported());
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| unsupported())?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).map_err(|_| unsupported())?;
+    // Same ID-token selector as account_plan_type, not credential verification.
+    // service.rs skips cloud startup AND refresh for these known personal plans.
+    match claims["https://api.openai.com/auth"]["chatgpt_plan_type"].as_str() {
+        Some("free" | "go" | "plus" | "pro" | "prolite" | "promax") => Ok(()),
+        _ => Err(unsupported()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_codex_managed_preferences() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn check_codex_managed_preferences() -> std::io::Result<()> {
+    use std::ffi::{CStr, c_void};
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            allocator: *const c_void,
+            text: *const libc::c_char,
+            encoding: u32,
+        ) -> *const c_void;
+        fn CFRelease(value: *const c_void);
+        fn CFPreferencesAppSynchronize(application: *const c_void) -> u8;
+        fn CFPreferencesAppValueIsForced(key: *const c_void, application: *const c_void) -> u8;
+    }
+    struct StringRef(*const c_void);
+    impl StringRef {
+        fn new(text: &CStr) -> std::io::Result<Self> {
+            // SAFETY: static nul-terminated UTF-8, default allocator; retained CFString.
+            let value =
+                unsafe { CFStringCreateWithCString(std::ptr::null(), text.as_ptr(), 0x08000100) };
+            if value.is_null() {
+                Err(invalid("cannot inspect Codex managed preferences"))
+            } else {
+                Ok(Self(value))
+            }
+        }
+    }
+    impl Drop for StringRef {
+        fn drop(&mut self) {
+            unsafe {
+                CFRelease(self.0);
+            }
+        }
+    }
+    let application = StringRef::new(c"com.openai.codex")?;
+    // Mirror the exact loader's native forced-preference API, never plist guesses
+    // or user defaults. Any forced value is unsupported, including malformed data.
+    if unsafe { CFPreferencesAppSynchronize(application.0) } == 0 {
+        return Err(invalid(
+            "cannot synchronize Codex managed preferences; refusing host startup",
+        ));
+    }
+    for name in [c"config_toml_base64", c"requirements_toml_base64"] {
+        let key = StringRef::new(name)?;
+        if unsafe { CFPreferencesAppValueIsForced(key.0, application.0) } != 0 {
+            return Err(invalid(
+                "forced com.openai.codex managed policy is unsupported; CLI overrides cannot seal this policy, use an unmanaged personal account",
+            ));
         }
     }
     Ok(())
@@ -623,11 +775,19 @@ pub(crate) fn check_version(
     minimum: [u64; 3],
     req: &StageRequest,
 ) -> std::io::Result<[u64; 3]> {
+    check_version_at(program, minimum, &req.cwd, &req.session_dir)
+}
+fn check_version_at(
+    program: &std::path::Path,
+    minimum: [u64; 3],
+    cwd: &std::path::Path,
+    scratch: &std::path::Path,
+) -> std::io::Result<[u64; 3]> {
     let mut cmd = std::process::Command::new(program);
     cmd.arg("--version")
         .env_clear()
         .envs(shell_environment())
-        .env("PATH", trusted_path(&req.cwd, &req.session_dir));
+        .env("PATH", trusted_path(cwd, scratch));
     let output = probe_output(cmd, std::time::Duration::from_secs(5))?;
     let version = String::from_utf8_lossy(&output)
         .split_whitespace()
@@ -643,6 +803,20 @@ pub(crate) fn check_version(
         "{} requires a verified native sandbox version >= {}.{}.{}; version probe failed or unsupported",
         program.display(), minimum[0], minimum[1], minimum[2]
     )))
+}
+
+/// Config-source closure is reviewed only for Codex 0.162.1; newer loaders require review.
+pub fn check_codex_version(
+    program: &std::path::Path,
+    cwd: &std::path::Path,
+    scratch: &std::path::Path,
+) -> std::io::Result<()> {
+    if check_version_at(program, [0, 162, 1], cwd, scratch)? != [0, 162, 1] {
+        return Err(invalid(
+            "Codex sandbox requires exactly reviewed version 0.162.1; newer configuration loaders are unsupported until reviewed",
+        ));
+    }
+    Ok(())
 }
 
 fn personal_claude_account(bytes: &[u8]) -> std::io::Result<()> {
@@ -938,6 +1112,70 @@ mod tests {
         assert!(check_claude_settings(root.path()).is_ok());
     }
     #[test]
+    fn codex_external_policy_sources_refuse_even_empty_or_broken_files() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("managed_config.toml");
+        assert!(check_codex_sources(std::slice::from_ref(&source)).is_ok());
+        std::fs::write(&source, "").unwrap();
+        assert!(check_codex_sources(std::slice::from_ref(&source)).is_err());
+        std::fs::remove_file(&source).unwrap();
+        std::os::unix::fs::symlink(root.path().join("absent"), &source).unwrap();
+        assert!(check_codex_sources(std::slice::from_ref(&source)).is_err());
+        let regular = root.path().join("regular");
+        std::fs::write(&regular, "").unwrap();
+        let inaccessible = regular.join("nested");
+        assert!(check_codex_sources(&[inaccessible]).is_err());
+    }
+
+    #[test]
+    fn codex_cloud_auth_refuses_workspace_unknown_and_uninspectable_modes() {
+        use base64::Engine;
+        for plan in [
+            "business",
+            "enterprise",
+            "edu",
+            "team",
+            "unknown",
+            "free",
+            "go",
+            "plus",
+            "pro",
+            "prolite",
+            "promax",
+        ] {
+            let payload =
+                serde_json::json!({"https://api.openai.com/auth": {"chatgpt_plan_type": plan}});
+            let jwt = format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+            );
+            let auth = serde_json::json!({"auth_mode": "chatgpt", "tokens": {"id_token": jwt}});
+            assert_eq!(
+                check_codex_auth(&auth.to_string()).is_ok(),
+                ["free", "go", "plus", "pro", "prolite", "promax"].contains(&plan),
+                "{plan}"
+            );
+        }
+        for auth in [
+            r#"{"auth_mode":"agent_identity"}"#,
+            r#"{"auth_mode":"chatgpt","tokens":{"id_token":"malformed"}}"#,
+            r#"{"auth_mode":"chatgpt"}"#,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":""}"#,
+            r#"{"auth_mode":123,"OPENAI_API_KEY":"dummy"}"#,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"dummy","agent_identity":{}}"#,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"dummy","personal_access_token":"dummy"}"#,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"dummy","bedrock_api_key":"dummy"}"#,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"dummy","bedrock_access_keys":{}}"#,
+            "{}",
+            "malformed",
+        ] {
+            assert!(check_codex_auth(auth).is_err());
+        }
+        assert!(check_codex_auth(r#"{"auth_mode":"apikey","OPENAI_API_KEY":"dummy"}"#).is_ok());
+        assert!(check_codex_auth(r#"{"OPENAI_API_KEY":"dummy"}"#).is_ok());
+    }
+
+    #[test]
     fn codex_nested_protection_never_reopens_a_denied_parent() {
         let root = tempfile::tempdir().unwrap();
         let mut req = request(root.path());
@@ -968,6 +1206,21 @@ mod tests {
         }
         std::fs::write(&bin, "#!/bin/sh\necho 'codex-cli 0.162.1'\n").unwrap();
         assert!(check_version(&bin, [0, 162, 1], &request(root.path())).is_ok());
+    }
+    #[test]
+    fn codex_version_requires_the_exact_reviewed_loader() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("codex");
+        for version in ["0.162.0", "0.162.1", "0.162.2", "0.163.0", "1.0.0"] {
+            std::fs::write(&bin, format!("#!/bin/sh\necho 'codex-cli {version}'\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                check_codex_version(&bin, root.path(), root.path()).is_ok(),
+                version == "0.162.1",
+                "{version}"
+            );
+        }
     }
     #[test]
     fn explicit_parent_write_denials_cannot_be_overridden_by_workspace_or_tmp() {
