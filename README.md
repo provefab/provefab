@@ -41,7 +41,7 @@ curl -fsSL https://provefab.com/install.sh | sh
 #       provefab-<version>-linux-<x86_64|aarch64>.tar.gz (static), unpack, then
 mkdir -p ~/.local/bin && install -m 755 provefab ~/.local/bin/provefab
 #    c. from source, with Rust 1.96 or newer:
-cargo install --git https://github.com/provefab/provefab --tag v0.7.0 --locked provefab
+cargo install --git https://github.com/provefab/provefab --tag v0.8.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
 #    On a server without a browser, Codex shows a device code for another machine.
