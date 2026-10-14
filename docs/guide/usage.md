@@ -6,7 +6,7 @@
 2. **Classification.** Jev reads the title, body and labels. It estimates the kind (bugfix, feature, refactor, docs, test, chore), the difficulty, the scope, and whether the issue is too vague.
 3. **A question, if the issue is vague.** Provefab asks in a comment and sets `provefab:needs-info`. Answer with a comment, as the issue author or a collaborator. If the answer is enough, the task resumes, and your answer is added to the issue text every stage reads.
 4. **Plan** (read-only tools). For a bugfix, the plan must give a **reproduction command** that fails before the fix. If it already passes, Provefab stops: the bug is not reproduced. The plan sees your [repository rules](rules.md), if any.
-5. **Implementation.** The agent changes the code in an isolated worktree, with native command enforcement and the tool-call guard. Claude and Pi file operations use sandboxed Bash.
+5. **Implementation.** The agent changes the code in an isolated worktree, with native command enforcement and the tool-call guard. Pi file operations use sandboxed Bash. All Claude stages currently refuse; select Codex or Pi in the model catalog.
 6. **Checks.** Your `gates` commands run in the native sandbox with network denied, plus the reproduction command for a bugfix. Declare the validation harness and its dependencies in [native execution policy](configuration.md#repossandbox-native-execution-policy); protection is explicit, not automatically discovered. On failure, Provefab:
    - triages the cause with Jev;
    - retries;

@@ -86,7 +86,8 @@ loop_threshold = 0.8            # above this, an agent going in circles is stopp
 # The catalog: the models of the worker CLIs found on PATH.
 "#;
 
-// The example file's entries (spec section 3), in its order.
+// Legacy CLI-detection entries (spec section 3), in their original order.
+// The copyable example now omits Claude because native stages universally refuse.
 const CLAUDE_SONNET: &str = r#"
 [[models]]
 id = "claude-sonnet"
@@ -707,8 +708,8 @@ mod tests {
     }
 
     /// Spec section 3: `claude` gives `claude-sonnet` and `claude-opus`,
-    /// `codex` gives `codex-gpt`, the same entries as the example file; a
-    /// file that is not executable does not count.
+    /// `codex` gives `codex-gpt`; a file that is not executable does not count.
+    /// CLI detection remains separate from the example's supported-stage catalog.
     #[test]
     fn the_catalog_comes_from_the_worker_clis_on_path() {
         let a = tempfile::tempdir().unwrap();
@@ -766,12 +767,37 @@ mod tests {
                 ids
             );
             for m in &config.models {
+                use crate::config::{Auth, ModelEntry, WorkerKind};
+                use crate::task::Tier;
+                let (worker, model, tier) = match m.id.as_str() {
+                    "claude-sonnet" => (WorkerKind::ClaudeCode, "sonnet", Tier::Standard),
+                    "claude-opus" => (WorkerKind::ClaudeCode, "opus", Tier::Frontier),
+                    "codex-gpt" => (WorkerKind::Codex, "gpt-5.5", Tier::Standard),
+                    id => panic!("unexpected init model {id}"),
+                };
+                // Independent literals retain the old init contract; the active
+                // example deliberately excludes every refused Claude entry.
                 assert_eq!(
-                    Some(m),
-                    example.models.iter().find(|e| e.id == m.id),
-                    "{}",
-                    m.id
+                    m,
+                    &ModelEntry {
+                        id: m.id.clone(),
+                        worker,
+                        model: model.into(),
+                        provider: String::new(),
+                        tier,
+                        max_concurrency: 1,
+                        auth: Auth::Subscription,
+                        price_id: None,
+                        price_in: None,
+                        price_out: None,
+                        price_cache_read: None,
+                        price_cache_write: None,
+                        quota_weight: None,
+                    }
                 );
+                if worker == WorkerKind::Codex {
+                    assert_eq!(Some(m), example.models.iter().find(|e| e.id == m.id));
+                }
             }
             assert_eq!(config.jev, example.jev);
             assert!(config.repos.is_empty(), "no repository is added");

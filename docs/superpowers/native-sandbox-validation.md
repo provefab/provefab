@@ -1,12 +1,37 @@
 # Validation native du sandbox
 
-Validation locale du 14 octobre 2026, branche `feat/native-sandbox`, base `337aafe`. Périmètre : trois tests opt-in, fixtures locales factices, gates core et adaptateurs existants. Aucun push, déploiement, installation globale ou accès à un secret réel. Seul changement de configuration autorisé : pinner `untrusted` les worktrees scratch créés par ce test, dans le profil Codex dédié, comme le fait le parcours core normal.
+Validation historique initiale du 14 octobre 2026, branche `feat/native-sandbox`, base `337aafe`. Périmètre : trois tests opt-in, fixtures locales factices, gates core et adaptateurs existants. Aucun push, déploiement, installation globale ou accès à un secret réel. Seul changement de configuration autorisé : pinner `untrusted` les worktrees scratch créés par ce test, dans le profil Codex dédié, comme le fait le parcours core normal.
+
+## Correctifs finaux I1/I2, 14 octobre 2026
+
+Une seule vague bornée depuis `9c2c6c5`, après [la revue globale](native-sandbox-review.md). Ces résultats remplacent les affirmations de support Claude ci-dessous, conservées comme historique. Tous les stages Claude refusent maintenant avant préparation, version/auth ou exécution host, même avec profil propre et NoTools. La frontière de contexte implicite reste non vérifiée. Choisir Codex/Pi, supprimer ou remplacer les entrées `claude-code` du catalogue, sans supprimer les données utilisateur. L’exemple actif contient seulement Codex ; `init` conserve sa détection historique et nécessite cette adaptation. Login/doctor ne prouvent pas le support d’un stage.
+
+I1 : les entrées trusted/secrets des adaptateurs utilisent le walker existant `trusted_path_target` sur leur plus proche ancêtre existant, avant canonicalisation. Chaque composant développé traversant cwd ou sandbox-tmp refuse. Les aliases externes stables et les feuilles secrètes absentes restent acceptés. Les consommateurs peuvent garder ces aliases parce qu’aucun composant de leur résolution acceptée n’appartient aux deux racines modifiables ; aucune stabilité face à un administrateur concurrent n’est revendiquée.
+
+Rouges observés sur le code précédent : `cargo test -p agent-workers adapter_inputs -- --nocapture` refuse le test avec « mutable adapter alias accepted » ; `cargo test -p agent-workers --test workers trusted_adapter_aliases -- --nocapture` révèle une préparation Pi acceptée et son probe ; `cargo test -p agent-workers --test workers claude_all_profiles_refuse -- --nocapture` obtient une Command Claude avec profil propre. Après correction, les quatre nouvelles régressions passent dans la suite adaptateurs, **69 unitaires + 14 intégrations**. Les contrôles I1 couvrent trusted, secret présent et secret absent à plusieurs niveaux via chacune des deux racines ; le contrôle positif vérifie les règles canonicalisées. I2 couvre Full, ReadOnly, UntrustedReadOnly et NoTools, prepare/run, absence de marqueur version/auth/stage et de mutation du profil/session. Fichiers et exécutables factices locaux uniquement.
+
+Checks finaux :
+
+| Commande | Résultat | Journal |
+|---|---|---|
+| `cargo fmt -- --check` | exit 0 | sortie terminal après dernier format |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, 5,08 s, sans warning | `/private/tmp/provefab-final-fixes-clippy-final.log` |
+| `cargo nextest run` | **804/804, 16 ignorés**, 53,519 s, sans LEAK/FAIL/WARN/ERROR | `/private/tmp/provefab-final-fixes-nextest-final.log` |
+| `cargo test -p provefab --test native_sandbox -- --ignored --nocapture --test-threads=1` avec les prérequis ci-dessous | **3/3**, 20,89 s, exit 0 | `/private/tmp/provefab-final-fixes-native.log` |
+| `cargo build --release --locked --offline -p provefab` | exit 0, 18,18 s | `/private/tmp/provefab-final-fixes-release.log` |
+| `git diff --check` | exit 0 | sortie terminal |
+
+Artefacts natifs relus : `/private/tmp/pf-core-ViIKhp/evidence.json`, `/private/tmp/pf-codex-Bwi8eu/evidence.json`, `/private/tmp/pf-pi-LZYzTC/{pi-output.txt,claude-refusal.txt}`. La suite existante conserve 17 résultats attendus core/Codex/Pi, HTTP0/ref absente, validateur exit1, patch ordinaire réellement terminé et appel protégé réellement refusé par hook. Le fichier Claude donne désormais le motif universel « implicit host context boundary is not verified » et oriente Codex/Pi. Aucun nouveau scénario offensif, probe Claude, accès à des secrets réels ni changement d’architecture runtime.
+
+Le premier full nextest a échoué sur une prémisse de test périmée : `setup::tests::the_catalog_comes_from_the_worker_clis_on_path` comparait les constantes init à l’exemple maintenant Codex-only. Les attentes complètes init sont désormais indépendantes et littérales ; l’égalité Codex/jev avec l’exemple reste vérifiée. La logique init/routing est inchangée. Ciblé **1/1** vert. Ce premier run a aussi signalé LEAK sur le parser Codex `failed_commands_turn_failures_and_usage_limits`, dont le corps n’effectue aucun spawn. Diagnostic isolé **1/1** sans LEAK, puis full ci-dessus sans récidive. Cause du signal initial inconnue, aucune garantie générale de nettoyage déduite. Un fmt initial a signalé uniquement le format de la nouvelle assertion native ; corrigé puis revérifié.
+
+Le total baisse de 816 à 804 : les tests des anciens helpers et modes acceptés Claude sont retirés avec ces helpers, et les régressions universelles les remplacent. Les preuves historiques restent historiques. Linux et la frontière native de course patch restent non vérifiés expérimentalement ; les limites Keychain, secret arbitraire et dépendances transitives ci-dessous restent applicables. Revue et rerun indépendants du contrôleur à suivre.
 
 ## Reproduction
 
 Les trois tests natifs de [native_sandbox.rs](../../crates/provefab/tests/native_sandbox.rs) sont ignorés par défaut. Leur invocation explicite exige les prérequis, sans succès silencieux si un binaire, une authentification ou une preuve manque. Ils conservent leurs répertoires privés et affichent `native evidence: <chemin>` pour inspection. Nettoyer uniquement ces chemins précis après inspection.
 
-Avant toute création de fixture ou mutation de confiance, la suite refuse toutes les variables Git héritées `GIT_*`, sauf `GIT_PAGER`. Cette exception est bornée : les commandes Git des fixtures et la découverte des cibles de confiance capturent leur sortie sans terminal et ne demandent jamais de pager. Un `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` ou `GIT_CONFIG_*` hérité peut rediriger Git malgré `current_dir`, donc refuse même si le test pense déjà imposer une config locale. Les diagnostics donnent les noms, jamais les valeurs. Deux tests focalisés ordinaires vérifient le refus avant callback/marqueur et la preuve JSON de réussite réelle des outils ; ils restent actifs sans prérequis natifs.
+Avant toute création de fixture ou mutation de confiance, la suite refuse toutes les variables Git héritées `GIT_*`, sauf `GIT_PAGER`. Cette exception est bornée : les commandes Git des fixtures et la découverte des cibles de confiance capturent leur sortie sans terminal et ne demandent jamais de pager. Un `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` ou `GIT_CONFIG_*` hérité peut rediriger Git malgré `current_dir`, donc refuse même si le test pense déjà imposer une config locale. Les diagnostics donnent les noms, jamais les valeurs. Les tests focalisés ordinaires vérifient le refus avant callback/marqueur et la preuve JSON de réussite réelle des outils ; ils restent actifs sans prérequis natifs.
 
 ```bash
 export PROVEFAB_NATIVE_SRT=/chemin/prive/node_modules/.bin/srt
@@ -23,11 +48,11 @@ cargo test -p provefab --test native_sandbox -- --ignored --nocapture --test-thr
 cargo test -p provefab --test guard_cli
 ```
 
-Utiliser un vrai exécutable Node. Le shim Vite+ `bin/node` se résout vers `vp` et change de comportement si lancé sous son nom canonique. Le profil Codex dédié doit être déjà connecté et avoir approuvé le hook Provefab. Le test appelle `codex_setup::pin_untrusted` pour son seul scratch neuf, puis `codex_setup::check` et `CodexWorker.run`, avec le binaire guard compilé par Cargo. Il vérifie après lancement que le scratch reste `untrusted` ; aucun login ou hook de confiance n'est changé. Le troisième test attend le refus Claude de cette machine : un hôte effectivement compatible doit adapter cette attente explicitement, et vérifier séparément son lancement, plutôt que prétendre avoir passé ce scénario de refus.
+Utiliser un vrai exécutable Node. Le shim Vite+ `bin/node` se résout vers `vp` et change de comportement si lancé sous son nom canonique. Le profil Codex dédié doit être déjà connecté et avoir approuvé le hook Provefab. Le test appelle `codex_setup::pin_untrusted` pour son seul scratch neuf, puis `codex_setup::check` et `CodexWorker.run`, avec le binaire guard compilé par Cargo. Il vérifie après lancement que le scratch reste `untrusted` ; aucun login ou hook de confiance n'est changé. Le troisième test exige désormais le refus universel Claude avant version/auth/stage pour frontière de contexte implicite non vérifiée, indépendamment du profil et de l’état host. Ne pas adapter cette attente pour faire passer un lancement Claude.
 
-Versions observées : macOS 26.6.2, aarch64 ; SRT 0.0.79 ; Codex 0.162.1 ; modèle demandé gpt-5.5 ; Pi 1.0.3 ; Node 24.21.0 ; Python 3.14.0 ; Git Homebrew 2.51.0 ; Rust 1.96.0 ; nextest 0.9.132. Claude installé est **2.1.299**, différent de la version 2.1.296 inspectée et supportée par le code. Son refus intervient avant le probe de version à cause de `~/.claude/state`, pas après une exécution réussie de Claude.
+Versions historiques observées : macOS 26.6.2, aarch64 ; SRT 0.0.79 ; Codex 0.162.1 ; modèle demandé gpt-5.5 ; Pi 1.0.3 ; Node 24.21.0 ; Python 3.14.0 ; Git Homebrew 2.51.0 ; Rust 1.96.0 ; nextest 0.9.132. Claude installé est **2.1.299**, différent de la version 2.1.296 inspectée alors par le code. Son refus intervient avant le probe de version à cause de `~/.claude/state`, pas après une exécution réussie de Claude.
 
-## Preuves observées
+## Preuves historiques observées
 
 Le contrôle non sandboxé exécute les **17 opérations** et réussit chacune. Le serveur HTTP témoin reçoit deux requêtes, Python sans proxy et curl enfant. Le dépôt Git bare local reçoit réellement `refs/heads/main`. Les fixtures sont restaurées avant le run strict.
 

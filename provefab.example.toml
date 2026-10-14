@@ -16,21 +16,9 @@ prefer = "subscription"          # your plans first, then API keys by price;
 
 # The catalog: the models Provefab may use, by tier.
 # Inside a tier, the cheapest usable model goes first (see [routing]).
-[[models]]
-id = "claude-sonnet"
-worker = "claude-code"           # "claude-code", "codex" or "pi"
-model = "sonnet"
-tier = "standard"                # "fast", "standard" or "frontier"
-max_concurrency = 1
-# Claude native sandbox currently requires personal claude.ai Pro/Max, exactly
-# 2.1.296, empty user settings and no managed/cache/state policy sources.
-# Claude API-key profiles/helpers are currently refused before stage execution.
-# price_id = "anthropic/claude-sonnet-5-5"   # when the automatic price match is wrong
-# price_in = 2.0                 # USD per million tokens; overrides fetched prices
-# price_out = 10.0
-# quota_weight = 1.0             # subscription only: plan usage per token, vs the
-                                 # vendor's cheapest model in this catalog
-
+# All claude-code stages temporarily refuse before host version/auth probes.
+# Remove or replace every claude-code entry in an existing/init-generated catalog.
+# Successful doctor/login results do not establish stage support. Keep user state.
 [[models]]
 id = "codex-gpt"
 worker = "codex"
@@ -40,10 +28,12 @@ tier = "standard"
 # system/managed/cloud policy sources; see the native policy configuration guide.
 
 [[models]]
-id = "claude-opus"
-worker = "claude-code"
-model = "opus"
+id = "codex-frontier"
+worker = "codex"
+model = "gpt-5.5"
 tier = "frontier"
+# This minimal catalog has one provider. Add a Pi model from another provider
+# for cross-provider review; choose its provider/model from your installed Pi catalog.
 
 # One block per watched repository.
 [[repos]]

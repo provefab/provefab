@@ -26,7 +26,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
 2. **Write the configuration:** run `provefab init`.
    - Exit code 0: the file is written (`~/.provefab/provefab.toml`, or `provefab.toml` in `$PROVEFAB_HOME` when that variable is set). The output names the file and the models of the worker CLIs found on `PATH`. Keep both for the summary.
    - Exit code 3: a configuration already exists. Keep it: never delete or replace it. Go to step 3.
-   - Exit code 4: no worker CLI is on `PATH`. Ask the person to install Claude Code (`claude`) or the Codex CLI (`codex`), and stop.
+   - Exit code 4: no worker CLI is on `PATH`. Ask the person to install a supported worker, Codex (`codex`) or Pi (`pi`), and stop.
    - Exit code 1: report the error, and stop.
 
 3. **Add the repository the person is in.**
@@ -55,7 +55,7 @@ This page is for a coding agent, such as Claude Code or Codex, that a person ask
    - Exit code 0: every other check passed. Exit code 1: at least one failed.
    - When the person says they ran the commands, run `provefab doctor --json` again, and repeat this step. Stop when the exit code is 0, or when the person does not want to go on.
 
-5. **Explain the native prerequisites before starting tasks.** Point the person to [native execution policy](configuration.md#repossandbox-native-execution-policy). They must provision SRT outside writable worktrees, prepare dependencies for offline gates and explicitly declare every validation dependency in `protected_paths`. `repos add` does not add that protection; detected install commands cannot download inside the sandbox. Successful login and `doctor` checks do not prove that the runtime, authentication mode or host policy can run a stage. Codex currently requires 0.162.1 with personal/API file authentication; Claude requires the narrow 2.1.296 personal Pro/Max mode and may refuse host state. Linux enforcement is unverified. Do not remove state or weaken settings to bypass refusal. These edits and installations stay with the person unless they explicitly ask you to edit configuration.
+5. **Explain the native prerequisites before starting tasks.** Point the person to [native execution policy](configuration.md#repossandbox-native-execution-policy). They must provision SRT outside writable worktrees, prepare dependencies for offline gates and explicitly declare every validation dependency in `protected_paths`. `repos add` does not add that protection; detected install commands cannot download inside the sandbox. Successful login and `doctor` checks do not prove that the runtime, authentication mode or host policy can run a stage. Codex currently requires 0.162.1 with personal/API file authentication. All Claude stages temporarily refuse before version/auth probes because their implicit host context boundary is unverified; select Codex or Pi. Remove or replace every `worker = "claude-code"` model block, including those created by `init`, before starting tasks. Linux enforcement is unverified. Do not remove state or weaken settings to bypass refusal. These edits and installations stay with the person unless they explicitly ask you to edit configuration.
 
 6. **End with a short summary for the person:**
    - what is configured: the file's path, the models, the repository with its `base` and `gates` (or why it was not added), and that Provefab keeps its own clone;

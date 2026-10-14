@@ -712,7 +712,7 @@ async fn native_codex_worker_executes_probe_and_apply_patch() {
 }
 
 #[tokio::test]
-#[ignore = "installed Pi factories, real SRT, current guard, and unsupported Claude host state required"]
+#[ignore = "installed Pi factories, real SRT, current guard, and Claude universal refusal required"]
 async fn native_pi_bash_and_claude_refusal() {
     let f = Fixture::new("pi");
     let witness = Witness::new();
@@ -771,11 +771,13 @@ async fn native_pi_bash_and_claude_refusal() {
         provefab_bin: env!("CARGO_BIN_EXE_provefab").into(),
     };
     let error = claude.prepare_command(&request).expect_err(
-        "current unmanaged-state absence is unverifiable; Claude must refuse before launch",
+        "Claude implicit host context boundary is unverified; every stage must refuse before launch",
     );
     assert!(
-        error.to_string().contains("managed/cached policy source")
-            && error.to_string().contains("state"),
+        error
+            .to_string()
+            .contains("implicit host context boundary is not verified")
+            && error.to_string().contains("Codex or Pi"),
         "unexpected unsupported reason: {error}"
     );
     assert!(!f.work.join("must-not-run").exists());

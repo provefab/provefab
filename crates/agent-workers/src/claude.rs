@@ -1,19 +1,15 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::process::{Flow, Transcript, apply_worker_env, prepare_git_hooks, run_jsonl};
+use crate::process::{Flow, Transcript, prepare_git_hooks, run_jsonl};
 use crate::types::digest;
-use crate::{
-    ExitReason, StageRequest, StageResult, ToolProfile, Usage, Worker, WorkerError, WorkerEvent,
-};
+use crate::{ExitReason, StageRequest, StageResult, Usage, Worker, WorkerError, WorkerEvent};
 
-/// Runs a stage with the unmodified `claude` binary in print mode, signed in
-/// with the user's own subscription from a dedicated config dir (spec §5.3, D14).
+/// Claude stages are temporarily unavailable: implicit host context has no verified boundary.
 pub struct ClaudeCodeWorker {
     pub program: PathBuf,
     /// The installed cc-provefab plugin directory.
@@ -24,110 +20,14 @@ pub struct ClaudeCodeWorker {
     pub provefab_bin: PathBuf,
 }
 
-/// Credentials and provider switches that would move Claude Code off the subscription (D14).
-const API_KEY_ENV: [&str; 5] = [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-];
-
 impl ClaudeCodeWorker {
-    pub fn args(&self, req: &StageRequest) -> Vec<OsString> {
-        let mut a: Vec<OsString> = vec!["-p".into(), req.prompt.clone().into()];
-        let mut push = |s: &str| a.push(s.into());
-        push("--output-format");
-        push("stream-json");
-        push("--verbose");
-        push("--model");
-        push(&req.model);
-        // Skip the repo's .claude/settings.json and .mcp.json (spec D20).
-        push("--setting-sources");
-        push("user");
-        push("--strict-mcp-config");
-        push("--settings");
-        push(
-            &req.sandbox
-                .claude_settings(req, &self.config_dir)
-                .to_string(),
-        );
-        push("--tools");
-        push(match req.tools {
-            // Native file tools run outside the shell sandbox and permit alias-swap races.
-            ToolProfile::ReadOnly | ToolProfile::UntrustedReadOnly | ToolProfile::Full => "Bash",
-            // `""` disables every built-in tool; `--json-schema` still answers.
-            ToolProfile::NoTools => "",
-        });
-        if req.tools != ToolProfile::NoTools {
-            // With --permission-prompts none, shell commands outside Claude Code's
-            // read-only set need a pre-approval. The cc-provefab PreToolUse hook
-            // (provefab guard) still runs first and can deny any call.
-            push("--allowedTools");
-            push("Bash");
-        }
-        push("--permission-mode");
-        push("acceptEdits");
-        push("--permission-prompts");
-        push("none");
-        push("--max-turns");
-        push(&req.max_turns.to_string());
-        a.push("--plugin-dir".into());
-        a.push(self.plugin_dir.clone().into_os_string());
-        if let Some(f) = &req.system_prompt_file {
-            a.push("--append-system-prompt-file".into());
-            a.push(f.clone().into_os_string());
-        }
-        if let Some(schema) = &req.output_schema {
-            a.push("--json-schema".into());
-            a.push(schema.to_string().into());
-        }
-        a
-    }
-}
-
-impl ClaudeCodeWorker {
-    /// The full command, environment included, for one stage.
-    fn command(&self, program: &std::path::Path, req: &StageRequest) -> Command {
-        let mut cmd = Command::new(program);
-        cmd.args(self.args(req)).current_dir(&req.cwd);
-        crate::sanitize_environment(&mut cmd);
-        apply_worker_env(
-            &mut cmd,
-            &req.cwd,
-            &req.session_dir.join("git-hooks"),
-            req.tools,
-        );
-        for key in API_KEY_ENV {
-            cmd.env_remove(key);
-        }
-        cmd.env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1");
-        cmd.env("CLAUDE_CONFIG_DIR", &self.config_dir);
-        cmd.env("PROVEFAB_BIN", &self.provefab_bin);
-        cmd
-    }
-    pub fn prepare_command(&self, req: &StageRequest) -> std::io::Result<Command> {
-        let mut req = crate::sandbox::prepare_request(
-            req,
-            &[self.plugin_dir.clone(), self.provefab_bin.clone()],
-            std::slice::from_ref(&self.config_dir),
-        )?;
-        crate::sandbox::check_claude_host_policy()?;
-        crate::sandbox::check_claude_settings(&self.config_dir)?;
-        let program = crate::sandbox::executable(&self.program, &req.cwd, &req.session_dir)?;
-        let version = crate::sandbox::check_version(&program, [2, 1, 296], &req)?;
-        if version != [2, 1, 296] {
-            return Err(std::io::Error::other(
-                "Claude sandbox policy inspection supports exactly 2.1.296; other versions require policy-source revalidation",
-            ));
-        }
-        crate::sandbox::check_claude_account(&program, &self.config_dir, &req)?;
-        req.sandbox.deny_write.push(program.clone());
-        let policy = crate::sandbox::write_policy(&req, false)?;
-        let mut cmd = self.command(&program, &req);
-        crate::sandbox::apply_temporary_env(&mut cmd, &req);
-        cmd.env(crate::SANDBOX_POLICY_ENV, policy);
-        Ok(cmd)
+    pub fn prepare_command(&self, _req: &StageRequest) -> std::io::Result<Command> {
+        // Final review I2: user memory/rules load on the host, before sandboxed tools.
+        // Refuse every profile before filesystem preparation, version or auth probes.
+        // Reopen only after exact-source controls and a supported-stage run are verified.
+        Err(std::io::Error::other(
+            "Claude stages are temporarily unavailable: the implicit host context boundary is not verified. Select Codex or Pi in the model catalog; do not delete user state or authentication to bypass this refusal",
+        ))
     }
 }
 
@@ -290,201 +190,7 @@ impl ClaudeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::NO_TOOLS_ENV;
     use serde_json::json;
-    use std::time::Duration;
-
-    fn worker() -> ClaudeCodeWorker {
-        ClaudeCodeWorker {
-            program: "claude".into(),
-            plugin_dir: "/x/cc-provefab".into(),
-            config_dir: "/home/.provefab/claude".into(),
-            provefab_bin: "/x/provefab".into(),
-        }
-    }
-
-    fn req() -> StageRequest {
-        StageRequest {
-            sandbox: Default::default(),
-            cwd: "/w".into(),
-            prompt: "Review the diff".into(),
-            model: "opus".into(),
-            provider: None,
-            tools: ToolProfile::ReadOnly,
-            system_prompt_file: None,
-            output_schema: Some(json!({"type": "object"})),
-            max_turns: 40,
-            timeout: Duration::from_secs(60),
-            session_dir: "/w/.s".into(),
-        }
-    }
-
-    #[test]
-    fn native_file_operations_use_only_sandboxed_bash() {
-        for tools in [
-            ToolProfile::Full,
-            ToolProfile::ReadOnly,
-            ToolProfile::UntrustedReadOnly,
-        ] {
-            let mut request = req();
-            request.tools = tools;
-            let args = worker().args(&request);
-            let i = args.iter().position(|s| s == "--tools").unwrap();
-            assert_eq!(
-                args[i + 1],
-                "Bash",
-                "unsandboxed file tools exposed: {args:?}"
-            );
-            let allowed = args.iter().position(|s| s == "--allowedTools").unwrap();
-            assert_eq!(args[allowed + 1], "Bash");
-        }
-    }
-
-    #[test]
-    fn native_claude_settings_require_enforcement_without_escape_commands() {
-        let args = worker().args(&req());
-        let i = args
-            .iter()
-            .position(|s| s == "--settings")
-            .expect("native settings");
-        let settings: Value = serde_json::from_str(args[i + 1].to_str().unwrap()).unwrap();
-        assert_eq!(settings["sandbox"]["enabled"], true);
-        assert_eq!(settings["sandbox"]["failIfUnavailable"], true);
-        assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
-        assert_eq!(settings["sandbox"]["excludedCommands"], json!([]));
-        assert_eq!(settings["sandbox"]["network"]["allowedDomains"], json!([]));
-        assert_eq!(settings["sandbox"]["network"]["allowLocalBinding"], false);
-        assert_eq!(settings["sandbox"]["network"]["strictAllowlist"], true);
-        assert_eq!(
-            settings["sandbox"]["network"]["deniedDomains"],
-            json!(["*"])
-        );
-    }
-
-    #[test]
-    fn args_isolate_the_repo_and_pass_the_schema() {
-        let args: Vec<String> = worker()
-            .args(&req())
-            .into_iter()
-            .map(|s| s.into_string().unwrap())
-            .collect();
-        let joined = args.join(" ");
-        assert!(
-            joined.starts_with(
-                "-p Review the diff --output-format stream-json --verbose --model opus"
-            ),
-            "{joined}"
-        );
-        for part in [
-            "--setting-sources user",
-            "--strict-mcp-config",
-            "--tools Bash",
-            "--permission-prompts none",
-            "--max-turns 40",
-            "--plugin-dir /x/cc-provefab",
-            r#"--json-schema {"type":"object"}"#,
-        ] {
-            assert!(joined.contains(part), "missing {part}: {joined}");
-        }
-        assert!(
-            !joined.contains("--bare"),
-            "bare mode ignores the subscription login"
-        );
-    }
-
-    /// Final review I4: under `--permission-prompts none`, shell commands need a
-    /// pre-approval; the guard's PreToolUse deny still runs first.
-    #[test]
-    fn review_i4_full_profile_pre_approves_bash_only() {
-        let mut full = req();
-        full.tools = ToolProfile::Full;
-        let joined = |r: &StageRequest| {
-            worker()
-                .args(r)
-                .into_iter()
-                .map(|s| s.into_string().unwrap())
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        assert!(
-            joined(&full).contains("--allowedTools Bash"),
-            "{}",
-            joined(&full)
-        );
-        assert!(
-            joined(&req()).contains("--allowedTools Bash"),
-            "read-only Bash is enforced by native policy and the guard"
-        );
-    }
-
-    /// Repository rules pre-flight S2: no built-in tool, and the guard is told
-    /// to refuse every call; the answer still comes through `--json-schema`.
-    #[test]
-    fn no_tools_lists_no_tool_and_tells_the_guard() {
-        let mut none = req();
-        none.tools = ToolProfile::NoTools;
-        let args: Vec<String> = worker()
-            .args(&none)
-            .into_iter()
-            .map(|s| s.into_string().unwrap())
-            .collect();
-        let at = args.iter().position(|a| a == "--tools").unwrap();
-        assert_eq!(args[at + 1], "", "{args:?}");
-        assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
-        assert!(args.iter().any(|a| a == "--json-schema"), "{args:?}");
-        let no_tools = |r: &StageRequest| {
-            worker()
-                .command(&worker().program, r)
-                .as_std()
-                .get_envs()
-                .find(|(k, _)| *k == NO_TOOLS_ENV)
-                .map(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
-        };
-        assert_eq!(no_tools(&none), Some(Some("1".into())));
-        assert_eq!(no_tools(&req()), Some(None), "removed for other stages");
-    }
-
-    /// Final review I1 (pull request reviews): Claude Code reviews a person's
-    /// pull request through sandboxed Bash only; the guard permits read-only commands.
-    #[test]
-    fn an_untrusted_review_uses_sandboxed_bash_and_tells_the_guard() {
-        let mut review = req();
-        review.tools = ToolProfile::UntrustedReadOnly;
-        let args: Vec<String> = worker()
-            .args(&review)
-            .into_iter()
-            .map(|s| s.into_string().unwrap())
-            .collect();
-        let at = args.iter().position(|a| a == "--tools").unwrap();
-        assert_eq!(args[at + 1], "Bash", "{args:?}");
-        assert!(args.iter().any(|a| a == "--allowedTools"), "{args:?}");
-        let marker = worker()
-            .command(&worker().program, &review)
-            .as_std()
-            .get_envs()
-            .find(|(k, _)| *k == crate::UNTRUSTED_REVIEW_ENV)
-            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()));
-        assert_eq!(marker.as_deref(), Some("1"));
-    }
-
-    /// Final review M6: other switches that move Claude Code off the subscription are removed too.
-    #[test]
-    fn review_m6_provider_switches_are_removed() {
-        let cmd = worker().command(&worker().program, &req());
-        let removed: Vec<String> = cmd
-            .as_std()
-            .get_envs()
-            .filter(|(_, v)| v.is_none())
-            .map(|(k, _)| k.to_string_lossy().into())
-            .collect();
-        for key in [
-            "ANTHROPIC_BASE_URL",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-        ] {
-            assert!(removed.iter().any(|k| k == key), "{key} kept: {removed:?}");
-        }
-    }
 
     /// Final review M1: a structured answer delivered at the turn limit completes the stage.
     #[test]
@@ -497,41 +203,6 @@ mod tests {
             ],
         );
         assert_eq!(s.exit, Some(ExitReason::Completed));
-    }
-
-    #[test]
-    fn command_removes_api_keys_and_sets_the_provefab_config_dir() {
-        let cmd = worker().command(&worker().program, &req());
-        let envs: Vec<(String, Option<String>)> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into(),
-                    v.map(|v| v.to_string_lossy().into()),
-                )
-            })
-            .collect();
-        assert!(
-            envs.contains(&("ANTHROPIC_API_KEY".into(), None)),
-            "{envs:?}"
-        );
-        assert!(
-            envs.contains(&("ANTHROPIC_AUTH_TOKEN".into(), None)),
-            "{envs:?}"
-        );
-        assert!(envs.contains(&("SSH_AUTH_SOCK".into(), None)), "{envs:?}");
-        assert!(
-            envs.contains(&(
-                "CLAUDE_CONFIG_DIR".into(),
-                Some("/home/.provefab/claude".into())
-            )),
-            "{envs:?}"
-        );
-        assert!(
-            envs.contains(&("PROVEFAB_WORKTREE".into(), Some("/w".into()))),
-            "{envs:?}"
-        );
     }
 
     fn feed(s: &mut ClaudeState, records: &[Value]) -> Vec<WorkerEvent> {

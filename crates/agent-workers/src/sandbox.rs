@@ -566,8 +566,25 @@ pub(crate) fn prepare_request(
     out.session_dir = canonical_path(&req.session_dir)?;
     disjoint(&out.cwd, &out.session_dir)?;
     for path in trusted.iter().chain(secrets) {
-        reject_worktree_symlink(path, &out.cwd)?;
-        reject_worktree_symlink(path, &out.session_dir.join("sandbox-tmp"))?;
+        // Adapter inputs may retain stable external aliases. Inspect every expanded
+        // component before canonicalization erases a mutable intermediate link.
+        // Absent credential leaves still protect their nearest existing ancestor.
+        let mut ancestor = path.as_path();
+        loop {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    ancestor = ancestor.parent().ok_or(e)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if trusted_path_target(ancestor, &out.cwd, &out.session_dir.join("sandbox-tmp")).is_none() {
+            return Err(invalid(format!(
+                "sandbox trusted path traverses a mutable or uninspectable root: {}",
+                path.display()
+            )));
+        }
         let path = canonical_path(path)?;
         disjoint(&out.cwd, &path)?;
         disjoint(&out.session_dir.join("sandbox-tmp"), &path)?;
@@ -658,33 +675,6 @@ impl SandboxPolicy {
             "enableWeakerNestedSandbox": false,
             "enableWeakerNetworkIsolation": false
         })
-    }
-    pub(crate) fn claude_settings(
-        &self,
-        req: &StageRequest,
-        auth: &std::path::Path,
-    ) -> serde_json::Value {
-        let mut policy = self.json(req, false);
-        policy["filesystem"]["denyRead"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!(auth));
-        if req.tools != ToolProfile::Full {
-            policy["filesystem"]["denyWrite"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::json!(req.cwd));
-        }
-        policy["network"]
-            .as_object_mut()
-            .unwrap()
-            .remove("strictAllowedDomains");
-        policy["network"]["strictAllowlist"] = true.into();
-        policy["enabled"] = true.into();
-        policy["failIfUnavailable"] = true.into();
-        policy["allowUnsandboxedCommands"] = false.into();
-        policy["excludedCommands"] = serde_json::json!([]);
-        serde_json::json!({"sandbox": policy})
     }
 }
 
@@ -937,39 +927,6 @@ pub fn check_codex_version(
     Ok(())
 }
 
-fn personal_claude_account(bytes: &[u8]) -> std::io::Result<()> {
-    let account: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|_| invalid("invalid Claude auth status JSON"))?;
-    if account["loggedIn"] != true
-        || account["authMethod"] != "claude.ai"
-        || account["apiProvider"] != "firstParty"
-        || !matches!(account["subscriptionType"].as_str(), Some("pro" | "max"))
-    {
-        return Err(invalid(
-            "Claude sandbox supports only personal firstParty claude.ai Pro/Max accounts; API, Team, Enterprise and unknown authentication are unsupported",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn check_claude_account(
-    program: &std::path::Path,
-    config: &std::path::Path,
-    req: &StageRequest,
-) -> std::io::Result<()> {
-    let mut cmd = tokio::process::Command::new(program);
-    sanitize_environment(&mut cmd);
-    apply_temporary_env(&mut cmd, req);
-    cmd.env("CLAUDE_CONFIG_DIR", config)
-        .env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1")
-        .args(["--setting-sources", "user", "auth", "status", "--json"])
-        .current_dir(&req.session_dir);
-    personal_claude_account(&probe_output(
-        cmd.into_std(),
-        std::time::Duration::from_secs(10),
-    )?)
-}
-
 /// Gate commands use SRT. Local-network opt-in fails closed until loopback-only binding is verified.
 /// Scratch must be trusted.
 pub fn gate_command(
@@ -1022,97 +979,6 @@ pub(crate) fn apply_temporary_env(cmd: &mut tokio::process::Command, req: &Stage
     for key in ["TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR"] {
         cmd.env(key, req.session_dir.join("sandbox-tmp"));
     }
-}
-
-// Presence is enough: managed policy wins over --settings, even an empty cache can
-// be populated later. Unknown v5 state is deliberately unsupported, not decoded.
-fn reject_policy_source(path: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(invalid(format!(
-            "cannot inspect Claude policy source {}: {e}",
-            path.display()
-        ))),
-        Ok(_) => Err(invalid(format!(
-            "unsupported Claude managed/cached policy source {}; use a dedicated unmanaged profile with no policy cache; do not delete authentication/state data. Use Codex or Pi while state support awaits verified effective-policy inspection",
-            path.display()
-        ))),
-    }
-}
-
-/// Array merges and Edit allow rules can widen native sandbox permissions.
-pub(crate) fn check_claude_settings(config_dir: &std::path::Path) -> std::io::Result<()> {
-    for name in [
-        "managed-settings.json",
-        "managed-settings.d",
-        "managed-mcp.json",
-        "remote-settings.json",
-        "remote-settings.json.signature.json",
-        "remote-settings.json.signature-iat.json",
-        "remote-settings-helper-consent",
-        "remote-settings-consent.json",
-        "state",
-    ] {
-        reject_policy_source(&config_dir.join(name))?;
-    }
-    let path = config_dir.join("settings.json");
-    let data = match std::fs::read(&path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let settings: serde_json::Value = serde_json::from_slice(&data)
-        .map_err(|e| invalid(format!("invalid Claude settings {}: {e}", path.display())))?;
-    if settings.as_object().is_none_or(|object| !object.is_empty()) {
-        return Err(invalid(format!(
-            "Claude settings {} must be an empty object for the dedicated native-sandbox profile; inherited hooks, helpers, permissions and other overrides are unsupported. Keep login credentials separate; do not delete authentication data",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn check_claude_host_policy() -> std::io::Result<()> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| invalid("HOME required to inspect Claude policy state"))?;
-    // The inspected binary protects both state roots; alternate storage semantics are
-    // not verified. Refuse both rather than assume config_dir completely isolates it.
-    check_claude_settings(&PathBuf::from(home).join(".claude"))?;
-    for root in [
-        "/Library/Application Support/ClaudeCode",
-        "/etc/claude-code",
-    ] {
-        for name in [
-            "managed-settings.json",
-            "managed-settings.d",
-            "managed-mcp.json",
-        ] {
-            reject_policy_source(&std::path::Path::new(root).join(name))?;
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Claude 2.1.296 Rxs/W2n read precisely these per-user/device plist paths.
-        // Use OS identity, never inherited USER/LOGNAME; presence/unreadability refuses.
-        let mut cmd = std::process::Command::new("/usr/bin/id");
-        cmd.arg("-un").env_clear();
-        let output = probe_output(cmd, std::time::Duration::from_secs(5))?;
-        let user = std::str::from_utf8(&output)
-            .map_err(|_| invalid("invalid OS account name"))?
-            .trim();
-        if user.is_empty() || user.contains(['/', '\0']) {
-            return Err(invalid("invalid OS account name"));
-        }
-        for path in [
-            PathBuf::from("/Library/Managed Preferences")
-                .join(user)
-                .join("com.anthropic.claudecode.plist"),
-            PathBuf::from("/Library/Managed Preferences/com.anthropic.claudecode.plist"),
-        ] {
-            reject_policy_source(&path)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1213,21 +1079,6 @@ mod tests {
         };
         assert!(gate_command(&req.cwd, &req.session_dir, &policy, "touch marker").is_err());
         assert!(!req.cwd.join("marker").exists());
-    }
-    #[test]
-    fn claude_rejects_mergeable_security_settings_and_allows_empty_profile() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("settings.json");
-        for settings in [
-            r#"{"sandbox":{"excludedCommands":["curl"]}}"#,
-            r#"{"permissions":{"additionalDirectories":["/"]}}"#,
-            r#"{"env":{"AWS_SECRET_ACCESS_KEY":"fake"}}"#,
-        ] {
-            std::fs::write(&path, settings).unwrap();
-            assert!(check_claude_settings(root.path()).is_err());
-        }
-        std::fs::write(&path, "{}").unwrap();
-        assert!(check_claude_settings(root.path()).is_ok());
     }
     #[test]
     fn codex_external_policy_sources_refuse_even_empty_or_broken_files() {
@@ -1549,40 +1400,69 @@ mod tests {
         assert!(prepare_request(&req, std::slice::from_ref(&alias), &[]).is_err());
     }
     #[test]
-    fn claude_rejects_inherited_edit_allow_rules() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("settings.json"),
-            r#"{"permissions":{"allow":["Edit(//outside/**)"]}}"#,
-        )
-        .unwrap();
-        assert!(check_claude_settings(root.path()).is_err());
-    }
-
-    #[test]
-    fn claude_rejects_managed_cache_and_policy_helper() {
-        for name in [
-            "managed-settings.json",
-            "remote-settings.json",
-            "state",
-            "remote-settings.json.signature.json",
-        ] {
+    fn adapter_inputs_reject_indirect_mutable_aliases_including_absent_secrets() {
+        for temporary in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            std::fs::write(root.path().join(name), "{}").unwrap();
-            assert!(
-                check_claude_settings(root.path()).is_err(),
-                "accepted {name}"
-            );
+            let req = request(root.path());
+            let writable = if temporary {
+                req.session_dir.join("sandbox-tmp")
+            } else {
+                req.cwd.clone()
+            };
+            std::fs::create_dir_all(&writable).unwrap();
+            let safe = root.path().join("safe");
+            std::fs::create_dir(&safe).unwrap();
+            std::fs::write(safe.join("dummy-secret"), "dummy").unwrap();
+            std::os::unix::fs::symlink(&safe, writable.join("bridge")).unwrap();
+            let alias = root.path().join("external-alias");
+            std::os::unix::fs::symlink(writable.join("bridge"), &alias).unwrap();
+            for (trusted, secrets) in [
+                (vec![alias.clone()], vec![]),
+                (vec![], vec![alias.join("dummy-secret")]),
+                (vec![], vec![alias.join("absent/nested-secret")]),
+            ] {
+                assert!(
+                    prepare_request(&req, &trusted, &secrets).is_err(),
+                    "mutable adapter alias accepted: {trusted:?} {secrets:?}"
+                );
+            }
         }
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("settings.json"),
-            r#"{"policyHelper":"echo unsafe"}"#,
-        )
-        .unwrap();
-        assert!(check_claude_settings(root.path()).is_err());
     }
-
+    #[test]
+    fn stable_external_adapter_aliases_allow_present_and_absent_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        let req = request(root.path());
+        let safe = root.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::write(safe.join("dummy-secret"), "dummy").unwrap();
+        let alias = root.path().join("external-alias");
+        std::os::unix::fs::symlink(&safe, &alias).unwrap();
+        let secrets = [
+            alias.join("dummy-secret"),
+            alias.join("absent/nested-secret"),
+        ];
+        let prepared = prepare_request(&req, &[alias], &secrets).unwrap();
+        let safe = safe.canonicalize().unwrap();
+        assert!(prepared.sandbox.deny_write.contains(&safe));
+        assert!(
+            prepared
+                .sandbox
+                .deny_write
+                .contains(&safe.join("absent/nested-secret"))
+        );
+        assert!(
+            prepared
+                .sandbox
+                .deny_read
+                .contains(&safe.join("dummy-secret"))
+        );
+        assert!(
+            prepared
+                .sandbox
+                .deny_read
+                .contains(&safe.join("absent/nested-secret"))
+        );
+    }
     #[test]
     fn gate_local_network_exception_is_refused_until_loopback_only_is_verified() {
         let root = tempfile::tempdir().unwrap();
@@ -1602,26 +1482,6 @@ mod tests {
         assert!(!root.path().join("marker").exists());
     }
     #[test]
-    fn claude_personal_auth_is_fail_closed() {
-        for subscription in ["pro", "max", "team", "enterprise", "unknown"] {
-            let account = serde_json::json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":subscription});
-            assert_eq!(
-                personal_claude_account(account.to_string().as_bytes()).is_ok(),
-                matches!(subscription, "pro" | "max")
-            );
-        }
-        for account in [
-            serde_json::json!({}),
-            serde_json::json!({"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty","subscriptionType":"max"}),
-            serde_json::json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"bedrock","subscriptionType":"max"}),
-            serde_json::json!({"loggedIn":false,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}),
-        ] {
-            assert!(personal_claude_account(account.to_string().as_bytes()).is_err());
-        }
-        assert!(personal_claude_account(b"invalid").is_err());
-    }
-
-    #[test]
     fn probes_bound_descendants_holding_stdout_open() {
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.args(["-c", "sleep 30 & exit 0"]);
@@ -1635,27 +1495,6 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
-    #[test]
-    fn claude_rejects_executable_user_settings_and_empty_state_directory() {
-        for key in ["hooks", "apiKeyHelper", "statusLine", "policyHelper"] {
-            let root = tempfile::tempdir().unwrap();
-            std::fs::write(
-                root.path().join("settings.json"),
-                serde_json::json!({key: "unsafe-command"}).to_string(),
-            )
-            .unwrap();
-            assert!(check_claude_settings(root.path()).is_err());
-        }
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("state")).unwrap();
-        assert!(check_claude_settings(root.path()).is_err());
-        let broken = root.path().join("broken-cache");
-        std::os::unix::fs::symlink(root.path().join("missing"), &broken).unwrap();
-        assert!(reject_policy_source(&broken).is_err());
-        let not_directory = root.path().join("file");
-        std::fs::write(&not_directory, "").unwrap();
-        assert!(reject_policy_source(&not_directory.join("policy")).is_err());
-    }
     #[test]
     fn path_walker_resolves_relative_links_and_bounds_expansion() {
         let root = tempfile::tempdir().unwrap();

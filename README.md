@@ -4,7 +4,7 @@ Provefab turns labelled GitHub, Jira or Linear issues into pull requests that ar
 
 [![Provefab in 12 seconds: a force push denied, a failing test and a blocking review sent back, then a pull request waiting for your review](docs/assets/provefab-loop.gif)](https://provefab.com/#demo)
 
-It runs as a service on your Mac or on a Linux server (x86_64 or ARM64). AI coding agents write the code through the unmodified Claude Code, Codex or Pi CLI, using a supported login and runtime (see [native policy configuration](docs/guide/configuration.md#repossandbox-native-execution-policy)). Jev, TypeSafe's classifier, rates each issue so that every stage runs on the cheapest available model that can do it: your plans first, then your API keys by price, with prices updated daily. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
+It runs as a service on your Mac or on a Linux server (x86_64 or ARM64). AI coding agents write the code through the unmodified Codex or Pi CLI, using a supported login and runtime (see [native policy configuration](docs/guide/configuration.md#repossandbox-native-execution-policy)). Jev, TypeSafe's classifier, rates each issue so that every stage runs on the cheapest available model that can do it: your plans first, then your API keys by price, with prices updated daily. Everything that decides an outcome is deterministic Rust: the checks, the commit, the push and the pull request.
 
 ```
 issue labelled `provefab`
@@ -26,9 +26,9 @@ The pull request then waits for your click. Optionally set `post_merge_checks` p
 
 ## Quick start
 
-Requirements: macOS or Linux (x86_64, ARM64; on Linux, the `ca-certificates` package for HTTPS and, for the service, systemd 240 or later), `git` and `gh` (signed in with `gh auth login`), and at least one supported worker: `claude` (Claude Code) or `codex` (Codex CLI), plus a separately provisioned [SRT](https://github.com/anthropics/sandbox-runtime) >= 0.0.79 outside writable worktrees for gates. Codex requires exactly 0.162.1, an inspectable file login for a personal account or API key, and no system/managed/cloud policy sources. Claude currently requires exactly 2.1.296, a personal claude.ai Pro/Max login, empty user settings and no managed/cache/state policy sources; Claude API-key profiles are refused. See [native policy configuration](docs/guide/configuration.md#repossandbox-native-execution-policy).
+Requirements: macOS or Linux (x86_64, ARM64; on Linux, the `ca-certificates` package for HTTPS and, for the service, systemd 240 or later), `git` and `gh` (signed in with `gh auth login`), and at least one supported worker: `codex` (Codex CLI) or `pi`, plus a separately provisioned [SRT](https://github.com/anthropics/sandbox-runtime) >= 0.0.79 outside writable worktrees for gates. Codex requires exactly 0.162.1, an inspectable file login for a personal account or API key, and no system/managed/cloud policy sources. All Claude stages temporarily refuse before version/auth probes because implicit host context loading has no verified boundary. Select Codex or Pi; do not delete user state to bypass refusal. See [native policy configuration](docs/guide/configuration.md#repossandbox-native-execution-policy).
 
-Native command enforcement has been exercised on macOS with Codex 0.162.1, Pi 1.0.3 and SRT 0.0.79. Linux enforcement remains unverified. The current macOS Claude installation (2.1.299) refuses because of a host state source before launch; this is safe refusal evidence, not a successful Claude run. Missing or unverifiable enforcement stops execution. Before starting tasks, provision dependencies for offline checks and declare every validator dependency in `protected_paths`; an empty list protects no validation harness. These are explicit path protections, not isolation from every host secret. See [Security](docs/guide/security.md).
+Native command enforcement has been exercised on macOS with Codex 0.162.1, Pi 1.0.3 and SRT 0.0.79. Linux enforcement remains unverified. Claude universally refuses before host probes, including clean profiles and NoTools; no successful Claude run is claimed. Missing or unverifiable enforcement stops execution. Before starting tasks, provision dependencies for offline checks and declare every validator dependency in `protected_paths`; an empty list protects no validation harness. These are explicit path protections, not isolation from every host secret. See [Security](docs/guide/security.md).
 
 With a coding agent, point it at [Set up Provefab with a coding agent](docs/guide/agents.md): it writes and checks the configuration, and leaves the sign-ins, keys and service to you.
 
@@ -44,13 +44,11 @@ mkdir -p ~/.local/bin && install -m 755 provefab ~/.local/bin/provefab
 cargo install --git https://github.com/provefab/provefab --tag v0.7.0 --locked provefab
 
 # 2. Sign the workers in, once, in Provefab's own config directories.
-#    On a server without a browser, Claude shows a link and takes the code
-#    you paste; Codex shows a device code to enter on another machine.
-provefab login claude        # Claude plan login, in ~/.provefab/claude
+#    On a server without a browser, Codex shows a device code for another machine.
 provefab login codex         # ChatGPT plan login, in ~/.provefab/codex, and trust for the guard hook
 # ...or an OpenAI API key, for a Codex model with auth = "api_key":
 provefab login codex --api-key
-# Claude API-key profiles can be configured, but cannot run native stages.
+# Claude logins can be configured, but all Claude stages temporarily refuse.
 
 # 3. Jev (TypeSafe) key: in the macOS Keychain, or on Linux in
 #    ~/.provefab/credentials.toml (readable by your account only, mode 600,
@@ -60,6 +58,7 @@ provefab login jev
 # 4. Configure, then check. `init` writes ~/.provefab/provefab.toml with the
 #    models of the workers it finds; `repos add` detects your checks
 #    (add --path <your clone> to read it instead of GitHub).
+#    Remove or replace all claude-code model blocks created by init.
 provefab init
 provefab repos add your-account/your-repo
 # Review detected gates: downloads and local listeners are denied.
@@ -137,7 +136,7 @@ cargo clippy --all-targets -- -D warnings
 cargo nextest run
 ```
 
-Tests that launch real agents are ignored by default. See `crates/provefab/tests/real_workers.rs` to enable them. The opt-in native suite executes real gates, Codex and Pi tools with dummy fixtures and checks Claude refusal on the current host. See `crates/provefab/tests/native_sandbox.rs`; the repository's `docs/superpowers/native-sandbox-validation.md` records its prerequisites, commands, evidence and limits.
+Tests that launch real agents are ignored by default. See `crates/provefab/tests/real_workers.rs` to enable them. The opt-in native suite executes real gates, Codex and Pi tools with dummy fixtures and checks universal Claude refusal before host probes. See `crates/provefab/tests/native_sandbox.rs`; the repository's `docs/superpowers/native-sandbox-validation.md` records its prerequisites, commands, evidence and limits.
 
 ## License
 

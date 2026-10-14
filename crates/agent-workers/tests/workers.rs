@@ -92,6 +92,92 @@ fn request(worktree: &Path, schema: bool) -> StageRequest {
     }
 }
 
+// Final review I1: final canonicalization must not hide a writable intermediate alias.
+#[test]
+fn trusted_adapter_aliases_refuse_both_writable_roots_before_version_probe() {
+    for temporary in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let req = request(root.path(), false);
+        let writable = if temporary {
+            req.session_dir.join("sandbox-tmp")
+        } else {
+            req.cwd.clone()
+        };
+        std::fs::create_dir_all(&writable).unwrap();
+        let safe = root.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        let marker = root.path().join("probe-marker");
+        let runtime = safe.join("runtime");
+        std::fs::write(
+            &runtime,
+            format!("#!/bin/sh\ntouch '{}'\necho 0.0.79\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&safe, writable.join("bridge")).unwrap();
+        let alias = root.path().join("external-alias");
+        std::os::unix::fs::symlink(writable.join("bridge"), &alias).unwrap();
+        let mut req = req;
+        req.sandbox.runtime = runtime.clone();
+        let worker = PiWorker {
+            program: runtime.clone(),
+            package: alias,
+            provefab_bin: runtime,
+        };
+        let error = worker
+            .prepare_command(&req)
+            .expect_err("mutable adapter alias accepted");
+        assert!(error.to_string().contains("trusted path"), "{error}");
+        assert!(!marker.exists(), "version probe ran before alias refusal");
+    }
+}
+
+// Final review I2: even a clean profile and NoTools must stop before any host CLI probe.
+#[tokio::test]
+async fn claude_all_profiles_refuse_before_version_auth_or_stage_invocation() {
+    if with_clean_home("claude_all_profiles_refuse_before_version_auth_or_stage_invocation") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut req = request(root.path(), true);
+    let bin = root.path().join("claude");
+    let marker = root.path().join("host-invocations");
+    std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = --version ]; then echo 2.1.296; else echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"subscriptionType\":\"max\"}}'; fi\n", marker.display())).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profile = root.path().join("clean-profile");
+    std::fs::create_dir(&profile).unwrap();
+    std::fs::write(profile.join("settings.json"), "{}").unwrap();
+    let worker = ClaudeCodeWorker {
+        program: bin.clone(),
+        config_dir: profile.clone(),
+        plugin_dir: root.path().join("plugin"),
+        provefab_bin: bin,
+    };
+    for tools in [
+        ToolProfile::Full,
+        ToolProfile::ReadOnly,
+        ToolProfile::UntrustedReadOnly,
+        ToolProfile::NoTools,
+    ] {
+        req.tools = tools;
+        let error = worker
+            .prepare_command(&req)
+            .expect_err("Claude implicit context boundary accepted");
+        let message = error.to_string();
+        assert!(message.contains("implicit host context"), "{message}");
+        assert!(message.contains("Codex or Pi"), "{message}");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(worker.run(&req, tx).await.is_err());
+        assert!(rx.try_recv().is_err());
+        assert!(!marker.exists(), "Claude version/auth/stage invoked");
+        assert!(!req.session_dir.exists(), "stage preparation mutated state");
+    }
+    assert_eq!(
+        std::fs::read_to_string(profile.join("settings.json")).unwrap(),
+        "{}"
+    );
+}
+
 async fn run<W: Worker>(
     w: &W,
     req: &StageRequest,
@@ -264,76 +350,6 @@ async fn review_m1_output_on_the_last_turn_is_completed() {
     );
 }
 
-const CLAUDE_STREAM: &str = concat!(
-    r#"{"type":"system","subtype":"init","apiKeySource":"none","plugins":[]}"#,
-    "\n",
-    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/w/a.rs"}}]}}"#,
-    "\n",
-    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
-    "\n",
-    r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"ok","structured_output":{"verdict":"changes"},"usage":{"input_tokens":5,"output_tokens":1}}"#,
-    "\n",
-);
-
-#[tokio::test]
-async fn claude_worker_end_to_end() {
-    if with_clean_home("claude_worker_end_to_end") {
-        return;
-    }
-    let fake = Fake::new(CLAUDE_STREAM, 0, 0);
-    let wt = tempfile::tempdir().unwrap();
-    let w = ClaudeCodeWorker {
-        program: fake.bin(),
-        plugin_dir: "/p/cc-provefab".into(),
-        config_dir: "/cfg/claude".into(),
-        provefab_bin: "/bin/provefab".into(),
-    };
-    let mut req = request(wt.path(), true);
-    req.sandbox.runtime = fake.bin();
-    let (result, events) = run(&w, &req).await;
-    assert_eq!(result.exit, ExitReason::Completed);
-    assert_eq!(
-        result.structured_output,
-        Some(json!({"verdict": "changes"}))
-    );
-    assert_eq!(
-        events[1],
-        WorkerEvent::ToolEnd {
-            name: "Read".into(),
-            is_error: false
-        }
-    );
-    let log = fake.log();
-    assert!(log.contains("ENV CLAUDE_CONFIG_DIR=/cfg/claude"), "{log}");
-    assert!(log.contains("ARG --setting-sources\nARG user"), "{log}");
-    assert!(log.contains("ARG --json-schema"), "{log}");
-    assert!(
-        req.session_dir.join("git-hooks/pre-push").is_file(),
-        "no push-blocking hook"
-    );
-}
-
-#[tokio::test]
-async fn claude_worker_without_result_record_is_a_crash() {
-    if with_clean_home("claude_worker_without_result_record_is_a_crash") {
-        return;
-    }
-    let fake = Fake::new(r#"{"type":"system","subtype":"init"}"#, 0, 1);
-    let wt = tempfile::tempdir().unwrap();
-    let w = ClaudeCodeWorker {
-        program: fake.bin(),
-        plugin_dir: "/p".into(),
-        config_dir: "/c".into(),
-        provefab_bin: "/f".into(),
-    };
-    let (result, _) = run(&w, &request(wt.path(), false)).await;
-    assert!(
-        matches!(result.exit, ExitReason::Crashed { code: Some(1), .. }),
-        "{:?}",
-        result.exit
-    );
-}
-
 const CODEX_STREAM: &str = concat!(
     r#"{"type":"thread.started","thread_id":"t"}"#,
     "\n",
@@ -430,7 +446,7 @@ async fn native_preparation_rejects_claude_user_sandbox_override_before_launch()
     if with_clean_home("native_preparation_rejects_claude_user_sandbox_override_before_launch") {
         return;
     }
-    let fake = Fake::new(CLAUDE_STREAM, 0, 0);
+    let fake = Fake::new("", 0, 0);
     let wt = tempfile::tempdir().unwrap();
     let session = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -465,16 +481,7 @@ async fn prepared_native_workers_pin_the_executable_before_changing_cwd() {
             codex_home: root.join("auth"),
             provefab_bin: root.join("guard"),
         };
-        let claude = ClaudeCodeWorker {
-            program: "agent".into(),
-            config_dir: root.join("auth"),
-            plugin_dir: root.join("plugin"),
-            provefab_bin: root.join("guard"),
-        };
-        for mut command in [
-            codex.prepare_command(&req, "test").unwrap(),
-            claude.prepare_command(&req).unwrap(),
-        ] {
+        for mut command in [codex.prepare_command(&req, "test").unwrap()] {
             assert_eq!(
                 command.as_std().get_program(),
                 root.join("trusted").canonicalize().unwrap().join(
@@ -554,41 +561,11 @@ async fn claude_host_state_refuses_before_agent_start() {
     let error = worker
         .prepare_command(&request(root.path(), false))
         .unwrap_err();
-    assert!(error.to_string().contains("state"), "{error}");
+    assert!(
+        error.to_string().contains("implicit host context"),
+        "{error}"
+    );
     assert!(!fake.dir.path().join("log.txt").exists());
-}
-
-#[tokio::test]
-async fn claude_preflight_refuses_unknown_versions_and_nonpersonal_auth() {
-    if with_clean_home("claude_preflight_refuses_unknown_versions_and_nonpersonal_auth") {
-        return;
-    }
-    for (version, status) in [
-        ("2.1.297", "max"),
-        ("2.1.296", "team"),
-        ("2.1.296", "enterprise"),
-    ] {
-        let fake = Fake::new("", 0, 0);
-        let path = fake.bin();
-        let script = std::fs::read_to_string(&path)
-            .unwrap()
-            .replace("2.1.296", version)
-            .replace("max", status);
-        std::fs::write(&path, script).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let worker = ClaudeCodeWorker {
-            program: path,
-            config_dir: fake.dir.path().join("auth"),
-            plugin_dir: fake.dir.path().join("plugin"),
-            provefab_bin: fake.bin(),
-        };
-        assert!(
-            worker
-                .prepare_command(&request(root.path(), false))
-                .is_err()
-        );
-        assert!(!fake.dir.path().join("log.txt").exists());
-    }
 }
 
 #[tokio::test]
